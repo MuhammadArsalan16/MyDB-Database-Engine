@@ -16,10 +16,12 @@ std::string Lexer::to_upper(std::string str) {
 }
 
 bool Lexer::is_keyword(const std::string& str) {
-    // UPDATED: Added WHERE and VALUES to our keyword dictionary!
     std::vector<std::string> keywords = {
         "SELECT", "FROM", "CREATE", "TABLE", 
-        "INSERT", "INTO", "VALUES", "WHERE", "PRIMARY", "KEY"
+        "INSERT", "INTO", "VALUES", "WHERE", "PRIMARY", "KEY",
+        "UPDATE", "SET", "DELETE",
+        "BEGIN", "COMMIT", "ROLLBACK", 
+        "JOIN", "ON", "INNER", "LEFT", "RIGHT", "FULL", "OUTER" // <-- ADDED JOIN TYPES
     };
     std::string upper_str = to_upper(str);
     return std::find(keywords.begin(), keywords.end(), upper_str) != keywords.end();
@@ -41,10 +43,12 @@ std::vector<Token> Lexer::tokenize() {
             continue;
         }
 
-        // Match Keywords and Identifiers (including numbers)
+        
         if (std::isalnum(c) || c == '_') {
             std::string word;
-            while (current_pos < source.length() && (std::isalnum(source[current_pos]) || source[current_pos] == '_')) {
+            // Notice we added source[current_pos] == '.' here!
+            while (current_pos < source.length() && 
+                  (std::isalnum(source[current_pos]) || source[current_pos] == '_' || source[current_pos] == '.')) {
                 word += source[current_pos++];
             }
             
@@ -55,7 +59,6 @@ std::vector<Token> Lexer::tokenize() {
             }
             continue;
         }
-
         // Skip unrecognized characters
         current_pos++;
     }

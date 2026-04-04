@@ -15,8 +15,10 @@ public:
 private:
     std::vector<Token> tokens;
     size_t current_token_idx = 0;
-
-    // Helper functions
+    std::unique_ptr<UpdateStatement> parse_update();
+    std::unique_ptr<DeleteStatement> parse_delete();
+    std::unique_ptr<TransactionStatement> parse_transaction(const std::string& cmd); 
+   // Helper functions
     Token peek();
     Token advance();
     bool match(TokenType type, const std::string& value = "");
