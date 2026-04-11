@@ -3,12 +3,12 @@
 #include <stdint.h>
 
 /* ------------------------------------------------------------------ */
-/*  Record header encode/decode (5 bytes on disk)                      */
-/*                                                                      */
-/*  Layout:                                                             */
-/*    Byte 0   : info_flags                                             */
-/*    Bytes 1-2: (heap_no << 3) | rec_type  as big-endian uint16       */
-/*    Bytes 3-4: next_offset  as big-endian uint16                     */
+/*  Record header encode/decode (5 bytes on disk)                     */
+/*                                                                    */
+/*  Layout:                                                           */
+/*    Byte 0   : info_flags                                           */
+/*    Bytes 1-2: (heap_no << 3) | rec_type  as big-endian uint16      */
+/*    Bytes 3-4: next_offset  as big-endian uint16                    */
 /* ------------------------------------------------------------------ */
 
 void rec_hdr_encode(const RecordHeader *rh, uint8_t *dst)
@@ -28,22 +28,22 @@ void rec_hdr_decode(const uint8_t *src, RecordHeader *rh)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Page header encode/decode                                          */
-/*                                                                      */
-/*  We store the PageHeader struct at a fixed layout using explicit     */
-/*  byte-by-byte writes so the layout is endian-independent.           */
-/*                                                                      */
-/*  Offsets within the 38-byte header:                                 */
-/*    0  : checksum      (4B)                                          */
-/*    4  : page_no       (4B)                                          */
-/*    8  : prev_page     (4B)                                          */
-/*    12 : next_page     (4B)                                          */
-/*    16 : lsn           (8B)                                          */
-/*    24 : page_type     (2B)                                          */
-/*    26 : num_records   (2B)                                          */
-/*    28 : free_offset   (2B)                                          */
-/*    30 : garbage_offset(2B)                                          */
-/*    32 : num_dir_slots (2B)                                          */
+/*  Page header encode/decode                                         */
+/*                                                                    */
+/*  We store the PageHeader struct at a fixed layout using explicit   */
+/*  byte-by-byte writes so the layout is endian-independent.          */
+/*                                                                    */
+/*  Offsets within the 38-byte header:                                */
+/*    0  : checksum      (4B)                                         */
+/*    4  : page_no       (4B)                                         */
+/*    8  : prev_page     (4B)                                         */
+/*    12 : next_page     (4B)                                         */
+/*    16 : lsn           (8B)                                         */
+/*    24 : page_type     (2B)                                         */
+/*    26 : num_records   (2B)                                         */
+/*    28 : free_offset   (2B)                                         */
+/*    30 : garbage_offset(2B)                                         */
+/*    32 : num_dir_slots (2B)                                         */
 /*    34 : (4 bytes reserved/padding to reach 38B)                    */
 /* ------------------------------------------------------------------ */
 
@@ -119,7 +119,7 @@ void page_write_header(uint8_t *page, const PageHeader *hdr)
 
 /* ------------------------------------------------------------------ */
 /*  FNV-1a checksum over bytes [4 .. PAGE_SIZE-9]                     */
-/*  (skips the checksum field itself and the trailer)                  */
+/*  (skips the checksum field itself and the trailer)                 */
 /* ------------------------------------------------------------------ */
 static uint32_t fnv1a(const uint8_t *data, size_t len)
 {
@@ -149,7 +149,7 @@ int page_verify_checksum(const uint8_t *page)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Page directory helpers                                             */
+/*  Page directory helpers                                            */
 /* ------------------------------------------------------------------ */
 
 uint16_t page_dir_get(const uint8_t *page, uint16_t i)
@@ -170,7 +170,7 @@ uint16_t page_dir_count(const uint8_t *page)
 }
 
 /* ------------------------------------------------------------------ */
-/*  page_init                                                           */
+/*  page_init                                                         */
 /* ------------------------------------------------------------------ */
 int page_init(uint8_t *page, uint32_t page_no, PageType type)
 {
@@ -217,13 +217,13 @@ int page_init(uint8_t *page, uint32_t page_no, PageType type)
 }
 
 /* ------------------------------------------------------------------ */
-/*  page_free_space                                                     */
-/*                                                                      */
-/*  Free space = gap between free_offset (top of records) and the      */
-/*  bottom of the page directory.                                       */
-/*                                                                      */
-/*  Directory bottom = PAGE_SIZE - PAGE_TRAILER_SIZE - 2*(num_slots+1) */
-/*  (+1 because we need room for one more slot after inserting)         */
+/*  page_free_space                                                   */
+/*                                                                    */
+/*  Free space = gap between free_offset (top of records) and the     */
+/*  bottom of the page directory.                                     */
+/*                                                                    */
+/*  Directory bottom = PAGE_SIZE - PAGE_TRAILER_SIZE - 2*(num_slots+1)*/
+/*  (+1 because we need room for one more slot after inserting)       */
 /* ------------------------------------------------------------------ */
 uint16_t page_free_space(const uint8_t *page)
 {
@@ -238,14 +238,14 @@ uint16_t page_free_space(const uint8_t *page)
 }
 
 /* ------------------------------------------------------------------ */
-/*  page_insert_record                                                  */
-/*                                                                      */
-/*  Inserts a new record after the record whose DATA starts at          */
-/*  `predecessor`.  The new record is:                                  */
-/*    [5B RecordHeader][record_data bytes]                              */
-/*                                                                      */
-/*  After insertion, the linked list is:                               */
-/*    ... → predecessor → NEW RECORD → old-predecessor-next → ...      */
+/*  page_insert_record                                                */
+/*                                                                    */
+/*  Inserts a new record after the record whose DATA starts at        */
+/*  `predecessor`.  The new record is:                                */
+/*    [5B RecordHeader][record_data bytes]                            */
+/*                                                                    */
+/*  After insertion, the linked list is:                              */
+/*    ... → predecessor → NEW RECORD → old-predecessor-next → ...     */
 /* ------------------------------------------------------------------ */
 int page_insert_record(uint8_t *page,
                        const uint8_t *record_data, uint16_t record_size,
@@ -301,10 +301,10 @@ int page_insert_record(uint8_t *page,
 }
 
 /* ------------------------------------------------------------------ */
-/*  page_delete_record — lazy deletion                                 */
-/*                                                                      */
-/*  Sets the deleted flag in the record header.                        */
-/*  The record stays in the linked list and directory until compact().  */
+/*  page_delete_record — lazy deletion                                */
+/*                                                                    */
+/*  Sets the deleted flag in the record header.                       */
+/*  The record stays in the linked list and directory until compact() */
 /* ------------------------------------------------------------------ */
 int page_delete_record(uint8_t *page, uint16_t slot_no)
 {
@@ -363,7 +363,7 @@ static uint16_t record_phys_size(const uint8_t *page, uint16_t doff)
 }
 
 /* ------------------------------------------------------------------ */
-/*  page_get_record                                                     */
+/*  page_get_record                                                   */
 /* ------------------------------------------------------------------ */
 int page_get_record(const uint8_t *page, uint16_t slot_no,
                     uint16_t *data_offset, uint16_t *data_size)
@@ -386,11 +386,11 @@ int page_get_record(const uint8_t *page, uint16_t slot_no,
 }
 
 /* ------------------------------------------------------------------ */
-/*  page_compact                                                        */
-/*                                                                      */
-/*  Rebuilds the page by walking the linked list (Infimum → Supremum)  */
-/*  and copying only non-deleted records into a temp buffer.            */
-/*  Then overwrites the original page.                                  */
+/*  page_compact                                                      */
+/*                                                                    */
+/*  Rebuilds the page by walking the linked list (Infimum → Supremum) */
+/*  and copying only non-deleted records into a temp buffer.          */
+/*  Then overwrites the original page.                                */
 /* ------------------------------------------------------------------ */
 int page_compact(uint8_t *page)
 {

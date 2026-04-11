@@ -11,6 +11,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # Storage engine — pure C11 static library
 add_subdirectory(storage_engine)
+add_subdirectory(query_parser)
 
 # Tests
 enable_testing()
