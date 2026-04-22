@@ -8,6 +8,11 @@
 .claude/
 CLAUDE.md
 
+
+# ── GitHub ────────────────────────────────────────────────────────
+.github/
+
+
 # ── CMake build output ─────────────────────────────────────────────────
 build/
 cmake-build-debug/
