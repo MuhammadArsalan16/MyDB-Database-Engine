@@ -1,11 +1,12 @@
 #include "buffer_pool.h"
+#include "page.h"
 #include <string.h>
 
 /* ------------------------------------------------------------------ */
-/*  LRU list helpers                                                    */
-/*                                                                      */
+/*  LRU list helpers                                                  */
+/*                                                                    */
 /*  lru_order[] stores frame indices. Index 0 = MRU, last = LRU.      */
-/*  Moving a frame to MRU: shift everything left one step.             */
+/*  Moving a frame to MRU: shift everything left one step.            */
 /* ------------------------------------------------------------------ */
 
 /* Move frame_idx to the front (MRU position) of the LRU list. */
@@ -63,7 +64,7 @@ static int find_frame(BufferPool *bp, int table_id, uint32_t page_no)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Public API                                                          */
+/*  Public API                                                        */
 /* ------------------------------------------------------------------ */
 
 void bp_init(BufferPool *bp)
@@ -94,9 +95,15 @@ uint8_t *bp_fetch_page(BufferPool *bp, DiskManager *dm,
 
     BPFrame *f = &bp->frames[victim];
 
-    /* Flush the victim's page to disk if it was modified */
+    /*
+     * Flush the victim's page to disk if it was modified.
+     * Use the victim's own DiskManager — the caller's `dm` belongs to
+     * a possibly-different table, and using it would write the victim's
+     * bytes into the wrong file.
+     */
     if (f->is_valid && f->is_dirty) {
-        if (disk_write_page(dm, f->page_no, f->data) != MYDB_OK)
+        page_set_checksum(f->data);
+        if (disk_write_page(f->dm, f->page_no, f->data) != MYDB_OK)
             return NULL;
     }
 
@@ -104,15 +111,25 @@ uint8_t *bp_fetch_page(BufferPool *bp, DiskManager *dm,
     if (disk_read_page(dm, page_no, f->data) != MYDB_OK)
         return NULL;
 
+    /*
+     * Verify checksum on read. Skip verification for freshly-allocated
+     * pages (header page_no == 0), which haven't been page_init'd yet —
+     * bp_alloc_page returns those zeroed pages so the caller can init them.
+     */
+    PageHeader phdr;
+    page_read_header(f->data, &phdr);
+    if (phdr.page_no != 0 && page_verify_checksum(f->data) != MYDB_OK)
+        return NULL;
+
     f->page_no   = page_no;
     f->table_id  = table_id;
+    f->dm        = dm;
     f->pin_count = 1;
     f->is_dirty  = 0;
     f->is_valid  = 1;
 
     if (bp->num_valid < BUFFER_POOL_SIZE) bp->num_valid++;
     lru_touch(bp, victim);   /* promotes victim to MRU */
-    lru_add(bp, victim);     /* ensure it is at front */
 
     return f->data;
 }
@@ -128,31 +145,45 @@ int bp_unpin_page(BufferPool *bp, int table_id, uint32_t page_no, int dirty)
     return MYDB_OK;
 }
 
-int bp_flush_page(BufferPool *bp, DiskManager *dm, int table_id, uint32_t page_no)
+int bp_flush_page(BufferPool *bp, int table_id, uint32_t page_no)
 {
     int fi = find_frame(bp, table_id, page_no);
     if (fi < 0) return MYDB_OK; /* not in cache — nothing to flush */
 
-    if (bp->frames[fi].is_dirty) {
-        if (disk_write_page(dm, bp->frames[fi].page_no, bp->frames[fi].data) != MYDB_OK)
+    BPFrame *f = &bp->frames[fi];
+    if (f->is_dirty) {
+        page_set_checksum(f->data);
+        if (disk_write_page(f->dm, f->page_no, f->data) != MYDB_OK)
             return MYDB_ERR;
-        bp->frames[fi].is_dirty = 0;
+        f->is_dirty = 0;
     }
     return MYDB_OK;
 }
 
-int bp_flush_table(BufferPool *bp, DiskManager *dm, int table_id)
+int bp_flush_table(BufferPool *bp, int table_id)
 {
+    /*
+     * Try to flush every dirty page belonging to this table even if one
+     * write fails. Returning early on the first failure would leave the
+     * remaining dirty pages stuck in the buffer pool while the caller
+     * (e.g. trx_commit) treats the table as half-flushed.
+     */
+    int rc = MYDB_OK;
     for (int i = 0; i < BUFFER_POOL_SIZE; i++) {
-        if (!bp->frames[i].is_valid) continue;
-        if (bp->frames[i].table_id != table_id) continue;
-        if (bp->frames[i].is_dirty) {
-            if (disk_write_page(dm, bp->frames[i].page_no, bp->frames[i].data) != MYDB_OK)
-                return MYDB_ERR;
-            bp->frames[i].is_dirty = 0;
+        BPFrame *f = &bp->frames[i];
+        if (!f->is_valid) continue;
+        if (f->table_id != table_id) continue;
+        if (!f->is_dirty) continue;
+
+        page_set_checksum(f->data);
+        if (disk_write_page(f->dm, f->page_no, f->data) != MYDB_OK) {
+            rc = MYDB_ERR;
+            /* leave is_dirty = 1 so a later flush can retry this page */
+            continue;
         }
+        f->is_dirty = 0;
     }
-    return MYDB_OK;
+    return rc;
 }
 
 uint8_t *bp_alloc_page(BufferPool *bp, DiskManager *dm,

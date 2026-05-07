@@ -31,7 +31,7 @@ static void setup(void)
 
 static void teardown(void)
 {
-    bp_flush_table(&bp, &dm, TABLE_ID);
+    bp_flush_table(&bp, TABLE_ID);
     disk_close(&dm);
     unlink(TEST_FILE);
 }
@@ -262,9 +262,59 @@ static void test_varchar_key(void)
     CHECK(count == 4, "varchar scan returns 4 records");
     CHECK(ordered,    "varchar scan is in alphabetical order");
 
-    bp_flush_table(&bp, &dm, TABLE_ID);
+    bp_flush_table(&bp, TABLE_ID);
     disk_close(&dm);
     unlink(TEST_FILE);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Regression test for issue #2 from the storage engine review.       */
+/*                                                                     */
+/*  Insert keys in random order across enough rows to force at least   */
+/*  one internal-node split, then look up every key. Before the slot   */
+/*  directory was made key-ordered, internal_search assumed slot order */
+/*  matched key order — true for monotonic inserts, false for random.  */
+/*  Random inserts that crossed an internal split would route searches */
+/*  to the wrong child and return "not found" for live rows.           */
+/* ------------------------------------------------------------------- */
+static void test_random_insert_with_internal_splits(void)
+{
+    printf("\n[test_random_insert_with_internal_splits]\n");
+    setup();
+
+    /* Insert 1500 rows in shuffled order — enough for ≥1 internal split. */
+    const int N = 1500;
+    int *keys = malloc(sizeof(int) * N);
+    for (int i = 0; i < N; i++) keys[i] = i;
+    /* Fisher-Yates shuffle with deterministic seed */
+    srand(424242);
+    for (int i = N - 1; i > 0; i--) {
+        int j = rand() % (i + 1);
+        int t = keys[i]; keys[i] = keys[j]; keys[j] = t;
+    }
+
+    int insert_failures = 0;
+    for (int i = 0; i < N; i++) {
+        uint8_t rec[64];
+        char val[16]; snprintf(val, sizeof(val), "v%d", keys[i]);
+        uint16_t rlen = make_record(keys[i], val, rec);
+        Value kv; kv.type = TYPE_INT; kv.is_null = 0; kv.v.int_val = keys[i];
+        if (btree_insert(&bt, &kv, rec, rlen, NULL) != MYDB_OK) insert_failures++;
+    }
+    CHECK(insert_failures == 0, "all 1500 random-order inserts succeed");
+
+    /* Look up every key — every one must be found. */
+    int lookup_failures = 0;
+    for (int i = 0; i < N; i++) {
+        Value kv; kv.type = TYPE_INT; kv.is_null = 0; kv.v.int_val = i;
+        BTreeSearchResult r;
+        if (btree_search(&bt, &kv, &r) != MYDB_OK || !r.found) lookup_failures++;
+    }
+    CHECK(lookup_failures == 0,
+          "every key found after random-order inserts crossing internal splits");
+
+    free(keys);
+    teardown();
 }
 
 /* ------------------------------------------------------------------ */
@@ -278,6 +328,7 @@ int main(void)
     test_scan_ordered();
     test_splits();
     test_varchar_key();
+    test_random_insert_with_internal_splits();
 
     printf("\nResults: %d/%d passed\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

@@ -2,10 +2,10 @@
 #define COMMON_H
 
 #include <stdint.h>
-#include <stddef.h>
+
 
 /* ------------------------------------------------------------------ */
-/*  Page layout constants                                               */
+/*  Page layout constants                                             */
 /* ------------------------------------------------------------------ */
 #define PAGE_SIZE               16384   /* 16 KB per page, matches InnoDB */
 #define PAGE_HEADER_SIZE        38      /* bytes at start of every page */
@@ -15,7 +15,7 @@
 #define RECORD_HEADER_SIZE      5       /* 5-byte header preceding every record */
 
 /* ------------------------------------------------------------------ */
-/*  Size limits                                                         */
+/*  Size limits                                                       */
 /* ------------------------------------------------------------------ */
 #define MAX_TABLE_NAME      64
 #define MAX_COLUMN_NAME     64
@@ -27,32 +27,83 @@
 #define BUFFER_POOL_SIZE    64      /* number of frames in the buffer pool */
 
 /* ------------------------------------------------------------------ */
-/*  Hidden system column sizes (InnoDB-style, present in every row)    */
+/*  Hidden system column sizes (InnoDB-style, present in every row)   */
 /* ------------------------------------------------------------------ */
 #define DB_TRX_ID_SIZE      6   /* transaction ID that last modified the row */
 #define DB_ROLL_PTR_SIZE    7   /* rollback pointer (unused in Phase 1, stored as 0) */
 #define DB_ROW_ID_SIZE      6   /* synthetic row ID, only when table has no PK */
 
 /* ------------------------------------------------------------------ */
-/*  Special values                                                      */
+/*  Special values                                                    */
 /* ------------------------------------------------------------------ */
 #define INVALID_PAGE        UINT32_MAX  /* sentinel for "no page" */
-#define MYDB_MAGIC          0x4D594442  /* "MYDB" — written to page 0 of every file */
+#define MYDB_MAGIC          0x4D594442  /* "MYDB" — written to every MyDB file */
 
 /* ------------------------------------------------------------------ */
-/*  Return codes                                                        */
+/*  File type constants (all files share MYDB_MAGIC; file_type field  */
+/*  at byte offset 6 of every file header distinguishes them)         */
+/* ------------------------------------------------------------------ */
+#define FILETYPE_DATABASE    1   /* __database.mydb        — engine registry */
+#define FILETYPE_CATALOG     2   /* __catalog.mydb         — partition catalog */
+#define FILETYPE_SCHEMA      3   /* __schema.mydb          — schema definition */
+#define FILETYPE_RELATION    4   /* <relation>.mydb        — B+ tree data file */
+#define FILETYPE_USERS       5   /* system_schema/users.mydb */
+#define FILETYPE_PRIVILEGES  6   /* system_schema/privileges.mydb */
+
+/* ------------------------------------------------------------------ */
+/*  On-disk format version. Bumped when any file layout changes in    */
+/*  a way that older binaries can't read.                             */
+/* ------------------------------------------------------------------ */
+#define MYDB_FORMAT_VERSION  1
+
+/* ------------------------------------------------------------------ */
+/*  v2 four-level hierarchy capacities                                */
+/* ------------------------------------------------------------------ */
+#define MAX_PARTITIONS               16   /* per __database.mydb */
+#define MAX_SCHEMAS_PER_PARTITION    64   /* per __catalog.mydb */
+#define MAX_RELATIONS_PER_SCHEMA     64   /* per __schema.mydb */
+
+/* ------------------------------------------------------------------ */
+/*  Fixed-size metadata file sizes                                    */
+/* ------------------------------------------------------------------ */
+#define DATABASE_FILE_SIZE   8192                          /* 8 KB */
+#define CATALOG_FILE_SIZE    4096                          /* 4 KB */
+#define SCHEMA_FILE_PAGES    65                            /* 1 dir + 64 RelationDef */
+#define SCHEMA_FILE_SIZE    (SCHEMA_FILE_PAGES * PAGE_SIZE) /* ~1 MB */
+
+/* system_schema/users.mydb: 32 user slots, ~8 KB total */
+#define USERS_FILE_SIZE        8192
+#define USERS_MAX_SLOTS          32
+
+/* system_schema/privileges.mydb: 256 grant slots, ~16 KB total */
+#define PRIVILEGES_FILE_SIZE   16384
+#define PRIVILEGES_MAX_SLOTS     256
+
+/* Identity / credential field widths (raw bytes on disk) */
+#define MAX_USERNAME             32   /* VARCHAR(32) — design doc §3.1 */
+#define USER_PASSWORD_HASH_LEN   32   /* SHA-256 raw output */
+#define USER_PASSWORD_SALT_LEN   16   /* per-user random salt */
+
+/* ------------------------------------------------------------------ */
+/*  Return codes                                                      */
 /* ------------------------------------------------------------------ */
 #define MYDB_OK                  0
-#define MYDB_ERR                -1
-#define MYDB_ERR_NOT_FOUND      -2
-#define MYDB_ERR_DUPLICATE      -3
-#define MYDB_ERR_FULL           -4
-#define MYDB_ERR_FK_VIOLATION   -5
-#define MYDB_ERR_NULL_VIOLATION -6
-#define MYDB_ERR_NO_TXN         -7
+#define MYDB_ERR                (-1)
+#define MYDB_ERR_NOT_FOUND      (-2)
+#define MYDB_ERR_DUPLICATE      (-3)
+#define MYDB_ERR_FULL           (-4)
+#define MYDB_ERR_FK_VIOLATION   (-5)
+#define MYDB_ERR_NULL_VIOLATION (-6)
+#define MYDB_ERR_NO_TXN         (-7)
+#define MYDB_ERR_PERM           (-8)   /* user lacks permission for the operation */
+#define MYDB_ERR_CROSS_SCHEMA   (-9)   /* query references a schema other than active */
+#define MYDB_ERR_BAD_MAGIC     (-10)   /* file header magic mismatch */
+#define MYDB_ERR_BAD_FILE_TYPE (-11)   /* file_type field doesn't match expected */
+#define MYDB_ERR_BAD_VERSION   (-12)   /* on-disk version newer than this binary */
+#define MYDB_ERR_BAD_CHECKSUM  (-13)   /* file or page checksum mismatch */
 
 /* ------------------------------------------------------------------ */
-/*  Data types supported by MyDB                                        */
+/*  Data types supported by MyDB                                      */
 /* ------------------------------------------------------------------ */
 typedef enum {
     TYPE_INT      = 0,  /* 4 bytes, signed 32-bit integer */
@@ -65,7 +116,7 @@ typedef enum {
 } DataType;
 
 /* ------------------------------------------------------------------ */
-/*  Page types                                                          */
+/*  Page types                                                        */
 /* ------------------------------------------------------------------ */
 typedef enum {
     PAGE_TYPE_DATA  = 0,    /* leaf page — stores full rows */
@@ -74,7 +125,7 @@ typedef enum {
 } PageType;
 
 /* ------------------------------------------------------------------ */
-/*  Record types (stored in the 3 low bits of heap_no field)           */
+/*  Record types (stored in the 3 low bits of heap_no field)          */
 /* ------------------------------------------------------------------ */
 typedef enum {
     REC_ORDINARY  = 0,  /* normal user row */
@@ -84,7 +135,7 @@ typedef enum {
 } RecordType;
 
 /* ------------------------------------------------------------------ */
-/*  Record ID — uniquely identifies a record on disk                   */
+/*  Record ID — uniquely identifies a record on disk                  */
 /* ------------------------------------------------------------------ */
 typedef struct {
     uint32_t page_no;   /* which page */
@@ -92,9 +143,9 @@ typedef struct {
 } RID;
 
 /* ------------------------------------------------------------------ */
-/*  Value — tagged union holding any column value                       */
-/*                                                                      */
-/*  is_null is a separate flag so we can distinguish NULL from 0/""    */
+/*  Value — tagged union holding any column value                     */
+/*                                                                    */
+/*  is_null is a separate flag so we can distinguish NULL from 0/""   */
 /* ------------------------------------------------------------------ */
 typedef struct {
     DataType type;
@@ -114,10 +165,10 @@ typedef struct {
 } Value;
 
 /* ------------------------------------------------------------------ */
-/*  Forward declarations (full definitions in their own headers)        */
+/*  Forward declarations (full definitions in their own headers)      */
 /* ------------------------------------------------------------------ */
 typedef struct Row         Row;
-typedef struct Schema      Schema;
+typedef struct RelationDef RelationDef;
 typedef struct Cursor      Cursor;
 typedef struct ColumnDef   ColumnDef;
 

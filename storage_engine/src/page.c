@@ -238,73 +238,134 @@ uint16_t page_free_space(const uint8_t *page)
 }
 
 /* ------------------------------------------------------------------ */
-/*  page_insert_record                                                */
+/*  page_check_invariants — debug-only integrity oracle               */
 /*                                                                    */
-/*  Inserts a new record after the record whose DATA starts at        */
-/*  `predecessor`.  The new record is:                                */
-/*    [5B RecordHeader][record_data bytes]                            */
+/*  After every mutator, asserts:                                     */
+/*    - num_records == num_dir_slots                                  */
+/*    - Walking the linked list (Infimum→Supremum) and skipping       */
+/*      records with the deleted flag yields the same sequence of     */
+/*      data offsets as iterating the directory dir[0..n-1].          */
 /*                                                                    */
-/*  After insertion, the linked list is:                              */
-/*    ... → predecessor → NEW RECORD → old-predecessor-next → ...     */
+/*  This catches: slot-shift memmove bugs, drift between counters,    */
+/*  out-of-sync mutations of list vs. directory, and next_offset      */
+/*  corruption from any source.                                       */
+/* ------------------------------------------------------------------ */
+
+void page_check_invariants(const uint8_t *page)
+{
+    PageHeader hdr;
+    page_read_header(page, &hdr);
+
+    assert(hdr.num_records == hdr.num_dir_slots);
+
+    RecordHeader inf_hdr;
+    rec_hdr_decode(page + INFIMUM_OFFSET, &inf_hdr);
+
+    uint16_t cur = inf_hdr.next_offset;
+    uint16_t i   = 0;
+    /* Bound the walk so corrupt next_offset can't loop forever */
+    uint16_t steps = 0;
+    while (cur != SUPREMUM_DATA && cur != 0 && steps < 8192) {
+        RecordHeader rh;
+        rec_hdr_decode(page + cur - RECORD_HEADER_SIZE, &rh);
+
+        if (!(rh.info_flags & 0x01)) {  /* live */
+            assert(i < hdr.num_dir_slots);
+            assert(page_dir_get(page, i) == cur);
+            i++;
+        }
+        cur = rh.next_offset;
+        steps++;
+    }
+    assert(i == hdr.num_dir_slots);
+}
+
+/* ------------------------------------------------------------------ */
+/*  page_insert_record — key-ordered slot directory                   */
+/*                                                                    */
+/*  Inserts a new record at directory slot `at_slot`. Existing slots  */
+/*  [at_slot .. n-1] shift right by one. The linked list is spliced   */
+/*  after the predecessor record (slot at_slot-1, or Infimum).        */
+/*                                                                    */
+/*  Physical layout: record bytes are still appended at free_offset.  */
+/*  Only the directory and linked list reflect key order.             */
 /* ------------------------------------------------------------------ */
 int page_insert_record(uint8_t *page,
                        const uint8_t *record_data, uint16_t record_size,
-                       uint16_t predecessor,
-                       uint16_t *slot_no)
+                       uint16_t at_slot)
 {
-    if (!page || !record_data || !slot_no) return MYDB_ERR;
+    if (!page || !record_data) return MYDB_ERR;
+
+    PageHeader hdr;
+    page_read_header(page, &hdr);
+
+    if (at_slot > hdr.num_dir_slots) return MYDB_ERR;
 
     /* Total bytes needed: record header + data + one directory slot (2B) */
     uint16_t total = RECORD_HEADER_SIZE + record_size + 2;
     if (page_free_space(page) < total) return MYDB_ERR_FULL;
 
-    PageHeader hdr;
-    page_read_header(page, &hdr);
+    /* Where we will write the new record physically */
+    uint16_t rec_offset  = hdr.free_offset;
+    uint16_t data_offset = rec_offset + RECORD_HEADER_SIZE;
 
-    /* Where we will write the new record */
-    uint16_t rec_offset  = hdr.free_offset;           /* start of 5B header */
-    uint16_t data_offset = rec_offset + RECORD_HEADER_SIZE;  /* start of payload */
+    /* Determine predecessor in the linked list:
+     *   at_slot == 0 → Infimum
+     *   else        → record at slot (at_slot - 1)
+     */
+    uint16_t pred_data_off;
+    if (at_slot == 0) {
+        pred_data_off = INFIMUM_DATA;
+    } else {
+        pred_data_off = page_dir_get(page, at_slot - 1);
+    }
 
-    /* Read predecessor's header to get its current next_offset */
     RecordHeader pred_hdr;
-    rec_hdr_decode(page + predecessor - RECORD_HEADER_SIZE, &pred_hdr);
+    rec_hdr_decode(page + pred_data_off - RECORD_HEADER_SIZE, &pred_hdr);
     uint16_t old_next = pred_hdr.next_offset;
 
-    /* Build the new record header:
-       - next_offset points to what predecessor used to point to
-       - heap_no = num_records + 2  (0=infimum, 1=supremum, 2+ = user rows) */
+    /* Build new record header. heap_no is informational only; using
+     * num_records+2 here is just a stable label, no longer a unique id
+     * (deletes don't reuse heap_no, but the directory carries identity). */
     RecordHeader new_hdr;
     new_hdr.info_flags  = 0;
     new_hdr.heap_type   = (uint16_t)(((hdr.num_records + 2) << 3) | REC_ORDINARY);
     new_hdr.next_offset = old_next;
     rec_hdr_encode(&new_hdr, page + rec_offset);
 
-    /* Write the record payload */
+    /* Write payload */
     memcpy(page + data_offset, record_data, record_size);
 
-    /* Splice into the linked list: predecessor now points to us */
+    /* Splice into linked list */
     pred_hdr.next_offset = data_offset;
-    rec_hdr_encode(&pred_hdr, page + predecessor - RECORD_HEADER_SIZE);
+    rec_hdr_encode(&pred_hdr, page + pred_data_off - RECORD_HEADER_SIZE);
 
-    /* Add a page directory slot for this record */
-    uint16_t new_slot = hdr.num_dir_slots;
-    page_dir_set(page, new_slot, data_offset);
+    /* Shift directory slots [at_slot .. n-1] right by one (toward lower
+     * memory addresses, since slot i lives at PAGE_SIZE-trailer-2-2*i). */
+    for (int i = (int)hdr.num_dir_slots; i > (int)at_slot; i--) {
+        uint16_t v = page_dir_get(page, (uint16_t)(i - 1));
+        page_dir_set(page, (uint16_t)i, v);
+    }
+    page_dir_set(page, at_slot, data_offset);
 
-    /* Update the page header */
+    /* Update header */
     hdr.free_offset   = data_offset + record_size;
     hdr.num_records++;
     hdr.num_dir_slots++;
     page_write_header(page, &hdr);
 
-    *slot_no = new_slot;
+    page_check_invariants(page);
     return MYDB_OK;
 }
 
 /* ------------------------------------------------------------------ */
-/*  page_delete_record — lazy deletion                                */
+/*  page_delete_record                                                */
 /*                                                                    */
-/*  Sets the deleted flag in the record header.                       */
-/*  The record stays in the linked list and directory until compact() */
+/*  Sets the deleted flag on the record (physical bytes stay in place */
+/*  until page_compact reclaims them) AND removes the slot from the   */
+/*  directory. The linked list is left intact: the deleted record     */
+/*  remains threaded with its delete bit set, but no directory slot   */
+/*  references it. page_compact rebuilds both list and directory.     */
 /* ------------------------------------------------------------------ */
 int page_delete_record(uint8_t *page, uint16_t slot_no)
 {
@@ -322,41 +383,57 @@ int page_delete_record(uint8_t *page, uint16_t slot_no)
 
     if (rh.info_flags & 0x01) return MYDB_ERR;  /* already deleted */
 
-    rh.info_flags |= 0x01;  /* set deleted bit */
+    rh.info_flags |= 0x01;
     rec_hdr_encode(&rh, page + rec_offset);
 
+    /* Shift directory slots [slot_no+1 .. n-1] left by one */
+    for (uint16_t i = slot_no; i + 1 < hdr.num_dir_slots; i++) {
+        uint16_t v = page_dir_get(page, (uint16_t)(i + 1));
+        page_dir_set(page, i, v);
+    }
+
     hdr.num_records--;
+    hdr.num_dir_slots--;
     page_write_header(page, &hdr);
+
+    page_check_invariants(page);
     return MYDB_OK;
 }
 
 /*
- * Compute the physical size of the record at data_offset `doff` by
- * scanning the directory for the nearest record that physically follows
- * doff (i.e., has the smallest data_offset > doff).
+ * Compute the physical size of the record at data_offset `doff`.
  *
- * This approach is correct regardless of whether records were inserted
- * in key order or not, because records are always appended physically
- * at free_offset even when they are spliced earlier in the linked list.
+ * Records are appended physically at free_offset regardless of key
+ * position. The physical end of a record is the start of the next
+ * physically-following record's header, or free_offset if it is the
+ * physically last record.
+ *
+ * We walk the linked list (which threads ALL records — live AND
+ * deleted, since delete is logical) and take the smallest data offset
+ * greater than `doff`. The directory alone is insufficient here,
+ * because a deleted record may sit physically between two live ones,
+ * but the directory only references live records.
  */
 static uint16_t record_phys_size(const uint8_t *page, uint16_t doff)
 {
     PageHeader hdr;
     page_read_header(page, &hdr);
 
-    /* Default end = free_offset (no physically later record exists) */
     uint16_t next_phys_hdr = hdr.free_offset;
 
-    uint16_t n = hdr.num_dir_slots;
-    for (uint16_t i = 0; i < n; i++) {
-        uint16_t d = page_dir_get(page, i);
-        if (d > doff) {
-            /* d - RECORD_HEADER_SIZE is where this neighbour's header starts,
-               which is also where the current record's data ends. */
-            uint16_t hdr_start = d - RECORD_HEADER_SIZE;
-            if (hdr_start < next_phys_hdr)
-                next_phys_hdr = hdr_start;
+    RecordHeader inf_hdr;
+    rec_hdr_decode(page + INFIMUM_OFFSET, &inf_hdr);
+    uint16_t cur   = inf_hdr.next_offset;
+    uint16_t steps = 0;
+    while (cur != SUPREMUM_DATA && cur != 0 && steps < 8192) {
+        if (cur > doff) {
+            uint16_t hs = cur - RECORD_HEADER_SIZE;
+            if (hs < next_phys_hdr) next_phys_hdr = hs;
         }
+        RecordHeader rh;
+        rec_hdr_decode(page + cur - RECORD_HEADER_SIZE, &rh);
+        cur = rh.next_offset;
+        steps++;
     }
 
     return (next_phys_hdr > doff) ? (uint16_t)(next_phys_hdr - doff) : 0;
@@ -388,9 +465,11 @@ int page_get_record(const uint8_t *page, uint16_t slot_no,
 /* ------------------------------------------------------------------ */
 /*  page_compact                                                      */
 /*                                                                    */
-/*  Rebuilds the page by walking the linked list (Infimum → Supremum) */
-/*  and copying only non-deleted records into a temp buffer.          */
-/*  Then overwrites the original page.                                */
+/*  Rebuilds the page from scratch by iterating the directory (which  */
+/*  is in key order, contains only live records). Each record is      */
+/*  appended into a fresh page via page_insert_record, which produces */
+/*  a clean linked list with no dead nodes and a tight physical       */
+/*  layout.                                                           */
 /* ------------------------------------------------------------------ */
 int page_compact(uint8_t *page)
 {
@@ -399,57 +478,26 @@ int page_compact(uint8_t *page)
     PageHeader hdr;
     page_read_header(page, &hdr);
 
-    /* Work in a temporary buffer so we can rebuild cleanly */
+    /* Work in a temporary buffer */
     uint8_t tmp[PAGE_SIZE];
     page_init(tmp, hdr.page_no, (PageType)hdr.page_type);
 
-    /*
-     * Walk the original linked list from Infimum to Supremum,
-     * re-inserting every non-deleted record into `tmp`.
-     */
-    uint16_t cur = INFIMUM_DATA;   /* start at infimum's data */
-    RecordHeader cur_hdr;
-    rec_hdr_decode(page + cur - RECORD_HEADER_SIZE, &cur_hdr);
-    cur = cur_hdr.next_offset;     /* first real record (or supremum) */
+    /* Preserve leaf-chain pointers and page-level fields */
+    PageHeader thdr;
+    page_read_header(tmp, &thdr);
+    thdr.prev_page = hdr.prev_page;
+    thdr.next_page = hdr.next_page;
+    thdr.lsn       = hdr.lsn;
+    page_write_header(tmp, &thdr);
 
-    uint16_t slot;
-    while (cur != SUPREMUM_DATA && cur != 0) {
-        rec_hdr_decode(page + cur - RECORD_HEADER_SIZE, &cur_hdr);
-
-        if (!(cur_hdr.info_flags & 0x01)) {
-            /* Live record — figure out its size the same way page_get_record does */
-            uint16_t next = cur_hdr.next_offset;
-            PageHeader orig_hdr;
-            page_read_header(page, &orig_hdr);
-
-            uint16_t end;
-            if (next == 0 || next == SUPREMUM_DATA)
-                end = orig_hdr.free_offset;
-            else
-                end = next - RECORD_HEADER_SIZE;
-
-            uint16_t sz = (end > cur) ? (end - cur) : 0;
-
-            /* Insert at the end of the chain in the new page (predecessor = last record or infimum) */
-            PageHeader tmp_hdr;
-            page_read_header(tmp, &tmp_hdr);
-
-            /* Find the current last record in tmp by walking its chain */
-            uint16_t pred = INFIMUM_DATA;
-            RecordHeader ph;
-            rec_hdr_decode(tmp + INFIMUM_OFFSET, &ph);
-            while (ph.next_offset != SUPREMUM_DATA && ph.next_offset != 0) {
-                pred = ph.next_offset;
-                rec_hdr_decode(tmp + pred - RECORD_HEADER_SIZE, &ph);
-            }
-
-            page_insert_record(tmp, page + cur, sz, pred, &slot);
-        }
-
-        cur = cur_hdr.next_offset;
+    uint16_t n = hdr.num_dir_slots;
+    for (uint16_t i = 0; i < n; i++) {
+        uint16_t doff, dsz;
+        if (page_get_record(page, i, &doff, &dsz) != MYDB_OK) continue;
+        page_insert_record(tmp, page + doff, dsz, i);
     }
 
-    /* Copy the compacted page back */
     memcpy(page, tmp, PAGE_SIZE);
+    page_check_invariants(page);
     return MYDB_OK;
 }

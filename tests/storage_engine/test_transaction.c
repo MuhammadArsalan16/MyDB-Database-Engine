@@ -3,6 +3,15 @@
 #include <unistd.h>
 
 #include "transaction.h"
+#include "page.h"
+
+/*
+ * Tests scribble small markers ("COMMITTED", "ORIGINAL", …) into pages.
+ * Pages now carry a managed checksum at offset 0; writes/reads of the
+ * markers happen in the user-records region instead so they don't
+ * collide with the checksum bytes that flush stamps.
+ */
+#define MARK_OFF USER_RECORDS_OFFSET
 
 #define TEST_FILE_A  "/tmp/mydb_test_trx_a.mydb"
 #define TEST_FILE_B  "/tmp/mydb_test_trx_b.mydb"
@@ -219,7 +228,7 @@ static void test_commit_flushes_to_disk(void)
 
     /* write a marker into page 1 through the buffer pool */
     uint8_t *page = bp_fetch_page(&bp, &dm_a, TABLE_A, 1);
-    memcpy(page, "COMMITTED", 9);
+    memcpy(page + MARK_OFF, "COMMITTED", 9);
     bp_unpin_page(&bp, TABLE_A, 1, /*dirty=*/1);
 
     trx_commit(&tm);
@@ -227,8 +236,8 @@ static void test_commit_flushes_to_disk(void)
     /* read page 1 directly from disk — bypassing the buffer pool */
     uint8_t disk_buf[PAGE_SIZE];
     int rc = disk_read_page(&dm_a, 1, disk_buf);
-    CHECK(rc == MYDB_OK,                         "disk_read_page OK after commit");
-    CHECK(memcmp(disk_buf, "COMMITTED", 9) == 0, "committed data is on disk");
+    CHECK(rc == MYDB_OK,                                    "disk_read_page OK after commit");
+    CHECK(memcmp(disk_buf + MARK_OFF, "COMMITTED", 9) == 0, "committed data is on disk");
 
     teardown();
 }
@@ -243,17 +252,19 @@ static void test_rollback_discards_dirty(void)
     printf("\n[test_rollback_discards_dirty]\n");
     setup_one();
 
-    /* write known content to page 1 on disk directly (pre-transaction state) */
+    /* write known content to page 1 on disk directly (pre-transaction state).
+     * Must be a valid page (init + checksum) so bp_fetch_page passes verify. */
     uint8_t original[PAGE_SIZE];
-    memset(original, 0, PAGE_SIZE);
-    memcpy(original, "ORIGINAL", 8);
+    page_init(original, 1, PAGE_TYPE_DATA);
+    memcpy(original + MARK_OFF, "ORIGINAL", 8);
+    page_set_checksum(original);
     disk_write_page(&dm_a, 1, original);
 
     trx_begin(&tm);
 
     /* overwrite through the buffer pool (in-memory only so far) */
     uint8_t *page = bp_fetch_page(&bp, &dm_a, TABLE_A, 1);
-    memcpy(page, "MODIFIED", 8);
+    memcpy(page + MARK_OFF, "MODIFIED", 8);
     bp_unpin_page(&bp, TABLE_A, 1, /*dirty=*/1);
 
     trx_rollback(&tm);
@@ -261,12 +272,13 @@ static void test_rollback_discards_dirty(void)
     /* page 1 should have been evicted; disk should still hold "ORIGINAL" */
     uint8_t disk_buf[PAGE_SIZE];
     disk_read_page(&dm_a, 1, disk_buf);
-    CHECK(memcmp(disk_buf, "ORIGINAL", 8) == 0, "disk unchanged after rollback");
+    CHECK(memcmp(disk_buf + MARK_OFF, "ORIGINAL", 8) == 0, "disk unchanged after rollback");
 
     /* fetching the page again from buffer pool should reload "ORIGINAL" */
     trx_begin(&tm);
     page = bp_fetch_page(&bp, &dm_a, TABLE_A, 1);
-    CHECK(memcmp(page, "ORIGINAL", 8) == 0, "buffer pool reloads original after rollback");
+    CHECK(memcmp(page + MARK_OFF, "ORIGINAL", 8) == 0,
+          "buffer pool reloads original after rollback");
     bp_unpin_page(&bp, TABLE_A, 1, 0);
     trx_commit(&tm);
 
@@ -283,8 +295,8 @@ static void test_commit_multiple_tables(void)
 
     uint8_t *pa = bp_fetch_page(&bp, &dm_a, TABLE_A, 1);
     uint8_t *pb = bp_fetch_page(&bp, &dm_b, TABLE_B, 1);
-    memcpy(pa, "TABLE_A", 7);
-    memcpy(pb, "TABLE_B", 7);
+    memcpy(pa + MARK_OFF, "TABLE_A", 7);
+    memcpy(pb + MARK_OFF, "TABLE_B", 7);
     bp_unpin_page(&bp, TABLE_A, 1, 1);
     bp_unpin_page(&bp, TABLE_B, 1, 1);
 
@@ -293,10 +305,10 @@ static void test_commit_multiple_tables(void)
 
     uint8_t buf[PAGE_SIZE];
     disk_read_page(&dm_a, 1, buf);
-    CHECK(memcmp(buf, "TABLE_A", 7) == 0, "table A data flushed to disk");
+    CHECK(memcmp(buf + MARK_OFF, "TABLE_A", 7) == 0, "table A data flushed to disk");
 
     disk_read_page(&dm_b, 1, buf);
-    CHECK(memcmp(buf, "TABLE_B", 7) == 0, "table B data flushed to disk");
+    CHECK(memcmp(buf + MARK_OFF, "TABLE_B", 7) == 0, "table B data flushed to disk");
 
     teardown();
 }
@@ -307,17 +319,23 @@ static void test_rollback_multiple_tables(void)
     printf("\n[test_rollback_multiple_tables]\n");
     setup_two();
 
-    /* lay down original content on disk for both tables */
-    uint8_t orig[PAGE_SIZE]; memset(orig, 0, PAGE_SIZE);
-    memcpy(orig, "ORIG_A", 6); disk_write_page(&dm_a, 1, orig);
-    memcpy(orig, "ORIG_B", 6); disk_write_page(&dm_b, 1, orig);
+    /* lay down original content on disk for both tables (valid pages) */
+    uint8_t orig[PAGE_SIZE];
+    page_init(orig, 1, PAGE_TYPE_DATA);
+    memcpy(orig + MARK_OFF, "ORIG_A", 6);
+    page_set_checksum(orig);
+    disk_write_page(&dm_a, 1, orig);
+    page_init(orig, 1, PAGE_TYPE_DATA);
+    memcpy(orig + MARK_OFF, "ORIG_B", 6);
+    page_set_checksum(orig);
+    disk_write_page(&dm_b, 1, orig);
 
     trx_begin(&tm);
 
     uint8_t *pa = bp_fetch_page(&bp, &dm_a, TABLE_A, 1);
     uint8_t *pb = bp_fetch_page(&bp, &dm_b, TABLE_B, 1);
-    memcpy(pa, "MOD_A", 5);
-    memcpy(pb, "MOD_B", 5);
+    memcpy(pa + MARK_OFF, "MOD_A", 5);
+    memcpy(pb + MARK_OFF, "MOD_B", 5);
     bp_unpin_page(&bp, TABLE_A, 1, 1);
     bp_unpin_page(&bp, TABLE_B, 1, 1);
 
@@ -326,10 +344,10 @@ static void test_rollback_multiple_tables(void)
 
     uint8_t buf[PAGE_SIZE];
     disk_read_page(&dm_a, 1, buf);
-    CHECK(memcmp(buf, "ORIG_A", 6) == 0, "table A disk unchanged after rollback");
+    CHECK(memcmp(buf + MARK_OFF, "ORIG_A", 6) == 0, "table A disk unchanged after rollback");
 
     disk_read_page(&dm_b, 1, buf);
-    CHECK(memcmp(buf, "ORIG_B", 6) == 0, "table B disk unchanged after rollback");
+    CHECK(memcmp(buf + MARK_OFF, "ORIG_B", 6) == 0, "table B disk unchanged after rollback");
 
     teardown();
 }
@@ -343,20 +361,20 @@ static void test_sequential_transactions(void)
     /* txn 1: write and commit */
     trx_begin(&tm);
     uint8_t *p = bp_fetch_page(&bp, &dm_a, TABLE_A, 1);
-    memcpy(p, "TXN1", 4);
+    memcpy(p + MARK_OFF, "TXN1", 4);
     bp_unpin_page(&bp, TABLE_A, 1, 1);
     trx_commit(&tm);
 
     /* txn 2: write and commit */
     trx_begin(&tm);
     p = bp_fetch_page(&bp, &dm_a, TABLE_A, 1);
-    memcpy(p, "TXN2", 4);
+    memcpy(p + MARK_OFF, "TXN2", 4);
     bp_unpin_page(&bp, TABLE_A, 1, 1);
     trx_commit(&tm);
 
     uint8_t buf[PAGE_SIZE];
     disk_read_page(&dm_a, 1, buf);
-    CHECK(memcmp(buf, "TXN2", 4) == 0, "last committed value is on disk");
+    CHECK(memcmp(buf + MARK_OFF, "TXN2", 4) == 0, "last committed value is on disk");
     CHECK(tm.next_id == 3,             "next_id advanced to 3 after two transactions");
 
     teardown();

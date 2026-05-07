@@ -2,27 +2,38 @@
 #define STORAGE_H
 
 #include "common.h"
-#include "schema.h"
+#include "relation_def.h"
 #include "transaction.h"
 #include "btree.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /*
  * storage.h — public interface for the execution engine
  *
- * This is the only header the execution engine needs to include.
- * It ties together disk manager, buffer pool, B+ Tree, schema catalog,
- * and transaction manager into a single unified API.
+ * Phase 9 rewrite: storage is now session-aware. All DDL / DML / DQL
+ * functions take a `RelationDef *` instead of a table-name string;
+ * the parser is responsible for validating the identifier at parse
+ * time (looking it up via engine_find_relation) and handing storage
+ * a validated pointer.
  *
  * Usage:
- *   storage_init("/path/to/data/dir");   // once at startup
+ *   storage_init(&eng);          // once after engine_login + engine_use_schema
  *   storage_begin();
- *   storage_insert("users", &row);
+ *   storage_insert(rel, &row);
  *   storage_commit();
- *   storage_shutdown();                  // once at exit
+ *   storage_shutdown();          // once before engine_close
  *
  * All functions return MYDB_OK (0) on success, negative error codes on failure.
  * storage_get_by_pk and cursor_next return NULL on miss / end-of-scan.
  */
+
+/* Forward declaration — full definition lives in engine.h. Storage
+ * keeps a pointer to the engine session for filesystem paths, the
+ * active SchemaFile (Cache 2) and the active partition catalog. */
+struct EngineState;
 
 /* ------------------------------------------------------------------ */
 /*  Row — one table row (forward-declared in common.h)                  */
@@ -37,12 +48,11 @@ struct Row {
 /*  Engine lifecycle                                                     */
 /* ------------------------------------------------------------------ */
 
-/*
- * Initialise the storage engine: open the schema catalog in data_dir,
- * set up the buffer pool and transaction manager.
- * Must be called once before any other storage_* function.
- */
-int storage_init(const char *data_dir);
+/* Initialise the storage runtime against an open engine session.
+ * The caller must already have called engine_init + engine_login.
+ * `engine_use_schema` may be called before OR after storage_init —
+ * storage resolves the active schema lazily on each call. */
+int storage_init(struct EngineState *eng);
 
 /* Commit any open transaction, flush everything, close all files. */
 int storage_shutdown(void);
@@ -52,14 +62,19 @@ int storage_shutdown(void);
 /* ------------------------------------------------------------------ */
 
 /*
- * Create a new table.  schema->root_page_no and secondary_root_page_no[]
- * are set by this function; the caller should not fill them in.
- * Returns MYDB_ERR_DUPLICATE if a table with that name already exists.
+ * Create a new relation in the active schema. `rel` is mutated:
+ *   rel->root_page_no and rel->secondary_root_page_no[] are filled in
+ *   by this function.
+ * Persists the RelationDef into __schema.mydb and creates the
+ * <relation>.mydb data file under the active partition.
+ *
+ * Returns MYDB_ERR_DUPLICATE if a relation with that name already exists.
  */
-int storage_create_table(const char *name, Schema *schema);
+int storage_create_table(RelationDef *rel);
 
-/* Delete a table's data file and remove it from the catalog. */
-int storage_drop_table(const char *name);
+/* Drop the relation: deletes its data file and removes its slot from
+ * __schema.mydb. */
+int storage_drop_table(RelationDef *rel);
 
 /* ------------------------------------------------------------------ */
 /*  DML                                                                 */
@@ -69,20 +84,20 @@ int storage_drop_table(const char *name);
  * Insert a row.
  * - NOT NULL columns must have non-null values in row->cols[].
  * - AUTO_INCREMENT PK: set row->cols[pk_idx] to is_null=1 or int_val=0
- *   and the engine will fill in the next counter value.
+ *   and the engine fills in the next counter value.
  * - UNIQUE columns: returns MYDB_ERR_DUPLICATE on violation.
  */
-int storage_insert(const char *table, Row *row);
+int storage_insert(RelationDef *rel, Row *row);
 
 /*
  * Update the row identified by rid with the values in new_row.
  * Internally: delete old record + insert new record.
  * rid is obtained from row->rid returned by storage_get_by_pk / cursor_next.
  */
-int storage_update(const char *table, RID rid, Row *new_row);
+int storage_update(RelationDef *rel, RID rid, Row *new_row);
 
 /* Delete the row identified by rid. */
-int storage_delete(const char *table, RID rid);
+int storage_delete(RelationDef *rel, RID rid);
 
 /* ------------------------------------------------------------------ */
 /*  DQL                                                                 */
@@ -93,20 +108,16 @@ int storage_delete(const char *table, RID rid);
  * Returns a pointer to an internal static Row, or NULL if not found.
  * The pointer is valid until the next storage_get_by_pk call.
  */
-Row *storage_get_by_pk(const char *table, Value *pk);
+Row *storage_get_by_pk(RelationDef *rel, Value *pk);
 
 /*
- * Open a full-table scan cursor.
- * Returns NULL on error (table not found, etc.).
- * The cursor must be closed with cursor_close() when done.
+ * Open a full-table scan cursor. NULL on error.
+ * The cursor must be closed with cursor_close().
  */
-Cursor *storage_scan(const char *table);
+Cursor *storage_scan(RelationDef *rel);
 
-/*
- * Advance the cursor and return a pointer to the next row.
- * Returns NULL when there are no more rows.
- * The pointed-to Row is owned by the cursor; do not free it.
- */
+/* Advance the cursor and return a pointer to the next row, or NULL at
+ * end-of-scan. The pointed-to Row is owned by the cursor. */
 Row *cursor_next(Cursor *cursor);
 
 /* Close a scan cursor and free its resources. */
@@ -119,5 +130,9 @@ void cursor_close(Cursor *cursor);
 int storage_begin(void);
 int storage_commit(void);
 int storage_rollback(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* STORAGE_H */

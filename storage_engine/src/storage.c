@@ -1,5 +1,7 @@
 #include "storage.h"
+#include "engine.h"
 #include "page.h"
+#include "buffer_pool.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -9,7 +11,9 @@
 /*  Internal types                                                       */
 /* ------------------------------------------------------------------ */
 
-/* One entry in the open-table registry */
+/* One entry in the open-table registry. Storage caches DiskManager +
+ * BTree handles per relation_name so a single SQL session doesn't
+ * reopen the file on every call. */
 typedef struct {
     char        name[MAX_TABLE_NAME];
     int         id;             /* table_id used with the buffer pool */
@@ -20,28 +24,27 @@ typedef struct {
 } OpenTable;
 
 /*
- * StorageScan — wraps a BTree cursor with schema context.
+ * StorageScan — wraps a BTree cursor with relation context.
  * storage_scan() returns (Cursor *)scan; cursor_next/close cast it back.
  * struct Cursor MUST be the first member so the cast is valid.
  */
 typedef struct {
-    Cursor    btree_cur;    /* must be first */
-    OpenTable *ot;
-    Schema    *schema;
-    Row       current_row;
-    uint8_t   rec_buf[PAGE_SIZE];
+    Cursor       btree_cur;     /* must be first */
+    OpenTable   *ot;
+    RelationDef *rel;
+    Row          current_row;
+    uint8_t      rec_buf[PAGE_SIZE];
 } StorageScan;
 
 /* Singleton storage state (one engine per process) */
 typedef struct {
-    SchemaCatalog      catalog;
-    BufferPool         bp;
-    TransactionManager trx;
-    OpenTable          open_tables[MAX_TABLES];
-    int                num_open;
-    int                next_table_id;  /* monotonic counter for table IDs */
-    char               data_dir[256];
-    int                initialized;
+    EngineState        *eng;             /* set by storage_init */
+    BufferPool          bp;
+    TransactionManager  trx;
+    OpenTable           open_tables[MAX_TABLES];
+    int                 num_open;
+    int                 next_table_id;   /* monotonic counter for table IDs */
+    int                 initialized;
 } StorageState;
 
 /*
@@ -54,13 +57,18 @@ static StorageState g;
 /*  Helpers                                                             */
 /* ------------------------------------------------------------------ */
 
-static void build_path(char *out, size_t outlen,
-                        const char *dir, const char *name)
+/* Build the on-disk path for a relation file:
+ *   <partition_path>/<schema_name>/<relation>.mydb  */
+static int build_path(char *out, size_t outlen, const char *relation_name)
 {
-    snprintf(out, outlen, "%s/%s.mydb", dir, name);
+    int n = snprintf(out, outlen, "%s/%s/%s.mydb",
+                     g.eng->current_partition_path,
+                     g.eng->current_schema_name,
+                     relation_name);
+    return (n < 0 || (size_t)n >= outlen) ? MYDB_ERR : MYDB_OK;
 }
 
-/* Find an already-open table by name; returns NULL if not open. */
+/* Find an already-open table by relation name; NULL if not open. */
 static OpenTable *find_open(const char *name)
 {
     for (int i = 0; i < MAX_TABLES; i++) {
@@ -71,16 +79,19 @@ static OpenTable *find_open(const char *name)
     return NULL;
 }
 
-/* Open a table (load DiskManager + BTree handles), register with trx. */
+/* Open a relation lazily: load DiskManager + BTree handles, register
+ * the table_id with the trx manager. The fresh writable RelationDef
+ * pointer comes from the active schema (storage is the single writer
+ * for auto_incr_counter / root_page_no, so we always read through
+ * the active SchemaFile rather than trusting the caller's copy). */
 static OpenTable *open_table(const char *name)
 {
     OpenTable *ot = find_open(name);
-    if (ot) return ot;  /* already open */
+    if (ot) return ot;
 
-    Schema *s = schema_get(&g.catalog, name);
-    if (!s) return NULL;
+    RelationDef *r = schema_find_relation(&g.eng->active_schema, name);
+    if (!r) return NULL;
 
-    /* find a free slot */
     int slot = -1;
     for (int i = 0; i < MAX_TABLES; i++) {
         if (!g.open_tables[i].is_open) { slot = i; break; }
@@ -91,24 +102,24 @@ static OpenTable *open_table(const char *name)
     memset(ot, 0, sizeof(OpenTable));
 
     char path[512];
-    build_path(path, sizeof(path), g.data_dir, name);
+    if (build_path(path, sizeof(path), name) != MYDB_OK) return NULL;
 
     if (disk_open(&ot->dm, path) != MYDB_OK) return NULL;
 
     strncpy(ot->name, name, MAX_TABLE_NAME - 1);
     ot->id = g.next_table_id++;
 
-    /* initialise clustered B+ Tree */
+    /* clustered B+ tree */
     btree_init(&ot->clustered, &g.bp, &ot->dm, ot->id,
-               s->root_page_no,
-               s->columns[s->pk_col_idx].type, 0);
+               r->root_page_no,
+               r->columns[r->pk_col_idx].type, 0);
 
-    /* initialise secondary B+ Trees */
-    for (int i = 0; i < s->num_secondary_indexes; i++) {
-        int ci = s->secondary_col_idx[i];
+    /* secondary B+ trees */
+    for (int i = 0; i < r->num_secondary_indexes; i++) {
+        int ci = r->secondary_col_idx[i];
         btree_init(&ot->secondary[i], &g.bp, &ot->dm, ot->id,
-                   s->secondary_root_page_no[i],
-                   s->columns[ci].type, 1);
+                   r->secondary_root_page_no[i],
+                   r->columns[ci].type, 1);
     }
 
     ot->is_open = 1;
@@ -121,7 +132,7 @@ static OpenTable *open_table(const char *name)
 static int close_table(OpenTable *ot)
 {
     if (!ot || !ot->is_open) return MYDB_OK;
-    bp_flush_table(&g.bp, &ot->dm, ot->id);
+    bp_flush_table(&g.bp, ot->id);
     bp_evict_table(&g.bp, ot->id);
     trx_unregister_table(&g.trx, ot->id);
     disk_close(&ot->dm);
@@ -147,7 +158,7 @@ static int close_table(OpenTable *ot)
 static void write_col(const Value *v, const ColumnDef *col, uint8_t *out)
 {
     if (v->is_null) {
-        memset(out, 0, schema_col_size(col));
+        memset(out, 0, relation_col_size(col));
         return;
     }
     switch (col->type) {
@@ -198,57 +209,49 @@ static void read_col(const uint8_t *in, const ColumnDef *col, Value *v)
 
 /* Serialize hidden cols + null bitmap + user cols into out[].
    Returns number of bytes written. */
-static uint16_t serialize_row_value(const Schema *s, const Row *row,
+static uint16_t serialize_row_value(const RelationDef *r, const Row *row,
                                     uint64_t trx_id, uint8_t *out)
 {
     uint16_t off = 0;
 
-    /* DB_TRX_ID (6 bytes LE) */
-    memcpy(out + off, &trx_id, 6);
+    memcpy(out + off, &trx_id, 6);   /* DB_TRX_ID */
     off += 6;
-
-    /* DB_ROLL_PTR (7 bytes, zeros in Phase 1) */
-    memset(out + off, 0, 7);
+    memset(out + off, 0, 7);          /* DB_ROLL_PTR (zeros in Phase 1) */
     off += 7;
 
     /* null bitmap (4 bytes = 32 bits, one per column) */
     uint32_t null_bits = 0;
-    for (int i = 0; i < s->num_columns; i++) {
+    for (int i = 0; i < r->num_columns; i++) {
         if (row->cols[i].is_null)
             null_bits |= (1u << i);
     }
     memcpy(out + off, &null_bits, 4);
     off += 4;
 
-    /* column values */
-    for (int i = 0; i < s->num_columns; i++) {
-        uint16_t csz = schema_col_size(&s->columns[i]);
-        write_col(&row->cols[i], &s->columns[i], out + off);
+    for (int i = 0; i < r->num_columns; i++) {
+        uint16_t csz = relation_col_size(&r->columns[i]);
+        write_col(&row->cols[i], &r->columns[i], out + off);
         off += csz;
     }
 
     return off;
 }
 
-/* Deserialize value bytes back into a Row. */
 static void deserialize_row_value(const uint8_t *val, uint16_t vlen,
-                                   const Schema *s, Row *row)
+                                   const RelationDef *r, Row *row)
 {
     (void)vlen;
     uint16_t off = 0;
+    off += 13;    /* skip DB_TRX_ID (6) + DB_ROLL_PTR (7) */
 
-    /* skip DB_TRX_ID (6) + DB_ROLL_PTR (7) */
-    off += 13;
-
-    /* null bitmap */
     uint32_t null_bits;
     memcpy(&null_bits, val + off, 4);
     off += 4;
 
-    row->num_cols = s->num_columns;
-    for (int i = 0; i < s->num_columns; i++) {
-        uint16_t csz = schema_col_size(&s->columns[i]);
-        read_col(val + off, &s->columns[i], &row->cols[i]);
+    row->num_cols = r->num_columns;
+    for (int i = 0; i < r->num_columns; i++) {
+        uint16_t csz = relation_col_size(&r->columns[i]);
+        read_col(val + off, &r->columns[i], &row->cols[i]);
         row->cols[i].is_null = (null_bits >> i) & 1;
         off += csz;
     }
@@ -259,19 +262,16 @@ static void deserialize_row_value(const uint8_t *val, uint16_t vlen,
 /*  Format: [klen:2BE][key_bytes][vlen:2BE][val_bytes]                 */
 /* ------------------------------------------------------------------ */
 
-static uint16_t build_clustered_record(const Schema *s, const Row *row,
+static uint16_t build_clustered_record(const RelationDef *r, const Row *row,
                                         uint64_t trx_id, uint8_t *out)
 {
-    /* key = serialized PK column */
-    const Value *pk_val = &row->cols[s->pk_col_idx];
+    const Value *pk_val = &row->cols[r->pk_col_idx];
     uint8_t  key_buf[MAX_VARCHAR_LEN + 2];
     uint16_t klen = btree_key_encode(pk_val, key_buf);
 
-    /* value = hidden + null bitmap + user columns */
     uint8_t  val_buf[PAGE_SIZE];
-    uint16_t vlen = serialize_row_value(s, row, trx_id, val_buf);
+    uint16_t vlen = serialize_row_value(r, row, trx_id, val_buf);
 
-    /* assemble: [klen:2BE][key][vlen:2BE][val] */
     uint16_t off = 0;
     out[off++] = (uint8_t)(klen >> 8);
     out[off++] = (uint8_t)(klen & 0xFF);
@@ -301,9 +301,14 @@ static uint16_t build_secondary_record(const Value *key, RID rid, uint8_t *out)
     return off;
 }
 
-/* ------------------------------------------------------------------ */
-/*  Parse a clustered record to extract the PK value                   */
-/* ------------------------------------------------------------------ */
+/* Compare two Values of the same type via their encoded key form. */
+static int value_compare(const Value *a, const Value *b)
+{
+    uint8_t  ab[MAX_VARCHAR_LEN + 2], bb[MAX_VARCHAR_LEN + 2];
+    uint16_t alen = btree_key_encode(a, ab);
+    uint16_t blen = btree_key_encode(b, bb);
+    return btree_key_compare(ab, alen, bb, blen, a->type);
+}
 
 static void record_get_pk(const uint8_t *rec, DataType pk_type, Value *out_pk)
 {
@@ -312,40 +317,65 @@ static void record_get_pk(const uint8_t *rec, DataType pk_type, Value *out_pk)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Find the page-directory slot that holds data at data_off.          */
+/*  Quota reconciliation after DML                                      */
+/*                                                                      */
+/*  Step 2 of the phase 9 plan: a successful DML may have grown the     */
+/*  relation file via btree splits. The pre/post difference in          */
+/*  dm.num_pages tells us by how much. We bump RelationEntry.num_pages  */
+/*  so __schema.mydb stays the persisted source of truth, and call      */
+/*  cat_track_alloc so __catalog.mydb's used_bytes stays consistent     */
+/*  with the partition's actual disk consumption.                       */
+/*                                                                      */
+/*  Note: this is a coarse, post-hoc reconciliation. v1 has no per-page */
+/*  free path, so we never drive deltas negative on user relations      */
+/*  outside DROP TABLE (which uses disk_destroy + cat_track_alloc       */
+/*  directly). Pre-check quota at the entry to DML to avoid growing     */
+/*  past the quota; this reconciliation closes the loop afterwards.    */
 /* ------------------------------------------------------------------ */
 
-static int find_slot_for_doff(OpenTable *ot, uint32_t page_no, uint16_t data_off)
+static void reconcile_growth(OpenTable *ot, const char *relation_name,
+                             uint32_t pages_before)
 {
-    uint8_t *page = bp_fetch_page(&g.bp, &ot->dm, ot->id, page_no);
-    if (!page) return -1;
+    uint32_t pages_after = ot->dm.num_pages;
+    if (pages_after == pages_before) return;
+    int32_t delta = (int32_t)(pages_after - pages_before);
 
-    uint16_t n = page_dir_count(page);
-    int slot = -1;
-    for (uint16_t i = 0; i < n; i++) {
-        if (page_dir_get(page, i) == data_off) { slot = (int)i; break; }
-    }
-    bp_unpin_page(&g.bp, ot->id, page_no, 0);
-    return slot;
+    schema_bump_relation_pages(&g.eng->active_schema, relation_name, delta);
+    cat_track_alloc(&g.eng->active_catalog, (int64_t)delta * PAGE_SIZE);
 }
+
+/* Quota pre-check: we don't know exactly how many pages a DML will
+ * allocate (b-tree splits depend on key size and tree shape), but a
+ * conservative upper bound of 4 pages catches the common "1 leaf
+ * split + maybe 1 internal split + maybe 1 root growth" pattern.
+ * Returns MYDB_OK if at least `headroom_pages` pages still fit under
+ * the partition quota, MYDB_ERR_FULL otherwise. */
+static int quota_headroom(uint32_t headroom_pages)
+{
+    Catalog *c = &g.eng->active_catalog;
+    if (c->header.used_bytes > c->header.quota_bytes) return MYDB_ERR_FULL;
+    uint64_t need = (uint64_t)headroom_pages * PAGE_SIZE;
+    if (c->header.quota_bytes - c->header.used_bytes < need) return MYDB_ERR_FULL;
+    return MYDB_OK;
+}
+
+#define DML_QUOTA_HEADROOM_PAGES 4
 
 /* ------------------------------------------------------------------ */
 /*  Engine lifecycle                                                    */
 /* ------------------------------------------------------------------ */
 
-int storage_init(const char *data_dir)
+int storage_init(EngineState *eng)
 {
-    if (!data_dir) return MYDB_ERR;
+    if (!eng) return MYDB_ERR;
     if (g.initialized) return MYDB_OK;
 
     memset(&g, 0, sizeof(g));
-    strncpy(g.data_dir, data_dir, sizeof(g.data_dir) - 1);
+    g.eng           = eng;
     g.next_table_id = 1;
 
     bp_init(&g.bp);
     trx_init(&g.trx, &g.bp);
-
-    if (schema_catalog_open(&g.catalog, data_dir) != MYDB_OK) return MYDB_ERR;
 
     g.initialized = 1;
     return MYDB_OK;
@@ -355,16 +385,14 @@ int storage_shutdown(void)
 {
     if (!g.initialized) return MYDB_OK;
 
-    /* commit any open transaction */
     if (trx_is_active(&g.trx)) trx_commit(&g.trx);
 
-    /* close all open tables */
     for (int i = 0; i < MAX_TABLES; i++) {
         if (g.open_tables[i].is_open)
             close_table(&g.open_tables[i]);
     }
 
-    schema_catalog_close(&g.catalog);
+    g.eng         = NULL;
     g.initialized = 0;
     return MYDB_OK;
 }
@@ -373,66 +401,98 @@ int storage_shutdown(void)
 /*  DDL                                                                 */
 /* ------------------------------------------------------------------ */
 
-int storage_create_table(const char *name, Schema *schema)
+int storage_create_table(RelationDef *rel)
 {
-    if (!g.initialized || !name || !schema) return MYDB_ERR;
-    if (schema_get(&g.catalog, name) != NULL) return MYDB_ERR_DUPLICATE;
+    if (!g.initialized || !rel) return MYDB_ERR;
+    if (!g.eng->schema_active) return MYDB_ERR_PERM;
+    if (schema_find_relation(&g.eng->active_schema, rel->relation_name) != NULL)
+        return MYDB_ERR_DUPLICATE;
 
-    strncpy(schema->table_name, name, MAX_TABLE_NAME - 1);
-    schema->root_page_no = INVALID_PAGE;
+    /* Pre-check quota: clustered root + one root per secondary index. */
+    uint32_t need_pages = 1u + rel->num_secondary_indexes;
+    if (quota_headroom(need_pages) != MYDB_OK) return MYDB_ERR_FULL;
 
-    /* create the .mydb file */
+    rel->root_page_no = INVALID_PAGE;
+
     char path[512];
-    build_path(path, sizeof(path), g.data_dir, name);
+    if (build_path(path, sizeof(path), rel->relation_name) != MYDB_OK)
+        return MYDB_ERR;
 
     DiskManager dm;
     if (disk_create(&dm, path) != MYDB_OK) return MYDB_ERR;
 
-    /* alloc + init root page for clustered index (page 1) */
+    /* Allocate the clustered root through partition_alloc_page so the
+     * partition quota counter reflects the growth. partition_alloc_page
+     * grows the file on disk; bp_fetch_page brings it into a frame so
+     * we can initialise it. */
     uint32_t root_pno;
-    uint8_t *root_page = bp_alloc_page(&g.bp, &dm, 0 /*temp id*/, &root_pno);
+    int rc = partition_alloc_page(&g.eng->active_catalog, &dm,
+                                  g.eng->current_user_id, &root_pno);
+    if (rc != MYDB_OK) { disk_close(&dm); return rc; }
+
+    uint8_t *root_page = bp_fetch_page(&g.bp, &dm, 0 /*temp id*/, root_pno);
     if (!root_page) { disk_close(&dm); return MYDB_ERR; }
     page_init(root_page, root_pno, PAGE_TYPE_DATA);
     bp_unpin_page(&g.bp, 0, root_pno, 1);
-    bp_flush_table(&g.bp, &dm, 0);
+    bp_flush_table(&g.bp, 0);
     bp_evict_table(&g.bp, 0);
 
-    schema->root_page_no = root_pno;
+    rel->root_page_no = root_pno;
 
-    /* alloc + init a root page for each secondary index */
-    for (int i = 0; i < schema->num_secondary_indexes; i++) {
+    /* Same pattern for each secondary index root. */
+    for (int i = 0; i < rel->num_secondary_indexes; i++) {
         uint32_t sec_pno;
-        uint8_t *sp = bp_alloc_page(&g.bp, &dm, 0, &sec_pno);
+        rc = partition_alloc_page(&g.eng->active_catalog, &dm,
+                                  g.eng->current_user_id, &sec_pno);
+        if (rc != MYDB_OK) { disk_close(&dm); return rc; }
+
+        uint8_t *sp = bp_fetch_page(&g.bp, &dm, 0, sec_pno);
         if (!sp) { disk_close(&dm); return MYDB_ERR; }
         page_init(sp, sec_pno, PAGE_TYPE_DATA);
         bp_unpin_page(&g.bp, 0, sec_pno, 1);
-        bp_flush_table(&g.bp, &dm, 0);
+        bp_flush_table(&g.bp, 0);
         bp_evict_table(&g.bp, 0);
-        schema->secondary_root_page_no[i] = sec_pno;
+        rel->secondary_root_page_no[i] = sec_pno;
     }
 
     disk_close(&dm);
 
-    /* add to catalog */
-    if (schema_add(&g.catalog, schema) != MYDB_OK) return MYDB_ERR;
+    /* Persist the relation in the active schema. schema_add_relation
+     * takes a snapshot of *rel into its defs[] slot — subsequent
+     * mutations (auto_incr_counter, etc.) flow through schema_flush_
+     * relation. */
+    rc = schema_add_relation(&g.eng->active_schema, rel);
+    if (rc != MYDB_OK) return rc;
 
+    /* Bump RelationEntry.num_pages for the root pages we just
+     * allocated (partition_alloc_page already bumped used_bytes). */
+    schema_bump_relation_pages(&g.eng->active_schema, rel->relation_name,
+                               (int32_t)need_pages);
     return MYDB_OK;
 }
 
-int storage_drop_table(const char *name)
+int storage_drop_table(RelationDef *rel)
 {
-    if (!g.initialized || !name) return MYDB_ERR;
+    if (!g.initialized || !rel) return MYDB_ERR;
+    if (!g.eng->schema_active) return MYDB_ERR_PERM;
 
-    /* close the table if it is currently open */
-    OpenTable *ot = find_open(name);
+    OpenTable *ot = find_open(rel->relation_name);
     if (ot) close_table(ot);
 
-    /* delete the data file */
+    /* Reclaim the partition quota for the file's pages before deleting. */
+    RelationEntry *e = schema_find_relation_stat(&g.eng->active_schema,
+                                                  rel->relation_name);
+    if (e && e->num_pages > 0) {
+        cat_track_alloc(&g.eng->active_catalog,
+                        -(int64_t)e->num_pages * PAGE_SIZE);
+    }
+
     char path[512];
-    build_path(path, sizeof(path), g.data_dir, name);
+    if (build_path(path, sizeof(path), rel->relation_name) != MYDB_OK)
+        return MYDB_ERR;
     disk_destroy(path);
 
-    return schema_remove(&g.catalog, name);
+    return schema_remove_relation(&g.eng->active_schema, rel->relation_name);
 }
 
 /* ------------------------------------------------------------------ */
@@ -447,23 +507,29 @@ int storage_rollback(void) { return trx_rollback(&g.trx); }
 /*  DML — INSERT                                                        */
 /* ------------------------------------------------------------------ */
 
-int storage_insert(const char *table, Row *row)
+int storage_insert(RelationDef *rel, Row *row)
 {
-    if (!g.initialized || !table || !row) return MYDB_ERR;
+    if (!g.initialized || !rel || !row) return MYDB_ERR;
+    if (!g.eng->schema_active) return MYDB_ERR_PERM;
 
-    Schema *s = schema_get(&g.catalog, table);
-    if (!s) return MYDB_ERR_NOT_FOUND;
+    /* Read the writable RelationDef from the active schema — caller's
+     * pointer may be a parser-side const view. */
+    RelationDef *r = schema_find_relation(&g.eng->active_schema,
+                                          rel->relation_name);
+    if (!r) return MYDB_ERR_NOT_FOUND;
 
-    OpenTable *ot = open_table(table);
+    OpenTable *ot = open_table(rel->relation_name);
     if (!ot) return MYDB_ERR;
 
-    /* implicit transaction: begin if none active */
+    if (quota_headroom(DML_QUOTA_HEADROOM_PAGES) != MYDB_OK)
+        return MYDB_ERR_FULL;
+
     int auto_txn = !trx_is_active(&g.trx);
     if (auto_txn) trx_begin(&g.trx);
 
-    /* validate NOT NULL */
-    for (int i = 0; i < s->num_columns; i++) {
-        if (s->columns[i].is_not_null && !s->columns[i].is_auto_increment) {
+    /* NOT NULL */
+    for (int i = 0; i < r->num_columns; i++) {
+        if (r->columns[i].is_not_null && !r->columns[i].is_auto_increment) {
             if (row->cols[i].is_null) {
                 if (auto_txn) trx_rollback(&g.trx);
                 return MYDB_ERR_NULL_VIOLATION;
@@ -471,49 +537,48 @@ int storage_insert(const char *table, Row *row)
         }
     }
 
-    /* handle AUTO_INCREMENT */
-    int pk = s->pk_col_idx;
-    if (s->columns[pk].is_auto_increment) {
-        /* use the counter when the caller passes null or 0 */
+    /* AUTO_INCREMENT */
+    int pk = r->pk_col_idx;
+    if (r->columns[pk].is_auto_increment) {
         if (row->cols[pk].is_null || row->cols[pk].v.int_val == 0) {
-            row->cols[pk].type       = TYPE_INT;
-            row->cols[pk].is_null    = 0;
-            row->cols[pk].v.int_val  = (int32_t)s->auto_incr_counter;
-            s->auto_incr_counter++;
+            row->cols[pk].type      = TYPE_INT;
+            row->cols[pk].is_null   = 0;
+            row->cols[pk].v.int_val = (int32_t)r->auto_incr_counter;
+            r->auto_incr_counter++;
         }
     }
 
-    /* build and insert the clustered record */
-    uint8_t rec_buf[PAGE_SIZE];
-    uint16_t rec_len = build_clustered_record(s, row, trx_current_id(&g.trx), rec_buf);
+    uint32_t pages_before = ot->dm.num_pages;
+
+    uint8_t  rec_buf[PAGE_SIZE];
+    uint16_t rec_len = build_clustered_record(r, row, trx_current_id(&g.trx),
+                                              rec_buf);
 
     RID rid;
     int rc = btree_insert(&ot->clustered, &row->cols[pk], rec_buf, rec_len, &rid);
     if (rc != MYDB_OK) {
+        reconcile_growth(ot, rel->relation_name, pages_before);
         if (auto_txn) trx_rollback(&g.trx);
         return rc;
     }
 
-    /* insert into secondary indexes */
-    for (int i = 0; i < s->num_secondary_indexes; i++) {
-        int ci = s->secondary_col_idx[i];
-        uint8_t srec[MAX_VARCHAR_LEN + 2 + 4 + 2];
+    for (int i = 0; i < r->num_secondary_indexes; i++) {
+        int ci = r->secondary_col_idx[i];
+        uint8_t  srec[MAX_VARCHAR_LEN + 2 + 4 + 2];
         uint16_t slen = build_secondary_record(&row->cols[ci], rid, srec);
 
         rc = btree_insert(&ot->secondary[i], &row->cols[ci], srec, slen, NULL);
         if (rc != MYDB_OK) {
+            reconcile_growth(ot, rel->relation_name, pages_before);
             if (auto_txn) trx_rollback(&g.trx);
             return rc;
         }
     }
 
-    /* persist updated auto_incr counter if it changed */
-    if (s->columns[pk].is_auto_increment) {
-        int idx = -1;
-        for (int i = 0; i < g.catalog.num_tables; i++) {
-            if (strcmp(g.catalog.tables[i].table_name, table) == 0) { idx = i; break; }
-        }
-        if (idx >= 0) schema_flush(&g.catalog, idx);
+    reconcile_growth(ot, rel->relation_name, pages_before);
+
+    if (r->columns[pk].is_auto_increment) {
+        schema_flush_relation(&g.eng->active_schema, rel->relation_name);
     }
 
     if (auto_txn) trx_commit(&g.trx);
@@ -547,45 +612,42 @@ static int read_record_by_rid(OpenTable *ot, RID rid,
 /*  DML — DELETE                                                        */
 /* ------------------------------------------------------------------ */
 
-int storage_delete(const char *table, RID rid)
+int storage_delete(RelationDef *rel, RID rid)
 {
-    if (!g.initialized || !table) return MYDB_ERR;
+    if (!g.initialized || !rel) return MYDB_ERR;
+    if (!g.eng->schema_active) return MYDB_ERR_PERM;
 
-    Schema *s = schema_get(&g.catalog, table);
-    if (!s) return MYDB_ERR_NOT_FOUND;
+    RelationDef *r = schema_find_relation(&g.eng->active_schema,
+                                          rel->relation_name);
+    if (!r) return MYDB_ERR_NOT_FOUND;
 
-    OpenTable *ot = open_table(table);
+    OpenTable *ot = open_table(rel->relation_name);
     if (!ot) return MYDB_ERR;
 
     int auto_txn = !trx_is_active(&g.trx);
     if (auto_txn) trx_begin(&g.trx);
 
-    /* read the record to get the PK and secondary key values */
-    uint8_t rec[PAGE_SIZE];
+    uint8_t  rec[PAGE_SIZE];
     uint16_t rec_len;
     if (read_record_by_rid(ot, rid, rec, &rec_len) != MYDB_OK) {
         if (auto_txn) trx_rollback(&g.trx);
         return MYDB_ERR;
     }
 
-    /* extract PK */
     Value pk_val;
-    record_get_pk(rec, s->columns[s->pk_col_idx].type, &pk_val);
+    record_get_pk(rec, r->columns[r->pk_col_idx].type, &pk_val);
 
-    /* deserialize full row to get secondary key values */
     uint16_t klen = ((uint16_t)rec[0] << 8) | rec[1];
     uint16_t voff = 2 + klen + 2;
     Row row;
     memset(&row, 0, sizeof(row));
-    deserialize_row_value(rec + voff, rec_len - voff, s, &row);
+    deserialize_row_value(rec + voff, rec_len - voff, r, &row);
 
-    /* delete from secondary indexes first */
-    for (int i = 0; i < s->num_secondary_indexes; i++) {
-        int ci = s->secondary_col_idx[i];
+    for (int i = 0; i < r->num_secondary_indexes; i++) {
+        int ci = r->secondary_col_idx[i];
         btree_delete(&ot->secondary[i], &row.cols[ci]);
     }
 
-    /* delete from clustered index */
     int rc = btree_delete(&ot->clustered, &pk_val);
     if (auto_txn) {
         if (rc == MYDB_OK) trx_commit(&g.trx); else trx_rollback(&g.trx);
@@ -597,29 +659,33 @@ int storage_delete(const char *table, RID rid)
 /*  DML — UPDATE                                                        */
 /* ------------------------------------------------------------------ */
 
-int storage_update(const char *table, RID rid, Row *new_row)
+int storage_update(RelationDef *rel, RID rid, Row *new_row)
 {
-    if (!g.initialized || !table || !new_row) return MYDB_ERR;
+    if (!g.initialized || !rel || !new_row) return MYDB_ERR;
+    if (!g.eng->schema_active) return MYDB_ERR_PERM;
 
-    Schema *s = schema_get(&g.catalog, table);
-    if (!s) return MYDB_ERR_NOT_FOUND;
+    RelationDef *r = schema_find_relation(&g.eng->active_schema,
+                                          rel->relation_name);
+    if (!r) return MYDB_ERR_NOT_FOUND;
 
-    OpenTable *ot = open_table(table);
+    OpenTable *ot = open_table(rel->relation_name);
     if (!ot) return MYDB_ERR;
+
+    if (quota_headroom(DML_QUOTA_HEADROOM_PAGES) != MYDB_OK)
+        return MYDB_ERR_FULL;
 
     int auto_txn = !trx_is_active(&g.trx);
     if (auto_txn) trx_begin(&g.trx);
 
-    /* NOT NULL check on new values */
-    for (int i = 0; i < s->num_columns; i++) {
-        if (s->columns[i].is_not_null && new_row->cols[i].is_null) {
+    /* NOT NULL */
+    for (int i = 0; i < r->num_columns; i++) {
+        if (r->columns[i].is_not_null && new_row->cols[i].is_null) {
             if (auto_txn) trx_rollback(&g.trx);
             return MYDB_ERR_NULL_VIOLATION;
         }
     }
 
-    /* read old record to get old secondary key values */
-    uint8_t old_rec[PAGE_SIZE];
+    uint8_t  old_rec[PAGE_SIZE];
     uint16_t old_rec_len;
     if (read_record_by_rid(ot, rid, old_rec, &old_rec_len) != MYDB_OK) {
         if (auto_txn) trx_rollback(&g.trx);
@@ -627,39 +693,73 @@ int storage_update(const char *table, RID rid, Row *new_row)
     }
 
     Value old_pk;
-    record_get_pk(old_rec, s->columns[s->pk_col_idx].type, &old_pk);
+    record_get_pk(old_rec, r->columns[r->pk_col_idx].type, &old_pk);
 
     uint16_t klen = ((uint16_t)old_rec[0] << 8) | old_rec[1];
     uint16_t voff = 2 + klen + 2;
     Row old_row;
     memset(&old_row, 0, sizeof(old_row));
-    deserialize_row_value(old_rec + voff, old_rec_len - voff, s, &old_row);
+    deserialize_row_value(old_rec + voff, old_rec_len - voff, r, &old_row);
 
-    /* delete old record from clustered + secondary indexes */
-    for (int i = 0; i < s->num_secondary_indexes; i++) {
-        int ci = s->secondary_col_idx[i];
+    /*
+     * Validate-before-delete: if any UNIQUE key changes to a value that
+     * already exists for another live row, fail the update without
+     * touching the existing data.
+     */
+    const Value *new_pk = &new_row->cols[r->pk_col_idx];
+    int pk_changed = (value_compare(&old_pk, new_pk) != 0);
+    if (pk_changed) {
+        BTreeSearchResult res;
+        if (btree_search(&ot->clustered, new_pk, &res) == MYDB_OK && res.found) {
+            if (auto_txn) trx_rollback(&g.trx);
+            return MYDB_ERR_DUPLICATE;
+        }
+    }
+
+    int sec_changed[MAX_SECONDARY_IDX] = {0};
+    for (int i = 0; i < r->num_secondary_indexes; i++) {
+        int ci = r->secondary_col_idx[i];
+        sec_changed[i] = (value_compare(&old_row.cols[ci], &new_row->cols[ci]) != 0);
+        if (sec_changed[i]) {
+            BTreeSearchResult res;
+            if (btree_search(&ot->secondary[i], &new_row->cols[ci], &res) == MYDB_OK
+                && res.found) {
+                if (auto_txn) trx_rollback(&g.trx);
+                return MYDB_ERR_DUPLICATE;
+            }
+        }
+    }
+
+    uint32_t pages_before = ot->dm.num_pages;
+
+    for (int i = 0; i < r->num_secondary_indexes; i++) {
+        if (!sec_changed[i]) continue;
+        int ci = r->secondary_col_idx[i];
         btree_delete(&ot->secondary[i], &old_row.cols[ci]);
     }
     btree_delete(&ot->clustered, &old_pk);
 
-    /* insert new record */
-    uint8_t new_rec[PAGE_SIZE];
-    uint16_t new_rec_len = build_clustered_record(s, new_row,
+    uint8_t  new_rec[PAGE_SIZE];
+    uint16_t new_rec_len = build_clustered_record(r, new_row,
                                                    trx_current_id(&g.trx), new_rec);
     RID new_rid;
-    int rc = btree_insert(&ot->clustered, &new_row->cols[s->pk_col_idx],
+    int rc = btree_insert(&ot->clustered, new_pk,
                           new_rec, new_rec_len, &new_rid);
     if (rc != MYDB_OK) {
+        reconcile_growth(ot, rel->relation_name, pages_before);
         if (auto_txn) trx_rollback(&g.trx);
         return rc;
     }
 
-    for (int i = 0; i < s->num_secondary_indexes; i++) {
-        int ci = s->secondary_col_idx[i];
-        uint8_t srec[MAX_VARCHAR_LEN + 2 + 4 + 2];
+    for (int i = 0; i < r->num_secondary_indexes; i++) {
+        if (!sec_changed[i]) continue;
+        int ci = r->secondary_col_idx[i];
+        uint8_t  srec[MAX_VARCHAR_LEN + 2 + 4 + 2];
         uint16_t slen = build_secondary_record(&new_row->cols[ci], new_rid, srec);
         btree_insert(&ot->secondary[i], &new_row->cols[ci], srec, slen, NULL);
     }
+
+    reconcile_growth(ot, rel->relation_name, pages_before);
 
     if (auto_txn) trx_commit(&g.trx);
     return MYDB_OK;
@@ -669,21 +769,22 @@ int storage_update(const char *table, RID rid, Row *new_row)
 /*  DQL — storage_get_by_pk                                            */
 /* ------------------------------------------------------------------ */
 
-Row *storage_get_by_pk(const char *table, Value *pk)
+Row *storage_get_by_pk(RelationDef *rel, Value *pk)
 {
-    if (!g.initialized || !table || !pk) return NULL;
+    if (!g.initialized || !rel || !pk) return NULL;
+    if (!g.eng->schema_active) return NULL;
 
-    Schema *s = schema_get(&g.catalog, table);
-    if (!s) return NULL;
+    RelationDef *r = schema_find_relation(&g.eng->active_schema,
+                                          rel->relation_name);
+    if (!r) return NULL;
 
-    OpenTable *ot = open_table(table);
+    OpenTable *ot = open_table(rel->relation_name);
     if (!ot) return NULL;
 
     BTreeSearchResult res;
     if (btree_search(&ot->clustered, pk, &res) != MYDB_OK) return NULL;
     if (!res.found) return NULL;
 
-    /* fetch the leaf page and read the record */
     uint8_t *page = bp_fetch_page(&g.bp, &ot->dm, ot->id, res.page_no);
     if (!page) return NULL;
 
@@ -697,13 +798,12 @@ Row *storage_get_by_pk(const char *table, Value *pk)
     memcpy(rec, page + data_off, data_sz);
     bp_unpin_page(&g.bp, ot->id, res.page_no, 0);
 
-    /* deserialize value portion */
     uint16_t klen = ((uint16_t)rec[0] << 8) | rec[1];
     uint16_t voff = 2 + klen + 2;
 
     static Row result;
     memset(&result, 0, sizeof(result));
-    deserialize_row_value(rec + voff, data_sz - voff, s, &result);
+    deserialize_row_value(rec + voff, data_sz - voff, r, &result);
     result.rid.page_no = res.page_no;
     result.rid.slot_no = res.slot_no;
     return &result;
@@ -713,22 +813,24 @@ Row *storage_get_by_pk(const char *table, Value *pk)
 /*  DQL — scan cursor                                                   */
 /* ------------------------------------------------------------------ */
 
-Cursor *storage_scan(const char *table)
+Cursor *storage_scan(RelationDef *rel)
 {
-    if (!g.initialized || !table) return NULL;
+    if (!g.initialized || !rel) return NULL;
+    if (!g.eng->schema_active) return NULL;
 
-    Schema *s = schema_get(&g.catalog, table);
-    if (!s) return NULL;
+    RelationDef *r = schema_find_relation(&g.eng->active_schema,
+                                          rel->relation_name);
+    if (!r) return NULL;
 
-    OpenTable *ot = open_table(table);
+    OpenTable *ot = open_table(rel->relation_name);
     if (!ot) return NULL;
 
     StorageScan *sc = (StorageScan *)malloc(sizeof(StorageScan));
     if (!sc) return NULL;
 
     memset(sc, 0, sizeof(StorageScan));
-    sc->ot     = ot;
-    sc->schema = s;
+    sc->ot  = ot;
+    sc->rel = r;
 
     if (btree_cursor_open(&ot->clustered, &sc->btree_cur) != MYDB_OK) {
         free(sc);
@@ -747,19 +849,14 @@ Row *cursor_next(Cursor *cur)
     if (btree_cursor_next(&sc->btree_cur, sc->rec_buf, &len) != MYDB_OK)
         return NULL;
 
-    /* parse: [klen:2BE][key][vlen:2BE][val] */
     uint16_t klen = ((uint16_t)sc->rec_buf[0] << 8) | sc->rec_buf[1];
     uint16_t voff = 2 + klen + 2;
 
     memset(&sc->current_row, 0, sizeof(Row));
-    deserialize_row_value(sc->rec_buf + voff, len - voff, sc->schema, &sc->current_row);
+    deserialize_row_value(sc->rec_buf + voff, len - voff, sc->rel, &sc->current_row);
 
-    /* set RID from the position btree_cursor_next recorded */
     sc->current_row.rid.page_no = sc->btree_cur.last_page_no;
-    int slot = find_slot_for_doff(sc->ot,
-                                   sc->btree_cur.last_page_no,
-                                   sc->btree_cur.last_data_off);
-    sc->current_row.rid.slot_no = (slot >= 0) ? (uint16_t)slot : 0;
+    sc->current_row.rid.slot_no = sc->btree_cur.last_slot;
 
     return &sc->current_row;
 }
