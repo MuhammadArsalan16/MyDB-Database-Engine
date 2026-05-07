@@ -2,7 +2,7 @@
 #define PAGE_H
 
 #include "common.h"
-
+#include <assert.h>
 /*
  * page.h — InnoDB-style slotted page format
  *
@@ -116,21 +116,28 @@ void page_read_header(const uint8_t *page, PageHeader *hdr);
 void page_write_header(uint8_t *page, const PageHeader *hdr);
 
 /*
- * Insert a record into the page.
+ * Insert a record into the page at a specific slot index.
+ *
+ * The page directory is maintained in KEY ORDER: slot 0 holds the
+ * smallest key, slot num_dir_slots-1 holds the largest. Callers
+ * (typically the B+ tree) determine the correct insertion slot via a
+ * key-ordered search and pass it here.
  *
  *   record_data : the payload bytes (NOT including the 5-byte record header)
  *   record_size : number of payload bytes
- *   predecessor : absolute byte offset of the record whose next_offset should
- *                 point to the new record (maintains key order in the linked list).
- *                 Pass INFIMUM_DATA to insert as the first user record.
- *   slot_no     : out-param, set to the new record's page-directory slot index
+ *   at_slot     : insert here. Existing slots [at_slot .. n-1] are shifted
+ *                 right by one. Pass 0 to insert before the current first
+ *                 record, num_dir_slots to append.
+ *
+ * The linked list is also maintained: the new record is spliced after
+ * the record at slot (at_slot - 1), or after Infimum if at_slot == 0.
  *
  * Returns MYDB_ERR_FULL if there is not enough free space.
+ * Returns MYDB_ERR if at_slot > num_dir_slots.
  */
 int page_insert_record(uint8_t *page,
                        const uint8_t *record_data, uint16_t record_size,
-                       uint16_t predecessor,
-                       uint16_t *slot_no);
+                       uint16_t at_slot);
 
 /*
  * Mark the record at slot_no as deleted (lazy deletion).
@@ -178,5 +185,9 @@ void page_set_checksum(uint8_t *page);
  * Returns MYDB_OK if valid, MYDB_ERR if corrupted.
  */
 int page_verify_checksum(const uint8_t *page);
+
+
+
+void page_check_invariants(const uint8_t *page);
 
 #endif /* PAGE_H */

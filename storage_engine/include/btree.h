@@ -36,7 +36,7 @@
  */
 
 /* ------------------------------------------------------------------ */
-/*  Key — serialised form of a Value for storage and comparison        */
+/*  Key — serialised form of a Value for storage and comparison       */
 /* ------------------------------------------------------------------ */
 typedef struct {
     uint8_t  data[MAX_VARCHAR_LEN + 2]; /* largest possible key: VARCHAR(150) + 2B len */
@@ -56,24 +56,24 @@ typedef struct {
 } BTree;
 
 /* ------------------------------------------------------------------ */
-/*  Cursor — iterator for sequential scans                             */
-/*                                                                      */
-/*  We walk the key-order linked list (infimum → r1 → r2 → supremum)  */
-/*  rather than the page directory (which is in insertion order).      */
+/*  Cursor — iterator for sequential scans                            */
+/*                                                                    */
+/*  The page directory is maintained in key order, so iterating slots */
+/*  0..num_dir_slots-1 walks records in key order. Crossing to the    */
+/*  next leaf uses the page-level next_page link.                     */
 /* ------------------------------------------------------------------ */
 struct Cursor {
     BTree   *tree;
     uint32_t page_no;       /* current leaf page */
-    uint16_t next_data_off; /* data offset of the NEXT record to return
-                               (in the current page's linked list) */
+    uint16_t next_slot;     /* index of the NEXT slot to return on this page */
     uint8_t  done;          /* 1 = no more records */
     /* set by btree_cursor_next to the position of the last returned record */
     uint32_t last_page_no;
-    uint16_t last_data_off;
+    uint16_t last_slot;
 };
 
 /* ------------------------------------------------------------------ */
-/*  Search result                                                       */
+/*  Search result                                                     */
 /* ------------------------------------------------------------------ */
 typedef struct {
     uint32_t page_no;
@@ -81,9 +81,9 @@ typedef struct {
     uint8_t  found;     /* 1 if key matched exactly */
 } BTreeSearchResult;
 
-/* ------------------------------------------------------------------ */
-/*  Key serialisation helpers (used by btree and schema/storage layers) */
-/* ------------------------------------------------------------------ */
+/* --------------------------------------------------------------------*/
+/* Key serialisation helpers (used by btree and schema/storage layers) */
+/* --------------------------------------------------------------------*/
 
 /* Serialise a Value into a byte key. Returns the number of bytes written. */
 uint16_t btree_key_encode(const Value *v, uint8_t *out);
@@ -97,10 +97,10 @@ int btree_key_compare(const uint8_t *a, uint16_t alen,
                       DataType type);
 
 /* ------------------------------------------------------------------ */
-/*  BTree operations                                                    */
+/*  BTree operations                                                  */
 /* ------------------------------------------------------------------ */
 
-/* Initialise a BTree handle (does not create any pages). */
+/* Initialize a BTree handle (does not create any pages). */
 void btree_init(BTree *bt, BufferPool *bp, DiskManager *dm,
                 int table_id, uint32_t root_page_no,
                 DataType key_type, uint8_t is_secondary);

@@ -59,7 +59,7 @@ int trx_commit(TransactionManager *tm)
 
     /* write every dirty page for every registered table to disk */
     for (int i = 0; i < tm->num_open; i++) {
-        if (bp_flush_table(tm->bp, tm->dms[i], tm->table_ids[i]) != MYDB_OK)
+        if (bp_flush_table(tm->bp, tm->table_ids[i]) != MYDB_OK)
             return MYDB_ERR;
     }
 

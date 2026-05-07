@@ -17,6 +17,7 @@ CMakeFiles/
 cmake_install.cmake
 CTestTestfile.cmake
 compile_commands.json
+.clangd
 
 # ── Make / object files ────────────────────────────────────────────────
 *.o

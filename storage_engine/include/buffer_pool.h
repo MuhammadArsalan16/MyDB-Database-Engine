@@ -24,12 +24,13 @@
 
 /* One cache frame holding a single page */
 typedef struct {
-    uint8_t  data[PAGE_SIZE]; /* raw page bytes */
-    uint32_t page_no;         /* which page is loaded here */
-    int      table_id;        /* which table this page belongs to */
-    uint16_t pin_count;       /* >0 means in use, cannot be evicted */
-    uint8_t  is_dirty;        /* 1 = modified since last flush */
-    uint8_t  is_valid;        /* 1 = frame holds a real page */
+    uint8_t      data[PAGE_SIZE]; /* raw page bytes */
+    uint32_t     page_no;         /* which page is loaded here */
+    int          table_id;        /* which table this page belongs to */
+    DiskManager *dm;              /* DM for this frame's table — used on flush/evict */
+    uint16_t     pin_count;       /* >0 means in use, cannot be evicted */
+    uint8_t      is_dirty;        /* 1 = modified since last flush */
+    uint8_t      is_valid;        /* 1 = frame holds a real page */
 } BPFrame;
 
 /* The buffer pool — 64 frames, LRU eviction */
@@ -67,11 +68,14 @@ uint8_t *bp_fetch_page(BufferPool *bp, DiskManager *dm,
  */
 int bp_unpin_page(BufferPool *bp, int table_id, uint32_t page_no, int dirty);
 
-/* Flush a single dirty page to disk immediately. */
-int bp_flush_page(BufferPool *bp, DiskManager *dm, int table_id, uint32_t page_no);
+/*
+ * Flush a single dirty page to disk immediately.
+ * Uses the DiskManager stored on the frame at fetch/alloc time.
+ */
+int bp_flush_page(BufferPool *bp, int table_id, uint32_t page_no);
 
-/* Flush all dirty pages belonging to table_id. */
-int bp_flush_table(BufferPool *bp, DiskManager *dm, int table_id);
+/* Flush all dirty pages belonging to table_id (uses each frame's DM). */
+int bp_flush_table(BufferPool *bp, int table_id);
 
 /*
  * Allocate a new page on disk, load it into a frame, pin it, and
@@ -81,8 +85,14 @@ uint8_t *bp_alloc_page(BufferPool *bp, DiskManager *dm,
                        int table_id, uint32_t *page_no);
 
 /*
- * Evict all pages for table_id from the pool (used during DROP TABLE).
- * All pages for the table must be unpinned before calling this.
+ * Evict all pages for table_id from the pool (used during DROP TABLE
+ * and after rollback). All pages for the table must be unpinned before
+ * calling this. Does NOT flush — caller must call bp_flush_table first
+ * if dirty pages should be persisted.
+ *
+ * IMPORTANT: any frame for this table_id stores a DiskManager pointer.
+ * The caller must call bp_evict_table BEFORE the DiskManager is closed
+ * or freed, otherwise stale DM pointers remain on the frames.
  */
 int bp_evict_table(BufferPool *bp, int table_id);
 

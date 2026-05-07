@@ -1,7 +1,26 @@
-set(TEST_MODULES disk_manager page buffer_pool btree schema transaction storage)
+# Storage-engine modules whose tests link only `storage_engine`.
+set(STORAGE_TEST_MODULES
+    disk_manager page buffer_pool btree transaction
+    file_header partition schema_file relation_def)
 
-foreach(mod ${TEST_MODULES})
+foreach(mod ${STORAGE_TEST_MODULES})
     add_executable(test_${mod} storage_engine/test_${mod}.c)
     target_link_libraries(test_${mod} PRIVATE storage_engine)
+    add_test(NAME test_${mod} COMMAND test_${mod})
+endforeach()
+
+# system_schema tests link the system_schema library (transitively
+# pulls storage_engine).
+add_executable(test_system_schema system_schema/test_system_schema.c)
+target_link_libraries(test_system_schema PRIVATE system_schema)
+add_test(NAME test_system_schema COMMAND test_system_schema)
+
+# engine tests link `engine` (transitively pulls storage_engine +
+# system_schema). test_storage joined this set in phase 9 — it now
+# bootstraps an engine to drive the session-aware storage API.
+set(ENGINE_TEST_MODULES database_file crypto engine storage)
+foreach(mod ${ENGINE_TEST_MODULES})
+    add_executable(test_${mod} engine/test_${mod}.c)
+    target_link_libraries(test_${mod} PRIVATE engine)
     add_test(NAME test_${mod} COMMAND test_${mod})
 endforeach()

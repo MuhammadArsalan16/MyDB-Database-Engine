@@ -3,7 +3,7 @@
 #include <stdlib.h>
 
 /* ================================================================== */
-/*  Key encode / decode / compare                                       */
+/*  Key encode / decode / compare                                     */
 /* ================================================================== */
 
 /*
@@ -86,7 +86,10 @@ void btree_key_decode(const uint8_t *data, uint16_t len, DataType type, Value *o
         uint16_t slen = ((uint16_t)data[0] << 8) | data[1];
         out->v.varchar_val.len = slen;
         memcpy(out->v.varchar_val.data, data + 2, slen);
-        out->v.varchar_val.data[slen] = '\0';
+        /* Buffer is exactly MAX_VARCHAR_LEN bytes; only NUL-terminate if
+         * there is room. Callers must rely on .len for length, not strlen. */
+        if (slen < MAX_VARCHAR_LEN)
+            out->v.varchar_val.data[slen] = '\0';
         break;
     }
     case TYPE_BOOL:
@@ -128,16 +131,16 @@ int btree_key_compare(const uint8_t *a, uint16_t alen,
 }
 
 /* ================================================================== */
-/*  On-disk record helpers                                              */
-/*                                                                      */
-/*  Clustered leaf record layout:                                       */
-/*    [key_len:2B][key_bytes:key_len][val_len:2B][val_bytes:val_len]   */
-/*                                                                      */
-/*  Internal node record layout:                                        */
-/*    [key_len:2B][key_bytes:key_len][child_page_no:4B]                */
-/*                                                                      */
-/*  Secondary leaf record layout:                                       */
-/*    [key_len:2B][key_bytes:key_len][page_no:4B][slot_no:2B]          */
+/*  On-disk record helpers                                            */
+/*                                                                    */
+/*  Clustered leaf record layout:                                     */
+/*    [key_len:2B][key_bytes:key_len][val_len:2B][val_bytes:val_len]  */
+/*                                                                    */
+/*  Internal node record layout:                                      */
+/*    [key_len:2B][key_bytes:key_len][child_page_no:4B]               */
+/*                                                                    */
+/*  Secondary leaf record layout:                                     */
+/*    [key_len:2B][key_bytes:key_len][page_no:4B][slot_no:2B]         */
 /* ================================================================== */
 
 /* Extract the encoded key from a record stored in a page. */
@@ -166,7 +169,7 @@ static uint16_t build_internal_record(const uint8_t *key, uint16_t klen,
 }
 
 /* ================================================================== */
-/*  BTree initialise                                                    */
+/*  BTree initialise                                                  */
 /* ================================================================== */
 
 void btree_init(BTree *bt, BufferPool *bp, DiskManager *dm,
@@ -182,20 +185,19 @@ void btree_init(BTree *bt, BufferPool *bp, DiskManager *dm,
 }
 
 /* ================================================================== */
-/*  Tree traversal helpers                                              */
+/*  Tree traversal helpers                                            */
 /* ================================================================== */
 
 /*
- * Search a leaf page for an encoded key by walking the key-order
- * linked list (Infimum → r1 → r2 → ... → Supremum).
+ * Search a leaf page for an encoded key.
  *
- * found_out = 1 and slot_out = matching slot if exact match.
- * found_out = 0 and slot_out = slot of first record > key (insertion point),
- *             or num_dir_slots if all records are < key.
+ * Iterates the directory in key order. With the directory maintained
+ * in key order, this is a straight scan (could be binary-searched as
+ * a future perf optimization).
  *
- * NOTE: slot numbers are used only for delete/get; the linked list gives
- * us key order. We map doff → slot by scanning the directory after we
- * find the position. That is O(n) but n ≤ a few hundred so it is fine.
+ *   found_out = 1, slot_out = matching slot           — exact match
+ *   found_out = 0, slot_out = first slot whose key > key (insertion point);
+ *                  num_dir_slots if all slots' keys are < key
  */
 static void leaf_search(const uint8_t *page, const uint8_t *key, uint16_t klen,
                         DataType type, uint16_t *slot_out, uint8_t *found_out)
@@ -204,54 +206,53 @@ static void leaf_search(const uint8_t *page, const uint8_t *key, uint16_t klen,
     *found_out = 0;
     *slot_out  = n;
 
-    /* Walk the linked list in key order */
-    RecordHeader inf_hdr;
-    rec_hdr_decode(page + INFIMUM_OFFSET, &inf_hdr);
-    uint16_t cur = inf_hdr.next_offset;
+    for (uint16_t i = 0; i < n; i++) {
+        uint16_t doff = page_dir_get(page, i);
 
-    while (cur != SUPREMUM_DATA && cur != 0) {
-        RecordHeader rh;
-        rec_hdr_decode(page + cur - RECORD_HEADER_SIZE, &rh);
+        uint8_t  rk[MAX_VARCHAR_LEN + 2];
+        uint16_t rklen;
+        record_get_key(page + doff, rk, &rklen);
 
-        if (!(rh.info_flags & 0x01)) { /* skip deleted */
-            uint8_t  rec_key[MAX_VARCHAR_LEN + 2];
-            uint16_t rec_klen;
-            record_get_key(page + cur, rec_key, &rec_klen);
-
-            int cmp = btree_key_compare(rec_key, rec_klen, key, klen, type);
-            if (cmp == 0) {
-                /* Exact match — find its slot number */
-                for (uint16_t s = 0; s < n; s++) {
-                    if (page_dir_get(page, s) == cur) { *slot_out = s; break; }
-                }
-                *found_out = 1;
-                return;
-            }
-            if (cmp > 0) {
-                /* First record > key — its slot is the insertion point */
-                for (uint16_t s = 0; s < n; s++) {
-                    if (page_dir_get(page, s) == cur) { *slot_out = s; break; }
-                }
-                return;
-            }
-        }
-        cur = rh.next_offset;
+        int cmp = btree_key_compare(rk, rklen, key, klen, type);
+        if (cmp == 0) { *slot_out = i; *found_out = 1; return; }
+        if (cmp >  0) { *slot_out = i; return; }
     }
-    /* All records < key; insertion point is after the last one */
+}
+
+/*
+ * Find the slot index in a leaf or internal page where a record with
+ * the given key should be inserted (first slot whose key >= search key,
+ * or num_dir_slots if all are <).
+ */
+static uint16_t find_insertion_slot(const uint8_t *page,
+                                    const uint8_t *key, uint16_t klen,
+                                    DataType type)
+{
+    uint16_t n = page_dir_count(page);
+    for (uint16_t i = 0; i < n; i++) {
+        uint16_t doff = page_dir_get(page, i);
+
+        uint8_t  rk[MAX_VARCHAR_LEN + 2];
+        uint16_t rklen;
+        record_get_key(page + doff, rk, &rklen);
+
+        if (btree_key_compare(rk, rklen, key, klen, type) >= 0)
+            return i;
+    }
+    return n;
 }
 
 /*
  * Search an internal page for the child page to follow for a given key.
- * Internal page stores records ordered by separator key. We want the
- * rightmost separator key <= search key. If all separators > key,
- * follow the leftmost child (stored as prev_page in the page header).
+ * Internal records are ordered by separator key in the directory; we
+ * follow the rightmost separator <= search key, or the leftmost child
+ * (stored in prev_page) if all separators are > key.
  */
 static uint32_t internal_search(const uint8_t *page, const uint8_t *key,
                                   uint16_t klen, DataType type)
 {
     uint16_t n = page_dir_count(page);
 
-    /* Start with leftmost child (stored in prev_page header field) */
     PageHeader hdr;
     page_read_header(page, &hdr);
     uint32_t child = hdr.prev_page; /* leftmost child page */
@@ -259,19 +260,19 @@ static uint32_t internal_search(const uint8_t *page, const uint8_t *key,
     for (uint16_t i = 0; i < n; i++) {
         uint16_t doff = page_dir_get(page, i);
 
-        uint8_t  rec_key[MAX_VARCHAR_LEN + 2];
-        uint16_t rec_klen;
-        record_get_key(page + doff, rec_key, &rec_klen);
+        uint8_t  rk[MAX_VARCHAR_LEN + 2];
+        uint16_t rklen;
+        record_get_key(page + doff, rk, &rklen);
 
-        int cmp = btree_key_compare(rec_key, rec_klen, key, klen, type);
-        if (cmp > 0) break; /* this separator is > key, stop */
+        int cmp = btree_key_compare(rk, rklen, key, klen, type);
+        if (cmp > 0) break;
         child = record_get_child(page + doff);
     }
     return child;
 }
 
 /* ================================================================== */
-/*  btree_search                                                        */
+/*  btree_search                                                      */
 /* ================================================================== */
 
 int btree_search(BTree *bt, const Value *key, BTreeSearchResult *result)
@@ -319,14 +320,14 @@ int btree_search(BTree *bt, const Value *key, BTreeSearchResult *result)
 }
 
 /* ================================================================== */
-/*  Split helpers                                                       */
-/*                                                                      */
-/*  When a leaf is full we:                                            */
-/*    1. Allocate a new right page                                      */
-/*    2. Move the upper half of records to the new page                */
-/*    3. Return the separator key (first key of new right page) and    */
-/*       the new right page number to the caller so it can insert      */
-/*       the separator into the parent.                                 */
+/*  Split helpers                                                     */
+/*                                                                    */
+/*  When a leaf is full we:                                           */
+/*    1. Allocate a new right page                                    */
+/*    2. Move the upper half of records to the new page               */
+/*    3. Return the separator key (first key of new right page) and   */
+/*       the new right page number to the caller so it can insert     */
+/*       the separator into the parent.                               */
 /* ================================================================== */
 
 /*
@@ -405,22 +406,14 @@ static int leaf_split(BTree *bt, uint32_t left_pno,
         }
     }
 
-    /* Re-insert lower half into left */
-    uint16_t prev_off = INFIMUM_DATA;
+    /* Re-insert lower half into left (records already in key order in scratch) */
     for (uint16_t i = 0; i < mid; i++) {
-        uint16_t slot;
-        page_insert_record(left, scratch + rec_off[i], rec_sz[i], prev_off, &slot);
-        uint16_t doff, dsz; page_get_record(left, slot, &doff, &dsz);
-        prev_off = doff;
+        page_insert_record(left, scratch + rec_off[i], rec_sz[i], i);
     }
 
     /* Insert upper half into right */
-    prev_off = INFIMUM_DATA;
     for (uint16_t i = mid; i < live_count; i++) {
-        uint16_t slot;
-        page_insert_record(right, scratch + rec_off[i], rec_sz[i], prev_off, &slot);
-        uint16_t doff, dsz; page_get_record(right, slot, &doff, &dsz);
-        prev_off = doff;
+        page_insert_record(right, scratch + rec_off[i], rec_sz[i], (uint16_t)(i - mid));
     }
 
     /* Separator = first key of the new right page (copy-up for leaf nodes) */
@@ -488,12 +481,8 @@ static int internal_split(BTree *bt, uint32_t int_pno,
     page_write_header(right, &rhdr);
 
     /* Insert upper half (after mid) into right */
-    uint16_t prev_off = INFIMUM_DATA;
     for (uint16_t i = mid + 1; i < cnt; i++) {
-        uint16_t slot;
-        page_insert_record(right, scratch + rec_off[i], rec_sz[i], prev_off, &slot);
-        uint16_t doff, dsz; page_get_record(right, slot, &doff, &dsz);
-        prev_off = doff;
+        page_insert_record(right, scratch + rec_off[i], rec_sz[i], (uint16_t)(i - mid - 1));
     }
 
     /* Rebuild left with lower half (before mid) */
@@ -503,12 +492,8 @@ static int internal_split(BTree *bt, uint32_t int_pno,
     lhdr.prev_page = leftmost_child;
     page_write_header(page, &lhdr);
 
-    prev_off = INFIMUM_DATA;
     for (uint16_t i = 0; i < mid; i++) {
-        uint16_t slot;
-        page_insert_record(page, scratch + rec_off[i], rec_sz[i], prev_off, &slot);
-        uint16_t doff, dsz; page_get_record(page, slot, &doff, &dsz);
-        prev_off = doff;
+        page_insert_record(page, scratch + rec_off[i], rec_sz[i], i);
     }
 
     bp_unpin_page(bt->bp, bt->table_id, int_pno,   1);
@@ -541,8 +526,7 @@ int btree_insert(BTree *bt, const Value *key,
         if (!root) return MYDB_ERR;
         page_init(root, root_pno, PAGE_TYPE_DATA);
 
-        uint16_t slot;
-        int rc = page_insert_record(root, record, record_len, INFIMUM_DATA, &slot);
+        int rc = page_insert_record(root, record, record_len, 0);
         bp_unpin_page(bt->bp, bt->table_id, root_pno, 1);
         if (rc != MYDB_OK) return rc;
 
@@ -554,7 +538,7 @@ int btree_insert(BTree *bt, const Value *key,
         fh.root_page_no = root_pno;
         disk_write_header(bt->dm, &fh);
 
-        if (out_rid) { out_rid->page_no = root_pno; out_rid->slot_no = slot; }
+        if (out_rid) { out_rid->page_no = root_pno; out_rid->slot_no = 0; }
         return MYDB_OK;
     }
 
@@ -593,39 +577,21 @@ int btree_insert(BTree *bt, const Value *key,
     uint8_t *leaf = bp_fetch_page(bt->bp, bt->dm, bt->table_id, cur_pno);
     if (!leaf) return MYDB_ERR;
 
-    /*
-     * Find predecessor by walking the linked list in key order.
-     * pred_off = data offset of the last record whose key < enc_key.
-     * Start at INFIMUM_DATA (which is always "less than everything").
-     */
-    uint16_t pred_off = INFIMUM_DATA;
-    {
-        RecordHeader ih; rec_hdr_decode(leaf + INFIMUM_OFFSET, &ih);
-        uint16_t cur2 = ih.next_offset;
-        while (cur2 != SUPREMUM_DATA && cur2 != 0) {
-            RecordHeader rh; rec_hdr_decode(leaf + cur2 - RECORD_HEADER_SIZE, &rh);
-            if (!(rh.info_flags & 0x01)) {
-                uint8_t rk[MAX_VARCHAR_LEN+2]; uint16_t rklen;
-                record_get_key(leaf + cur2, rk, &rklen);
-                if (btree_key_compare(rk, rklen, enc_key, enc_len, bt->key_type) < 0)
-                    pred_off = cur2;
-                else break;
-            }
-            cur2 = rh.next_offset;
-        }
-    }
-
-    uint16_t new_slot;
-    int rc = page_insert_record(leaf, record, record_len, pred_off, &new_slot);
+    uint16_t at = find_insertion_slot(leaf, enc_key, enc_len, bt->key_type);
+    int rc = page_insert_record(leaf, record, record_len, at);
 
     if (rc == MYDB_OK) {
         /* Simple case: record fit without a split */
-        if (out_rid) { out_rid->page_no = cur_pno; out_rid->slot_no = new_slot; }
+        if (out_rid) { out_rid->page_no = cur_pno; out_rid->slot_no = at; }
         bp_unpin_page(bt->bp, bt->table_id, cur_pno, 1);
         return MYDB_OK;
     }
 
     bp_unpin_page(bt->bp, bt->table_id, cur_pno, 0);
+
+    /* Only a full page should drive us into a split. Any other error
+     * (bad args, invalid slot) is a real bug — propagate it. */
+    if (rc != MYDB_ERR_FULL) return rc;
 
     /* --- Leaf is full: split and propagate up the path --- */
     uint8_t  sep_key[MAX_VARCHAR_LEN + 2];
@@ -642,25 +608,9 @@ int btree_insert(BTree *bt, const Value *key,
     uint8_t *ins_page = bp_fetch_page(bt->bp, bt->dm, bt->table_id, insert_pno);
     if (!ins_page) return MYDB_ERR;
 
-    /* Re-find predecessor in the chosen page via linked list */
-    pred_off = INFIMUM_DATA;
-    {
-        RecordHeader ih; rec_hdr_decode(ins_page + INFIMUM_OFFSET, &ih);
-        uint16_t cur3 = ih.next_offset;
-        while (cur3 != SUPREMUM_DATA && cur3 != 0) {
-            RecordHeader rh; rec_hdr_decode(ins_page + cur3 - RECORD_HEADER_SIZE, &rh);
-            if (!(rh.info_flags & 0x01)) {
-                uint8_t rk[MAX_VARCHAR_LEN+2]; uint16_t rklen;
-                record_get_key(ins_page + cur3, rk, &rklen);
-                if (btree_key_compare(rk, rklen, enc_key, enc_len, bt->key_type) < 0)
-                    pred_off = cur3;
-                else break;
-            }
-            cur3 = rh.next_offset;
-        }
-    }
-    page_insert_record(ins_page, record, record_len, pred_off, &new_slot);
-    if (out_rid) { out_rid->page_no = insert_pno; out_rid->slot_no = new_slot; }
+    uint16_t ins_at = find_insertion_slot(ins_page, enc_key, enc_len, bt->key_type);
+    page_insert_record(ins_page, record, record_len, ins_at);
+    if (out_rid) { out_rid->page_no = insert_pno; out_rid->slot_no = ins_at; }
     bp_unpin_page(bt->bp, bt->table_id, insert_pno, 1);
 
     /* --- Propagate split up the path (internal node insertions) ---
@@ -678,30 +628,17 @@ int btree_insert(BTree *bt, const Value *key,
         uint8_t  int_rec[MAX_VARCHAR_LEN + 2 + 4 + 2];
         uint16_t int_rec_len = build_internal_record(sep_key, sep_klen, right_pno, int_rec);
 
-        /* Find predecessor in parent via linked list (key order) */
-        pred_off = INFIMUM_DATA;
-        {
-            RecordHeader ih; rec_hdr_decode(parent + INFIMUM_OFFSET, &ih);
-            uint16_t c = ih.next_offset;
-            while (c != SUPREMUM_DATA && c != 0) {
-                RecordHeader rh; rec_hdr_decode(parent + c - RECORD_HEADER_SIZE, &rh);
-                uint8_t rk[MAX_VARCHAR_LEN+2]; uint16_t rklen;
-                record_get_key(parent + c, rk, &rklen);
-                if (btree_key_compare(rk, rklen, sep_key, sep_klen, bt->key_type) < 0)
-                    pred_off = c;
-                else break;
-                c = rh.next_offset;
-            }
-        }
-
-        uint16_t pslot;
-        rc = page_insert_record(parent, int_rec, int_rec_len, pred_off, &pslot);
+        uint16_t pat = find_insertion_slot(parent, sep_key, sep_klen, bt->key_type);
+        rc = page_insert_record(parent, int_rec, int_rec_len, pat);
         if (rc == MYDB_OK) {
             bp_unpin_page(bt->bp, bt->table_id, parent_pno, 1);
             return MYDB_OK; /* no more splits needed */
         }
 
         bp_unpin_page(bt->bp, bt->table_id, parent_pno, 0);
+
+        /* Only split on a genuinely full parent — propagate other errors. */
+        if (rc != MYDB_ERR_FULL) return rc;
 
         /* Parent is full — split it too */
         uint8_t  new_sep[MAX_VARCHAR_LEN + 2];
@@ -715,21 +652,8 @@ int btree_insert(BTree *bt, const Value *key,
         uint32_t ins_pno = (cmp < 0) ? parent_pno : new_right_pno;
         uint8_t *ins_par = bp_fetch_page(bt->bp, bt->dm, bt->table_id, ins_pno);
         if (ins_par) {
-            pred_off = INFIMUM_DATA;
-            {
-                RecordHeader ih; rec_hdr_decode(ins_par + INFIMUM_OFFSET, &ih);
-                uint16_t c = ih.next_offset;
-                while (c != SUPREMUM_DATA && c != 0) {
-                    RecordHeader rh; rec_hdr_decode(ins_par + c - RECORD_HEADER_SIZE, &rh);
-                    uint8_t rk[MAX_VARCHAR_LEN+2]; uint16_t rklen;
-                    record_get_key(ins_par + c, rk, &rklen);
-                    if (btree_key_compare(rk, rklen, sep_key, sep_klen, bt->key_type) < 0)
-                        pred_off = c;
-                    else break;
-                    c = rh.next_offset;
-                }
-            }
-            page_insert_record(ins_par, int_rec, int_rec_len, pred_off, &pslot);
+            uint16_t at2 = find_insertion_slot(ins_par, sep_key, sep_klen, bt->key_type);
+            page_insert_record(ins_par, int_rec, int_rec_len, at2);
             bp_unpin_page(bt->bp, bt->table_id, ins_pno, 1);
         }
 
@@ -752,8 +676,7 @@ int btree_insert(BTree *bt, const Value *key,
 
     uint8_t  int_rec[MAX_VARCHAR_LEN + 2 + 4 + 2];
     uint16_t int_rec_len = build_internal_record(sep_key, sep_klen, right_pno, int_rec);
-    uint16_t rslot;
-    page_insert_record(new_root, int_rec, int_rec_len, INFIMUM_DATA, &rslot);
+    page_insert_record(new_root, int_rec, int_rec_len, 0);
     bp_unpin_page(bt->bp, bt->table_id, new_root_pno, 1);
 
     bt->root_page_no = new_root_pno;
@@ -768,7 +691,7 @@ int btree_insert(BTree *bt, const Value *key,
 }
 
 /* ================================================================== */
-/*  btree_delete                                                        */
+/*  btree_delete                                                      */
 /* ================================================================== */
 
 int btree_delete(BTree *bt, const Value *key)
@@ -786,7 +709,7 @@ int btree_delete(BTree *bt, const Value *key)
 }
 
 /* ================================================================== */
-/*  Cursor                                                              */
+/*  Cursor                                                            */
 /* ================================================================== */
 
 /*
@@ -818,26 +741,14 @@ static uint32_t find_leftmost_leaf(BTree *bt)
 
 int btree_cursor_open(BTree *bt, Cursor *cur)
 {
-    cur->tree = bt;
-    cur->done = 0;
-    cur->page_no = find_leftmost_leaf(bt);
+    cur->tree      = bt;
+    cur->done      = 0;
+    cur->page_no   = find_leftmost_leaf(bt);
+    cur->next_slot = 0;
 
     if (cur->page_no == INVALID_PAGE) {
         cur->done = 1;
-        return MYDB_OK;
     }
-
-    /*
-     * Position at the first user record by following the linked list
-     * from Infimum. next_data_off = infimum.next_offset.
-     */
-    uint8_t *page = bp_fetch_page(bt->bp, bt->dm, bt->table_id, cur->page_no);
-    if (!page) { cur->done = 1; return MYDB_ERR; }
-
-    RecordHeader inf_hdr;
-    rec_hdr_decode(page + INFIMUM_OFFSET, &inf_hdr);
-    cur->next_data_off = inf_hdr.next_offset; /* first user record or SUPREMUM_DATA */
-    bp_unpin_page(bt->bp, bt->table_id, cur->page_no, 0);
     return MYDB_OK;
 }
 
@@ -853,65 +764,32 @@ int btree_cursor_next(Cursor *cur, uint8_t *data_out, uint16_t *len)
         PageHeader hdr;
         page_read_header(page, &hdr);
 
-        /*
-         * Walk the linked list from next_data_off until we hit a live
-         * record or reach Supremum (SUPREMUM_DATA = 56) / end of chain.
-         */
-        while (cur->next_data_off != SUPREMUM_DATA && cur->next_data_off != 0) {
-            uint16_t doff = cur->next_data_off;
-            uint16_t roff = doff - RECORD_HEADER_SIZE;
-
-            RecordHeader rh;
-            rec_hdr_decode(page + roff, &rh);
-            uint16_t next = rh.next_offset; /* save before we might skip */
-
-            if (!(rh.info_flags & 0x01)) {
-                /*
-                 * Live record — compute physical size by scanning the
-                 * directory for the nearest record with doff > current doff.
-                 * This is correct even when insertion order != key order.
-                 */
-                uint16_t next_phys = hdr.free_offset;
-                uint16_t nslots = hdr.num_dir_slots;
-                for (uint16_t si = 0; si < nslots; si++) {
-                    uint16_t sd = page_dir_get(page, si);
-                    if (sd > doff) {
-                        uint16_t hs = sd - RECORD_HEADER_SIZE;
-                        if (hs < next_phys) next_phys = hs;
-                    }
-                }
-                uint16_t sz = (next_phys > doff) ? (uint16_t)(next_phys - doff) : 0;
-
-                cur->last_page_no  = cur->page_no;
-                cur->last_data_off = doff;
-                cur->next_data_off = next; /* advance for next call */
-                memcpy(data_out, page + doff, sz);
-                *len = sz;
+        if (cur->next_slot < hdr.num_dir_slots) {
+            uint16_t doff, dsz;
+            if (page_get_record(page, cur->next_slot, &doff, &dsz) == MYDB_OK) {
+                cur->last_page_no = cur->page_no;
+                cur->last_slot    = cur->next_slot;
+                cur->next_slot++;
+                memcpy(data_out, page + doff, dsz);
+                *len = dsz;
                 bp_unpin_page(cur->tree->bp, cur->tree->table_id, cur->page_no, 0);
                 return MYDB_OK;
             }
-
-            /* Deleted record — skip it */
-            cur->next_data_off = next;
+            /* Shouldn't happen: directory only references live records */
+            cur->next_slot++;
+            bp_unpin_page(cur->tree->bp, cur->tree->table_id, cur->page_no, 0);
+            continue;
         }
 
-        /* Reached end of this leaf page — follow next_page pointer */
+        /* End of this leaf — follow next_page */
         uint32_t next_pno = hdr.next_page;
         bp_unpin_page(cur->tree->bp, cur->tree->table_id, cur->page_no, 0);
 
         if (next_pno == INVALID_PAGE || next_pno == 0) {
             cur->done = 1;
         } else {
-            cur->page_no = next_pno;
-
-            /* Initialise next_data_off from the new page's infimum */
-            uint8_t *np = bp_fetch_page(cur->tree->bp, cur->tree->dm,
-                                         cur->tree->table_id, next_pno);
-            if (!np) { cur->done = 1; return MYDB_ERR; }
-            RecordHeader inf_hdr;
-            rec_hdr_decode(np + INFIMUM_OFFSET, &inf_hdr);
-            cur->next_data_off = inf_hdr.next_offset;
-            bp_unpin_page(cur->tree->bp, cur->tree->table_id, next_pno, 0);
+            cur->page_no   = next_pno;
+            cur->next_slot = 0;
         }
     }
 

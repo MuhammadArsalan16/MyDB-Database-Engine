@@ -48,11 +48,10 @@ static void test_insert_and_get(void)
     printf("\n[test_insert_and_get]\n");
     page_init(pg, 1, PAGE_TYPE_DATA);
 
-    /* Insert a 10-byte record */
+    /* Insert a 10-byte record at slot 0 */
     uint8_t rec1[10];
     memset(rec1, 0xAA, 10);
-    uint16_t slot1;
-    CHECK(page_insert_record(pg, rec1, 10, INFIMUM_DATA, &slot1) == MYDB_OK,
+    CHECK(page_insert_record(pg, rec1, 10, 0) == MYDB_OK,
           "insert record 1 succeeds");
 
     PageHeader hdr;
@@ -64,19 +63,18 @@ static void test_insert_and_get(void)
 
     /* Read it back */
     uint16_t doff, dsz;
-    CHECK(page_get_record(pg, slot1, &doff, &dsz) == MYDB_OK, "get record 1");
+    CHECK(page_get_record(pg, 0, &doff, &dsz) == MYDB_OK, "get record 1");
     CHECK(dsz == 10, "record 1 size == 10");
     CHECK(memcmp(pg + doff, rec1, 10) == 0, "record 1 data matches");
 
-    /* Insert a second record (linked after the first) */
+    /* Insert a second record by appending at slot 1 */
     uint8_t rec2[20];
     memset(rec2, 0xBB, 20);
-    uint16_t slot2;
-    CHECK(page_insert_record(pg, rec2, 20, doff, &slot2) == MYDB_OK,
+    CHECK(page_insert_record(pg, rec2, 20, 1) == MYDB_OK,
           "insert record 2 succeeds");
 
     uint16_t doff2, dsz2;
-    CHECK(page_get_record(pg, slot2, &doff2, &dsz2) == MYDB_OK, "get record 2");
+    CHECK(page_get_record(pg, 1, &doff2, &dsz2) == MYDB_OK, "get record 2");
     CHECK(dsz2 == 20, "record 2 size == 20");
     CHECK(memcmp(pg + doff2, rec2, 20) == 0, "record 2 data matches");
 }
@@ -88,22 +86,22 @@ static void test_delete(void)
 
     uint8_t rec[8];
     memset(rec, 0xCC, 8);
-    uint16_t slot;
-    page_insert_record(pg, rec, 8, INFIMUM_DATA, &slot);
+    page_insert_record(pg, rec, 8, 0);
 
-    CHECK(page_delete_record(pg, slot) == MYDB_OK, "delete record succeeds");
+    CHECK(page_delete_record(pg, 0) == MYDB_OK, "delete record succeeds");
 
     PageHeader hdr;
     page_read_header(pg, &hdr);
-    CHECK(hdr.num_records == 0, "num_records == 0 after delete");
+    CHECK(hdr.num_records   == 0, "num_records == 0 after delete");
+    CHECK(hdr.num_dir_slots == 0, "num_dir_slots == 0 after delete");
 
-    /* Getting a deleted record must fail */
+    /* Slot 0 no longer references a record */
     uint16_t doff, dsz;
-    CHECK(page_get_record(pg, slot, &doff, &dsz) == MYDB_ERR_NOT_FOUND,
-          "get deleted record returns NOT_FOUND");
+    CHECK(page_get_record(pg, 0, &doff, &dsz) == MYDB_ERR_NOT_FOUND,
+          "get on now-empty directory returns NOT_FOUND");
 
-    /* Deleting again must fail */
-    CHECK(page_delete_record(pg, slot) == MYDB_ERR, "double-delete fails");
+    /* Deleting again must fail (directory is empty) */
+    CHECK(page_delete_record(pg, 0) == MYDB_ERR_NOT_FOUND, "delete on empty fails");
 }
 
 static void test_compact(void)
@@ -111,23 +109,16 @@ static void test_compact(void)
     printf("\n[test_compact]\n");
     page_init(pg, 1, PAGE_TYPE_DATA);
 
-    /* Insert 3 records */
+    /* Insert 3 records, appending each */
     uint8_t r[3][8];
-    uint16_t slots[3];
-    uint16_t prev = INFIMUM_DATA;
     for (int i = 0; i < 3; i++) {
         memset(r[i], (uint8_t)(0x10 + i), 8);
-        page_insert_record(pg, r[i], 8, prev, &slots[i]);
-        uint16_t doff, dsz;
-        page_get_record(pg, slots[i], &doff, &dsz);
-        prev = doff;
+        page_insert_record(pg, r[i], 8, (uint16_t)i);
     }
 
-    /* Delete the middle one */
-    page_delete_record(pg, slots[1]);
+    /* Delete the middle one (slot 1) — slot 2 shifts down to slot 1 */
+    page_delete_record(pg, 1);
 
-    PageHeader hdr_before;
-    page_read_header(pg, &hdr_before);
     uint16_t free_before = page_free_space(pg);
 
     /* Compact */
@@ -156,21 +147,16 @@ static void test_full_page(void)
     /* Insert 50-byte records until the page is full */
     uint8_t rec[50];
     memset(rec, 0x55, 50);
-    uint16_t slot;
-    int count = 0;
-    uint16_t prev = INFIMUM_DATA;
+    uint16_t count = 0;
 
-    while (page_insert_record(pg, rec, 50, prev, &slot) == MYDB_OK) {
-        uint16_t doff, dsz;
-        page_get_record(pg, slot, &doff, &dsz);
-        prev = doff;
+    while (page_insert_record(pg, rec, 50, count) == MYDB_OK) {
         count++;
     }
 
     CHECK(count > 0, "inserted at least one record before full");
 
     /* The next insert must fail with FULL */
-    CHECK(page_insert_record(pg, rec, 50, prev, &slot) == MYDB_ERR_FULL,
+    CHECK(page_insert_record(pg, rec, 50, count) == MYDB_ERR_FULL,
           "insert into full page returns MYDB_ERR_FULL");
 
     printf("  INFO: filled page with %d records of 50 bytes each\n", count);

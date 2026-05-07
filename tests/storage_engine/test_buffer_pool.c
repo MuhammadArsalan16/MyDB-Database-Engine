@@ -30,11 +30,16 @@ static void test_fetch_and_unpin(void)
     DiskManager dm;
     disk_create(&dm, TEST_FILE);
 
-    /* Allocate a page and write a known pattern to it */
+    /* Allocate a page and write a known pattern to it.
+     * The page must be a valid page (init + checksum) because bp_fetch_page
+     * verifies the checksum on read. */
     uint32_t pno;
     disk_alloc_page(&dm, &pno); /* page 1 */
     uint8_t wbuf[PAGE_SIZE];
-    memset(wbuf, 0xAB, PAGE_SIZE);
+    page_init(wbuf, pno, PAGE_TYPE_DATA);
+    /* Stamp a recognisable pattern into the user-record region */
+    memset(wbuf + USER_RECORDS_OFFSET, 0xAB, 256);
+    page_set_checksum(wbuf);
     disk_write_page(&dm, pno, wbuf);
 
     BufferPool bp;
@@ -64,20 +69,21 @@ static void test_dirty_flush(void)
     BufferPool bp;
     bp_init(&bp);
 
-    /* Fetch, modify in the frame, unpin as dirty */
+    /* Fetch, init as a valid page, modify the body, unpin as dirty */
     uint8_t *page = bp_fetch_page(&bp, &dm, TABLE_ID, pno);
-    memset(page, 0xCD, PAGE_SIZE);
+    page_init(page, pno, PAGE_TYPE_DATA);
+    memset(page + USER_RECORDS_OFFSET, 0xCD, 256);
     bp_unpin_page(&bp, TABLE_ID, pno, 1); /* dirty=1 */
 
     /* Flush to disk explicitly */
-    CHECK(bp_flush_page(&bp, &dm, TABLE_ID, pno) == MYDB_OK, "bp_flush_page succeeds");
+    CHECK(bp_flush_page(&bp, TABLE_ID, pno) == MYDB_OK, "bp_flush_page succeeds");
 
     /* Read back from disk directly to verify the flush worked */
     uint8_t rbuf[PAGE_SIZE];
     disk_read_page(&dm, pno, rbuf);
-    uint8_t expected[PAGE_SIZE];
-    memset(expected, 0xCD, PAGE_SIZE);
-    CHECK(memcmp(rbuf, expected, PAGE_SIZE) == 0, "dirty data persisted to disk");
+    CHECK(page_verify_checksum(rbuf) == MYDB_OK, "flushed page has valid checksum");
+    CHECK(memcmp(rbuf + USER_RECORDS_OFFSET, page + USER_RECORDS_OFFSET, 256) == 0,
+          "dirty data persisted to disk");
 
     disk_close(&dm);
 }
@@ -173,17 +179,20 @@ static void test_alloc_page(void)
     CHECK(p != NULL,    "bp_alloc_page returns non-NULL");
     CHECK(new_pno == 1, "first allocated page is page 1");
 
-    /* Write something and flush */
-    memset(p, 0xEE, PAGE_SIZE);
+    /* Init the page, write something into the body, and flush */
+    page_init(p, new_pno, PAGE_TYPE_DATA);
+    memset(p + USER_RECORDS_OFFSET, 0xEE, 256);
     bp_unpin_page(&bp, TABLE_ID, new_pno, 1);
-    bp_flush_page(&bp, &dm, TABLE_ID, new_pno);
+    bp_flush_page(&bp, TABLE_ID, new_pno);
 
-    /* Verify on disk */
+    /* Verify on disk: checksum is valid and the body bytes survived */
     uint8_t rbuf[PAGE_SIZE];
     disk_read_page(&dm, new_pno, rbuf);
-    uint8_t expected[PAGE_SIZE];
-    memset(expected, 0xEE, PAGE_SIZE);
-    CHECK(memcmp(rbuf, expected, PAGE_SIZE) == 0, "alloc_page data flushed correctly");
+    CHECK(page_verify_checksum(rbuf) == MYDB_OK, "flushed page has valid checksum");
+    uint8_t expected[256];
+    memset(expected, 0xEE, 256);
+    CHECK(memcmp(rbuf + USER_RECORDS_OFFSET, expected, 256) == 0,
+          "alloc_page data flushed correctly");
 
     disk_close(&dm);
 }
