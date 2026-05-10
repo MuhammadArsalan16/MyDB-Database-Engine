@@ -13,8 +13,8 @@
  */
 #define MARK_OFF USER_RECORDS_OFFSET
 
-#define TEST_FILE_A  "/home/hasnat/mydb/mydb_test_trx_a.mydb"
-#define TEST_FILE_B  "/home/hasnat/mydb/mydb_test_trx_b.mydb"
+#define TEST_FILE_A  "/tmp/mydb_test_trx_a.mydb"
+#define TEST_FILE_B  "/tmp/mydb_test_trx_b.mydb"
 #define TABLE_A  0
 #define TABLE_B  1
 

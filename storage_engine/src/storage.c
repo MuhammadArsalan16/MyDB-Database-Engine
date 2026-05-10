@@ -6,6 +6,10 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 /* ------------------------------------------------------------------ */
 /*  Internal types                                                       */
@@ -406,6 +410,51 @@ int storage_flush_all_dirty(void)
 /* ------------------------------------------------------------------ */
 /*  DDL                                                                 */
 /* ------------------------------------------------------------------ */
+
+int storage_create_schema(const char *name)
+{
+    if (!g.initialized || !name || name[0] == '\0') return MYDB_ERR;
+    if (strlen(name) >= sizeof(g.eng->current_schema_name)) return MYDB_ERR;
+
+    /* Owner check: only partition owners can create schemas. Analysts
+     * (no partition) get MYDB_ERR_PERM here. */
+    if (!g.eng->partition_open) return MYDB_ERR_PERM;
+
+    /* Reject duplicates against the partition catalog. */
+    if (cat_find_schema(&g.eng->active_catalog, name) != NULL)
+        return MYDB_ERR_DUPLICATE;
+
+    /* Build <partition>/<name>/ and <partition>/<name>/__schema.mydb. */
+    char dir[256], path[256];
+    int n = snprintf(dir, sizeof(dir), "%s/%s",
+                     g.eng->current_partition_path, name);
+    if (n < 0 || (size_t)n >= sizeof(dir)) return MYDB_ERR;
+    n = snprintf(path, sizeof(path), "%s/__schema.mydb", dir);
+    if (n < 0 || (size_t)n >= sizeof(path)) return MYDB_ERR;
+
+    /* mkdir; tolerate EEXIST only if it's already a directory. */
+    if (mkdir(dir, 0755) != 0) {
+        struct stat st;
+        if (errno != EEXIST || stat(dir, &st) != 0 || !S_ISDIR(st.st_mode))
+            return MYDB_ERR;
+    }
+
+    SchemaFile sf;
+    int rc = schema_create(path, g.eng->current_partition_id, name, &sf);
+    if (rc != MYDB_OK) {
+        rmdir(dir);   /* best-effort cleanup if dir was newly created */
+        return rc;
+    }
+    schema_close(&sf);
+
+    rc = cat_add_schema(&g.eng->active_catalog, name);
+    if (rc != MYDB_OK) {
+        unlink(path);
+        rmdir(dir);
+        return rc;
+    }
+    return MYDB_OK;
+}
 
 int storage_create_table(RelationDef *rel)
 {

@@ -1,6 +1,8 @@
 #include "engine.h"
 #include "crypto.h"
 #include "storage.h"
+#include "parser_api.h"
+#include "exec_engine_api.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -379,4 +381,42 @@ const RelationDef *engine_find_relation(EngineState *eng,
     if (!eng || !relation_name) return NULL;
     if (!eng->schema_active)    return NULL;
     return schema_find_relation(&eng->active_schema, relation_name);
+}
+
+
+/* ====================================================================
+ *  SQL execution
+ *
+ *  Engine is the single front door for raw SQL coming from bin/REPL.
+ *  Two-stage pipeline:
+ *    1. parser_parse(sql)               -> opaque AST handle
+ *    2. exec_engine_execute(eng, ast)   -> walks AST, writes result
+ *
+ *  The AST handle is heap-allocated by the parser and freed here on
+ *  every path. Parser errors are formatted into result_out and the
+ *  parser's PARSER_ERR is returned to the caller.
+ * ==================================================================== */
+
+int engine_execute_sql(EngineState *eng, const char *sql,
+                       char *result_out, size_t result_cap)
+{
+    if (!eng || !sql || !result_out || result_cap == 0) return MYDB_ERR;
+    if (!eng->logged_in) return MYDB_ERR_PERM;
+
+    ParserAST *ast = NULL;
+    char err_buf[256];
+    err_buf[0] = '\0';
+
+    int rc = parser_parse(sql, &ast, err_buf, sizeof(err_buf));
+    if (rc != PARSER_OK) {
+        snprintf(result_out, result_cap, "parse error: %s",
+                 err_buf[0] ? err_buf : "unknown");
+        /* PARSER_ERR is -1, same as MYDB_ERR — translate explicitly
+         * in case the values diverge in the future. */
+        return MYDB_ERR;
+    }
+
+    rc = exec_engine_execute(eng, ast, result_out, result_cap);
+    parser_free_ast(ast);
+    return rc;
 }

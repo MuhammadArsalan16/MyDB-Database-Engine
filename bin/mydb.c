@@ -1,9 +1,10 @@
 /* mydb — pre-engine CLI binary.
  *
- *   mydb init -u <username>
+ *   mydb init  -u <username>     first-run engine bootstrap
+ *   mydb start -u <username>     login + interactive REPL
  *
- * Prompts for the password interactively (twice, for confirmation)
- * and calls engine_bootstrap(). The password never appears on argv.
+ * Both subcommands prompt for the password interactively; the
+ * password never appears on argv.
  *
  * Engine root resolves from $MYDB_HOME, defaulting to ~/.mydb/. */
 
@@ -18,6 +19,7 @@
 
 #include "common.h"
 #include "engine.h"
+#include "storage.h"
 
 static const char *resolve_root_dir(char *buf, size_t cap)
 {
@@ -38,10 +40,11 @@ static const char *resolve_root_dir(char *buf, size_t cap)
 static void print_usage(void)
 {
     fprintf(stderr,
-        "Usage: mydb init -u <username>\n"
+        "Usage:\n"
+        "  mydb init  -u <username>   bootstrap a new MyDB engine\n"
+        "  mydb start -u <username>   login and open the SQL REPL\n"
         "\n"
-        "Initialises a new MyDB engine at $MYDB_HOME (default ~/.mydb).\n"
-        "Prompts for the password.\n");
+        "Engine root resolves from $MYDB_HOME (default ~/.mydb).\n");
 }
 
 static int run_init(int argc, char **argv)
@@ -93,10 +96,150 @@ static int run_init(int argc, char **argv)
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/*  REPL                                                                 */
+/*                                                                       */
+/*  fgets-based read loop. Buffers lines until ';' is seen, then sends  */
+/*  the whole buffer to engine_execute_sql() and prints the result.    */
+/*  Engine is the single back-end door — bin/ never touches the parser  */
+/*  or execution engine directly.                                       */
+/* ------------------------------------------------------------------ */
+
+#define REPL_LINE_CAP   1024
+#define REPL_QUERY_CAP  8192
+#define REPL_RESULT_CAP 4096
+
+static int is_blank(const char *s)
+{
+    while (*s) {
+        if (*s != ' ' && *s != '\t' && *s != '\n' && *s != '\r') return 0;
+        s++;
+    }
+    return 1;
+}
+
+/* Strip trailing whitespace and check for a literal exit command
+ * (with or without a terminating semicolon). */
+static int is_exit_command(const char *buf)
+{
+    while (*buf == ' ' || *buf == '\t' || *buf == '\n' || *buf == '\r') buf++;
+    if (strncmp(buf, "exit", 4) != 0 && strncmp(buf, ".exit", 5) != 0)
+        return 0;
+    /* match `exit`, `exit;`, `.exit`, `.exit;` (plus trailing whitespace) */
+    const char *p = (buf[0] == '.') ? buf + 5 : buf + 4;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ';') p++;
+    return *p == '\0';
+}
+
+static void run_repl(EngineState *eng)
+{
+    char query[REPL_QUERY_CAP];
+    char line[REPL_LINE_CAP];
+    char result[REPL_RESULT_CAP];
+    size_t qlen = 0;
+
+    printf("Type `exit` or Ctrl-D to quit.\n");
+    query[0] = '\0';
+
+    for (;;) {
+        fputs(qlen == 0 ? "mydb> " : "  ... ", stdout);
+        fflush(stdout);
+
+        if (!fgets(line, sizeof(line), stdin)) {
+            putchar('\n');
+            break;   /* EOF — Ctrl-D */
+        }
+
+        /* skip empty lines at the start of a fresh query */
+        if (qlen == 0 && is_blank(line)) continue;
+        if (qlen == 0 && is_exit_command(line)) break;
+
+        size_t llen = strlen(line);
+        if (qlen + llen + 1 >= sizeof(query)) {
+            fprintf(stderr, "mydb: query too long, discarded\n");
+            qlen = 0; query[0] = '\0';
+            continue;
+        }
+        memcpy(query + qlen, line, llen + 1);
+        qlen += llen;
+
+        /* submit when the buffer ends with ';' (after stripping whitespace) */
+        const char *end = query + qlen;
+        while (end > query && (end[-1] == '\n' || end[-1] == '\r' ||
+                               end[-1] == ' ' || end[-1] == '\t')) end--;
+        if (end == query || end[-1] != ';') continue;
+
+        int rc = engine_execute_sql(eng, query, result, sizeof(result));
+        if (rc == MYDB_OK) printf("%s\n", result);
+        else               fprintf(stderr, "error: %s (rc=%d)\n", result, rc);
+
+        qlen = 0; query[0] = '\0';
+    }
+}
+
+static int run_start(int argc, char **argv)
+{
+    /* Expected: argv = { "start", "-u", "<username>" } */
+    if (argc != 3 || strcmp(argv[1], "-u") != 0) {
+        print_usage();
+        return 1;
+    }
+    const char *username = argv[2];
+    if (username[0] == '\0') {
+        fprintf(stderr, "mydb: username may not be empty\n");
+        return 1;
+    }
+
+    char root_dir[256];
+    if (!resolve_root_dir(root_dir, sizeof(root_dir))) {
+        fprintf(stderr, "mydb: cannot resolve engine root "
+                        "(set $MYDB_HOME or $HOME)\n");
+        return 1;
+    }
+
+    char *pw = getpass("Password: ");
+    if (!pw || pw[0] == '\0') {
+        fprintf(stderr, "mydb: password may not be empty\n");
+        return 1;
+    }
+
+    EngineState eng;
+    int rc = engine_init(root_dir, &eng);
+    if (rc != MYDB_OK) {
+        fprintf(stderr, "mydb: engine_init failed (rc=%d). "
+                        "Is %s initialised? Run `mydb init` first.\n",
+                rc, root_dir);
+        return 1;
+    }
+
+    rc = engine_login(&eng, username, pw);
+    /* Wipe the password buffer regardless of outcome. */
+    memset(pw, 0, strlen(pw));
+    if (rc != MYDB_OK) {
+        if (rc == MYDB_ERR_NOT_FOUND)
+            fprintf(stderr, "mydb: unknown user '%s'\n", username);
+        else if (rc == MYDB_ERR_PERM)
+            fprintf(stderr, "mydb: authentication failed\n");
+        else
+            fprintf(stderr, "mydb: login failed (rc=%d)\n", rc);
+        engine_close(&eng);
+        return 1;
+    }
+
+    printf("Logged in as %s.\n", username);
+    run_repl(&eng);
+
+    storage_shutdown();   /* safe no-op until exec engine initialises storage */
+    engine_close(&eng);
+    printf("Goodbye.\n");
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2) { print_usage(); return 1; }
-    if (strcmp(argv[1], "init") == 0) return run_init(argc - 1, argv + 1);
+    if (strcmp(argv[1], "init")  == 0) return run_init (argc - 1, argv + 1);
+    if (strcmp(argv[1], "start") == 0) return run_start(argc - 1, argv + 1);
     print_usage();
     return 1;
 }

@@ -67,6 +67,19 @@ int storage_flush_all_dirty(void);
 /* ------------------------------------------------------------------ */
 
 /*
+ * Create a new schema in the current partition.
+ *   1. Owner check: caller must own the active partition.
+ *   2. Reject duplicates against the partition catalog.
+ *   3. mkdir <partition>/<name>/, write its __schema.mydb, register in
+ *      __catalog.mydb.
+ *
+ * Returns MYDB_ERR_PERM    if the caller does not own a partition.
+ *         MYDB_ERR_DUPLICATE if a schema with that name already exists.
+ *         MYDB_ERR_FULL    if the catalog has no free schema slots.
+ */
+int storage_create_schema(const char *name);
+
+/*
  * Create a new relation in the active schema. `rel` is mutated:
  *   rel->root_page_no and rel->secondary_root_page_no[] are filled in
  *   by this function.

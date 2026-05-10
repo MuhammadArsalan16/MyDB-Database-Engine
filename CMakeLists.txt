@@ -18,12 +18,17 @@ add_subdirectory(storage_engine)
 # System schema (users + privileges) — engine-level metadata, lives outside
 # any partition. Depends on storage_engine for common.h / file_header / checksum.
 add_subdirectory(system_schema)
+# Query parser — Lexer/Parser plus parser_api C bridge. Built before
+# engine so engine can link it.
+add_subdirectory(query_parser)
+# Execution engine — AST walker. Built after query_parser, before engine.
+add_subdirectory(execution_engine)
 # Engine orchestrator — owns __database.mydb, EngineState, login/use_schema
 # flow, and the bootstrap path. Pulls in crypto helpers (SHA-256 + salt).
+# Engine links query_parser + execution_engine to drive engine_execute_sql.
 add_subdirectory(engine)
 # `mydb` executable (admin subcommands like `mydb init`).
 add_subdirectory(bin)
-add_subdirectory(query_parser)
 
 # Tests
 enable_testing()

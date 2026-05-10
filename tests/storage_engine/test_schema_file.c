@@ -6,7 +6,7 @@
 #include "common.h"
 #include "schema_file.h"
 
-#define TEST_FILE  "/home/hasnat/mydb/partition/schema/mydb_test_schema_file.mydb"
+#define TEST_FILE  "/tmp/mydb_test_schema_file.mydb"
 #define TEST_PID   17
 #define TEST_NAME  "mydb"
 

@@ -568,6 +568,60 @@ static void test_drop_recreate_fresh(void)
 }
 
 /* ================================================================== */
+/*  8. engine_execute_sql wires parser + exec engine                  */
+/*                                                                     */
+/*  End-to-end check that bin's single SQL door works:                */
+/*    - valid SQL flows through parser → exec engine stub → MYDB_OK   */
+/*      with the stub's "received AST" message in result_out.         */
+/*    - garbage SQL flows through parser only → MYDB_ERR with a       */
+/*      "parse error: …" message in result_out.                       */
+/*    - calling without an active session returns MYDB_ERR_PERM.      */
+/*                                                                     */
+/*  Once the executor is real, this test will start asserting actual  */
+/*  query results instead of stub messages.                           */
+/* ================================================================== */
+
+static void test_execute_sql_pipeline(void)
+{
+    printf("\n[test_execute_sql_pipeline]\n");
+    full_setup("main");
+
+    char result[1024];
+
+    /* Valid statement → parser succeeds, exec engine stub runs. */
+    int rc = engine_execute_sql(&g_eng, "SELECT * FROM users;",
+                                result, sizeof(result));
+    CHECK(rc == MYDB_OK, "valid SQL → MYDB_OK");
+    CHECK(strstr(result, "exec_engine") != NULL,
+          "result mentions exec_engine (stub reached)");
+
+    /* Garbage → parser rejects, engine reports parse error. */
+    rc = engine_execute_sql(&g_eng, "wibble flarn;",
+                            result, sizeof(result));
+    CHECK(rc != MYDB_OK, "garbage SQL → non-OK");
+    CHECK(strstr(result, "parse error") != NULL,
+          "result mentions parse error");
+
+    full_close();
+}
+
+static void test_execute_sql_no_session(void)
+{
+    printf("\n[test_execute_sql_no_session]\n");
+
+    /* engine_init only — no login. */
+    rm_recursive(TEST_ROOT);
+    engine_bootstrap(TEST_ROOT, TEST_USER, TEST_PASS);
+    engine_init(TEST_ROOT, &g_eng);
+
+    char result[256];
+    int rc = engine_execute_sql(&g_eng, "SELECT 1;", result, sizeof(result));
+    CHECK(rc == MYDB_ERR_PERM, "execute_sql without login → MYDB_ERR_PERM");
+
+    engine_close(&g_eng);
+}
+
+/* ================================================================== */
 
 int main(void)
 {
@@ -580,6 +634,8 @@ int main(void)
     test_commit_survives_restart();
     test_rollback_clears_rows();
     test_drop_recreate_fresh();
+    test_execute_sql_pipeline();
+    test_execute_sql_no_session();
 
     rm_recursive(TEST_ROOT);
 

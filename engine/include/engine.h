@@ -1,6 +1,8 @@
 #ifndef ENGINE_H
 #define ENGINE_H
 
+#include <stddef.h>
+
 #include "common.h"
 #include "database_file.h"
 #include "partition.h"
@@ -109,7 +111,7 @@ int engine_login(EngineState *eng,
  *   and open that partition's copy of the schema.
  *
  *   1. Flush dirty pages of old schema's relations (if any active).
- *      [TODO phase 11] implicit COMMIT of any open transaction.
+ *
  *   2. Verify access and locate the schema file.
  *   3. Open <partition>/<schema>/__schema.mydb into eng->active_schema. */
 int engine_use_schema(EngineState *eng, const char *schema_name);
@@ -147,6 +149,30 @@ int engine_check_access(EngineState *eng, int write_required);
  * pointer is valid until the next USE / engine_close. */
 const RelationDef *engine_find_relation(EngineState *eng,
                                         const char *relation_name);
+
+
+/* ------------------------------------------------------------------ */
+/*  SQL execution entry point                                          */
+/*                                                                    */
+/*  The single door bin/REPL uses to run a SQL string. The engine     */
+/*  pipeline:                                                          */
+/*    1. parser_parse(sql)              -> opaque AST handle           */
+/*    2. exec_engine_execute(eng, ast)  -> walks AST, writes result    */
+/*    3. parser_free_ast(ast)           -> always, on every path       */
+/*                                                                    */
+/*  Bin never sees the parser or execution engine modules — engine    */
+/*  is the single front door for raw SQL. Result string is NUL-       */
+/*  terminated and truncated to result_cap-1 bytes.                   */
+/*                                                                    */
+/*  Returns:                                                          */
+/*    MYDB_OK         statement executed; result_out has the result    */
+/*    MYDB_ERR        parse error (message in result_out)              */
+/*    MYDB_ERR_PERM   not logged in                                    */
+/*    other           propagated from execution engine                 */
+/* ------------------------------------------------------------------ */
+int engine_execute_sql(EngineState *eng,
+                       const char *sql,
+                       char *result_out, size_t result_cap);
 
 
 #ifdef __cplusplus

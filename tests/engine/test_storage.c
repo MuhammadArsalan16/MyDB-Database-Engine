@@ -158,6 +158,67 @@ static void test_init_shutdown(void)
     engine_close(&g_eng);
 }
 
+static void test_create_schema_basic(void)
+{
+    printf("\n[test_create_schema_basic]\n");
+    setup_session();
+
+    int rc = storage_create_schema("alt");
+    CHECK(rc == MYDB_OK, "storage_create_schema returns OK");
+    CHECK(cat_find_schema(&g_eng.active_catalog, "alt") != NULL,
+          "schema is registered in the catalog");
+
+    /* Filesystem side-effects: dir + __schema.mydb both exist. */
+    char dir[256], path[256];
+    snprintf(dir,  sizeof(dir),  "%s/alt", g_eng.current_partition_path);
+    snprintf(path, sizeof(path), "%s/__schema.mydb", dir);
+    struct stat st;
+    CHECK(stat(dir, &st) == 0 && S_ISDIR(st.st_mode),
+          "schema directory created");
+    CHECK(stat(path, &st) == 0 && S_ISREG(st.st_mode),
+          "__schema.mydb created");
+
+    teardown_session();
+}
+
+static void test_create_schema_duplicate(void)
+{
+    printf("\n[test_create_schema_duplicate]\n");
+    setup_session();
+
+    CHECK(storage_create_schema("alt") == MYDB_OK, "first create OK");
+    CHECK(storage_create_schema("alt") == MYDB_ERR_DUPLICATE,
+          "duplicate schema rejected");
+
+    teardown_session();
+}
+
+static void test_create_schema_then_use(void)
+{
+    printf("\n[test_create_schema_then_use]\n");
+    setup_session();
+
+    CHECK(storage_create_schema("alt") == MYDB_OK, "create OK");
+    CHECK(engine_use_schema(&g_eng, "alt") == MYDB_OK,
+          "engine_use_schema after create OK");
+    CHECK(g_eng.schema_active == 1, "schema_active after USE");
+    CHECK(strcmp(g_eng.current_schema_name, "alt") == 0,
+          "current_schema_name is 'alt'");
+
+    teardown_session();
+}
+
+static void test_create_schema_bad_args(void)
+{
+    printf("\n[test_create_schema_bad_args]\n");
+    setup_session();
+
+    CHECK(storage_create_schema(NULL) == MYDB_ERR, "NULL name rejected");
+    CHECK(storage_create_schema("")   == MYDB_ERR, "empty name rejected");
+
+    teardown_session();
+}
+
 static void test_create_drop_table(void)
 {
     printf("\n[test_create_drop_table]\n");
@@ -837,6 +898,10 @@ int main(void)
     printf("=== test_storage ===\n");
 
     test_init_shutdown();
+    test_create_schema_basic();
+    test_create_schema_duplicate();
+    test_create_schema_then_use();
+    test_create_schema_bad_args();
     test_create_drop_table();
     test_insert_get_by_pk();
     test_auto_increment();

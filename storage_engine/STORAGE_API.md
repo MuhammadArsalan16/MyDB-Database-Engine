@@ -383,6 +383,30 @@ All functions that return `int` return one of these:
 
 ## 6. DDL — Create and Drop Tables
 
+### `storage_create_schema`
+
+```c
+int storage_create_schema(const char *name);
+```
+
+Creates a new schema (database) inside the current partition. Equivalent of SQL `CREATE DATABASE`. The execution engine calls this when it sees a `CREATE DATABASE` AST node.
+
+- **Owner-only.** Only a user who owns the active partition can create schemas. Analyst sessions get `MYDB_ERR_PERM`.
+- Creates `<partition>/<name>/`, writes its `__schema.mydb`, and registers the schema in the partition's `__catalog.mydb`.
+- After this returns `MYDB_OK`, you can `engine_use_schema(eng, name)` to make it active and start creating tables in it.
+
+Returns:
+- `MYDB_ERR_PERM` if caller does not own a partition
+- `MYDB_ERR_DUPLICATE` if a schema with that name already exists
+- `MYDB_ERR_FULL` if all 64 catalog schema slots are used
+
+```c
+int rc = storage_create_schema("hr");
+// rc == MYDB_OK  →  schema "hr" exists, ready for engine_use_schema
+```
+
+---
+
 ### `storage_create_table`
 
 ```c

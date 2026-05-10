@@ -236,11 +236,11 @@ int main(void)
 {
     printf("=== test_page ===\n");
 
-    //test_init();
-    //test_insert_and_get();
-    //test_delete();
-    //test_compact();
-    //test_full_page();
+    test_init();
+    test_insert_and_get();
+    test_delete();
+    test_compact();
+    test_full_page();
     test_checksum();
 
     printf("\nResults: %d/%d passed\n", tests_passed, tests_run);
