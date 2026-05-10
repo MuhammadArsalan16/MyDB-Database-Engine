@@ -5,7 +5,7 @@
 
 #include "btree.h"
 
-#define TEST_FILE "/tmp/mydb_test_btree.mydb"
+#define TEST_FILE "/home/hasnat/mydb/mydb_test_btree.mydb"
 #define TABLE_ID  0
 
 static int tests_run    = 0;

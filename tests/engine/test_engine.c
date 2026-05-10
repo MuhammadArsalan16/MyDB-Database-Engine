@@ -513,6 +513,189 @@ static void test_find_relation_null_args(void)
 
 
 /* ================================================================== */
+/*  engine_check_access                                               */
+/* ================================================================== */
+
+/* Helper: bootstrap root, create schema "hr" under root's partition,
+ * insert an analyst user (no partition), optionally grant access to
+ * "hr", then open a fresh engine session logged in as analyst. */
+static void prepare_analyst_session(EngineState *eng, int grant_hr)
+{
+    cleanup();
+    engine_bootstrap(TEST_ROOT, "root", "p");
+
+    /* Login as root to create the schema and any grants. */
+    EngineState root_eng;
+    engine_init(TEST_ROOT, &root_eng);
+    engine_login(&root_eng, "root", "p");
+
+    char schema_dir[256], schema_path[256];
+    snprintf(schema_dir,  sizeof(schema_dir),  "%s/hr",
+             root_eng.current_partition_path);
+    snprintf(schema_path, sizeof(schema_path), "%s/__schema.mydb", schema_dir);
+    mkdir(schema_dir, 0755);
+    SchemaFile sf;
+    schema_create(schema_path, root_eng.current_partition_id, "hr", &sf);
+    schema_close(&sf);
+    cat_add_schema(&root_eng.active_catalog, "hr");
+
+    /* Insert analyst user. */
+    UserSlot a;
+    memset(&a, 0, sizeof(a));
+    strncpy(a.username, "analyst", MAX_USERNAME - 1);
+    memset(a.password_salt, 0x55, sizeof(a.password_salt));
+    crypto_hash_password("pw", a.password_salt, a.password_hash);
+    a.hash_algorithm = 1;
+    a.is_active      = 1;
+    uint32_t aid;
+    users_insert(&root_eng.system_schema.users, &a, &aid);
+
+    if (grant_hr) {
+        PrivilegeSlot priv;
+        memset(&priv, 0, sizeof(priv));
+        priv.grantee_id   = aid;
+        priv.partition_id = root_eng.current_partition_id;
+        priv.granted_by   = 1;
+        priv.is_valid     = 1;
+        strncpy(priv.schema_name, "hr", sizeof(priv.schema_name) - 1);
+        uint32_t priv_id;
+        privileges_insert(&root_eng.system_schema.privileges, &priv, &priv_id);
+    }
+
+    engine_close(&root_eng);
+
+    /* Open a fresh session as analyst. */
+    engine_init(TEST_ROOT, eng);
+    engine_login(eng, "analyst", "pw");
+}
+
+static void test_check_access_owner_passes(void)
+{
+    printf("\n[test_check_access_owner_passes]\n");
+    EngineState eng;
+    prepare_schema(&eng, "hr");
+    engine_use_schema(&eng, "hr");
+
+    CHECK(engine_check_access(&eng, 0) == MYDB_OK,
+          "owner read → MYDB_OK");
+    CHECK(engine_check_access(&eng, 1) == MYDB_OK,
+          "owner write → MYDB_OK");
+
+    engine_close(&eng);
+}
+
+static void test_check_access_no_login_fails(void)
+{
+    printf("\n[test_check_access_no_login_fails]\n");
+    cleanup();
+    engine_bootstrap(TEST_ROOT, "root", "p");
+    EngineState eng;
+    engine_init(TEST_ROOT, &eng);
+
+    CHECK(engine_check_access(&eng, 0) == MYDB_ERR_PERM,
+          "not logged in → read denied");
+    CHECK(engine_check_access(&eng, 1) == MYDB_ERR_PERM,
+          "not logged in → write denied");
+
+    engine_close(&eng);
+}
+
+static void test_check_access_no_schema_fails(void)
+{
+    printf("\n[test_check_access_no_schema_fails]\n");
+    cleanup();
+    engine_bootstrap(TEST_ROOT, "root", "p");
+    EngineState eng;
+    engine_init(TEST_ROOT, &eng);
+    engine_login(&eng, "root", "p");
+    /* deliberately no USE — schema_active == 0 */
+
+    CHECK(engine_check_access(&eng, 0) == MYDB_ERR_PERM,
+          "no active schema → read denied");
+    CHECK(engine_check_access(&eng, 1) == MYDB_ERR_PERM,
+          "no active schema → write denied");
+
+    engine_close(&eng);
+}
+
+static void test_check_access_analyst_with_grant(void)
+{
+    printf("\n[test_check_access_analyst_with_grant]\n");
+    EngineState eng;
+    prepare_analyst_session(&eng, 1);
+    engine_use_schema(&eng, "hr");
+
+    CHECK(engine_check_access(&eng, 0) == MYDB_OK,
+          "analyst + grant → read OK");
+    CHECK(engine_check_access(&eng, 1) == MYDB_ERR_PERM,
+          "analyst + grant → write denied (SELECT-only grant)");
+
+    engine_close(&eng);
+}
+
+static void test_check_access_analyst_no_grant(void)
+{
+    printf("\n[test_check_access_analyst_no_grant]\n");
+    EngineState eng;
+    prepare_analyst_session(&eng, 0);
+
+    /* Manually mark a schema active so check_access reaches the
+     * privilege lookup rather than failing on schema_active==0. */
+    eng.schema_active        = 1;
+    eng.current_partition_id = 1;
+    strncpy(eng.current_schema_name, "hr",
+            sizeof(eng.current_schema_name) - 1);
+
+    CHECK(engine_check_access(&eng, 0) == MYDB_ERR_PERM,
+          "analyst + no grant → read denied");
+    CHECK(engine_check_access(&eng, 1) == MYDB_ERR_PERM,
+          "analyst + no grant → write denied");
+
+    eng.schema_active = 0; /* let engine_close skip schema teardown */
+    engine_close(&eng);
+}
+
+
+/* ================================================================== */
+/*  engine_use_schema — analyst path                                  */
+/* ================================================================== */
+
+static void test_use_schema_analyst_with_privilege(void)
+{
+    printf("\n[test_use_schema_analyst_with_privilege]\n");
+    EngineState eng;
+    prepare_analyst_session(&eng, 1);
+
+    CHECK(engine_use_schema(&eng, "hr") == MYDB_OK,
+          "analyst with privilege → USE succeeds");
+    CHECK(eng.schema_active == 1,
+          "schema_active set");
+    CHECK(strcmp(eng.current_schema_name, "hr") == 0,
+          "schema name stored");
+    CHECK(eng.current_partition_id == 1,
+          "partition_id from privilege stored");
+    CHECK(eng.active_schema.fd >= 0,
+          "schema file open");
+
+    engine_close(&eng);
+}
+
+static void test_use_schema_analyst_without_privilege(void)
+{
+    printf("\n[test_use_schema_analyst_without_privilege]\n");
+    EngineState eng;
+    prepare_analyst_session(&eng, 0);
+
+    CHECK(engine_use_schema(&eng, "hr") == MYDB_ERR_PERM,
+          "analyst without privilege → MYDB_ERR_PERM");
+    CHECK(eng.schema_active == 0,
+          "schema_active stays 0");
+
+    engine_close(&eng);
+}
+
+
+/* ================================================================== */
 /*  Argument validation                                               */
 /* ================================================================== */
 
@@ -573,6 +756,15 @@ int main(void)
     test_find_relation_miss();
     test_find_relation_requires_active_schema();
     test_find_relation_null_args();
+
+    test_check_access_owner_passes();
+    test_check_access_no_login_fails();
+    test_check_access_no_schema_fails();
+    test_check_access_analyst_with_grant();
+    test_check_access_analyst_no_grant();
+
+    test_use_schema_analyst_with_privilege();
+    test_use_schema_analyst_without_privilege();
 
     test_null_args();
 

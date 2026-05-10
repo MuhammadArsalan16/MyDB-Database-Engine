@@ -119,9 +119,10 @@ typedef enum {
 /*  Page types                                                        */
 /* ------------------------------------------------------------------ */
 typedef enum {
-    PAGE_TYPE_DATA  = 0,    /* leaf page — stores full rows */
-    PAGE_TYPE_INDEX = 1,    /* internal B+ Tree node — stores keys + child pointers */
-    PAGE_TYPE_META  = 2     /* page 0 of each file — file header */
+    PAGE_TYPE_DATA     = 0,  /* clustered leaf — [klen][key][vlen][val] */
+    PAGE_TYPE_INTERNAL = 1,  /* internal B+ Tree node — [klen][key][child_page_no] */
+    PAGE_TYPE_META     = 2,  /* page 0 of each file — file header */
+    PAGE_TYPE_INDEX    = 3   /* secondary index leaf — [klen][key][page_no][slot_no] */
 } PageType;
 
 /* ------------------------------------------------------------------ */

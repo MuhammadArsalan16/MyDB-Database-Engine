@@ -299,7 +299,7 @@ int btree_search(BTree *bt, const Value *key, BTreeSearchResult *result)
         PageHeader hdr;
         page_read_header(page, &hdr);
 
-        if (hdr.page_type == PAGE_TYPE_DATA) {
+        if (hdr.page_type != PAGE_TYPE_INTERNAL) {
             /* Leaf page — do the final search */
             uint16_t slot;
             uint8_t  found;
@@ -379,10 +379,11 @@ static int leaf_split(BTree *bt, uint32_t left_pno,
     uint32_t right_pno;
     uint8_t *right = bp_alloc_page(bt->bp, bt->dm, bt->table_id, &right_pno);
     if (!right) { bp_unpin_page(bt->bp, bt->table_id, left_pno, 0); return MYDB_ERR; }
-    page_init(right, right_pno, PAGE_TYPE_DATA);
+    PageType leaf_type = bt->is_secondary ? PAGE_TYPE_INDEX : PAGE_TYPE_DATA;
+    page_init(right, right_pno, leaf_type);
 
     /* Re-initialise left (this zeroes it; that is fine — we have copies in scratch) */
-    page_init(left, left_pno, PAGE_TYPE_DATA);
+    page_init(left, left_pno, leaf_type);
 
     /* Restore leaf-chain pointers:  orig_prev ← left ↔ right → orig_next */
     PageHeader lhdr, rhdr;
@@ -472,7 +473,7 @@ static int internal_split(BTree *bt, uint32_t int_pno,
     uint32_t right_pno;
     uint8_t *right = bp_alloc_page(bt->bp, bt->dm, bt->table_id, &right_pno);
     if (!right) { bp_unpin_page(bt->bp, bt->table_id, int_pno, 0); return MYDB_ERR; }
-    page_init(right, right_pno, PAGE_TYPE_INDEX);
+    page_init(right, right_pno, PAGE_TYPE_INTERNAL);
 
     /* Right page's leftmost child = mid_child */
     PageHeader rhdr;
@@ -486,7 +487,7 @@ static int internal_split(BTree *bt, uint32_t int_pno,
     }
 
     /* Rebuild left with lower half (before mid) */
-    page_init(page, int_pno, PAGE_TYPE_INDEX);
+    page_init(page, int_pno, PAGE_TYPE_INTERNAL);
     PageHeader lhdr;
     page_read_header(page, &lhdr);
     lhdr.prev_page = leftmost_child;
@@ -524,7 +525,7 @@ int btree_insert(BTree *bt, const Value *key,
         uint32_t root_pno;
         uint8_t *root = bp_alloc_page(bt->bp, bt->dm, bt->table_id, &root_pno);
         if (!root) return MYDB_ERR;
-        page_init(root, root_pno, PAGE_TYPE_DATA);
+        page_init(root, root_pno, bt->is_secondary ? PAGE_TYPE_INDEX : PAGE_TYPE_DATA);
 
         int rc = page_insert_record(root, record, record_len, 0);
         bp_unpin_page(bt->bp, bt->table_id, root_pno, 1);
@@ -555,7 +556,7 @@ int btree_insert(BTree *bt, const Value *key,
         PageHeader hdr;
         page_read_header(page, &hdr);
 
-        if (hdr.page_type == PAGE_TYPE_DATA) {
+        if (hdr.page_type != PAGE_TYPE_INTERNAL) {
             /* Leaf found — check for duplicate key */
             uint16_t slot; uint8_t found;
             leaf_search(page, enc_key, enc_len, bt->key_type, &slot, &found);
@@ -666,7 +667,7 @@ int btree_insert(BTree *bt, const Value *key,
     uint32_t new_root_pno;
     uint8_t *new_root = bp_alloc_page(bt->bp, bt->dm, bt->table_id, &new_root_pno);
     if (!new_root) return MYDB_ERR;
-    page_init(new_root, new_root_pno, PAGE_TYPE_INDEX);
+    page_init(new_root, new_root_pno, PAGE_TYPE_INTERNAL);
 
     /* New root has old root as leftmost child, sep_key → right_pno as first record */
     PageHeader nr_hdr;
@@ -728,7 +729,7 @@ static uint32_t find_leftmost_leaf(BTree *bt)
         PageHeader hdr;
         page_read_header(page, &hdr);
 
-        if (hdr.page_type == PAGE_TYPE_DATA) {
+        if (hdr.page_type != PAGE_TYPE_INTERNAL) {
             bp_unpin_page(bt->bp, bt->table_id, pno, 0);
             return pno;
         }

@@ -1,6 +1,7 @@
 #include "page.h"
 #include <string.h>
 #include <stdint.h>
+#include <stdio.h>
 
 /* ------------------------------------------------------------------ */
 /*  Record header encode/decode (5 bytes on disk)                     */
@@ -145,6 +146,8 @@ int page_verify_checksum(const uint8_t *page)
 {
     uint32_t stored  = get32(page);
     uint32_t computed = fnv1a(page + 4, PAGE_SIZE - 4 - PAGE_TRAILER_SIZE);
+    //printf("Stored: %u\n", stored);
+    //printf("Computed %u", computed);
     return (stored == computed) ? MYDB_OK : MYDB_ERR;
 }
 
@@ -400,43 +403,99 @@ int page_delete_record(uint8_t *page, uint16_t slot_no)
     return MYDB_OK;
 }
 
+
+
+
+
+void print_page_header(const PageHeader *hdr)
+{
+    printf("PageHeader\n");
+    printf("{\n");
+
+    printf("  checksum       = %u   (size = %zu bytes)\n",
+           hdr->checksum, sizeof(hdr->checksum));
+
+    printf("  page_no        = %u   (size = %zu bytes)\n",
+           hdr->page_no, sizeof(hdr->page_no));
+
+    printf("  prev_page      = %u   (size = %zu bytes)\n",
+           hdr->prev_page, sizeof(hdr->prev_page));
+
+    printf("  next_page      = %u   (size = %zu bytes)\n",
+           hdr->next_page, sizeof(hdr->next_page));
+
+    printf("  lsn            = %llu (size = %zu bytes)\n",
+           (unsigned long long)hdr->lsn,
+           sizeof(hdr->lsn));
+
+    printf("  page_type      = %u   (size = %zu bytes)\n",
+           hdr->page_type, sizeof(hdr->page_type));
+
+    printf("  num_records    = %u   (size = %zu bytes)\n",
+           hdr->num_records, sizeof(hdr->num_records));
+
+    printf("  free_offset    = %u   (size = %zu bytes)\n",
+           hdr->free_offset, sizeof(hdr->free_offset));
+
+    printf("  garbage_offset = %u   (size = %zu bytes)\n",
+           hdr->garbage_offset, sizeof(hdr->garbage_offset));
+
+    printf("  num_dir_slots  = %u   (size = %zu bytes)\n",
+           hdr->num_dir_slots, sizeof(hdr->num_dir_slots));
+
+    printf("}\n");
+
+    printf("sizeof(PageHeader) = %zu bytes\n", sizeof(PageHeader));
+
+    /* Serialized on-disk header size */
+    printf("serialized header size = %u bytes\n", 38u);
+}
 /*
- * Compute the physical size of the record at data_offset `doff`.
+ * Compute the size of the record at data_offset `doff` in O(1).
  *
- * Records are appended physically at free_offset regardless of key
- * position. The physical end of a record is the start of the next
- * physically-following record's header, or free_offset if it is the
- * physically last record.
- *
- * We walk the linked list (which threads ALL records — live AND
- * deleted, since delete is logical) and take the smallest data offset
- * greater than `doff`. The directory alone is insufficient here,
- * because a deleted record may sit physically between two live ones,
- * but the directory only references live records.
+ * All B+ tree record formats start with [klen:2B][key_bytes], so klen
+ * is always at doff+0..1. What follows depends on page type:
+ *   PAGE_TYPE_DATA     (clustered leaf)  : [vlen:2B][val_bytes]
+ *   PAGE_TYPE_INTERNAL (internal node)   : [child_page_no:4B]
+ *   PAGE_TYPE_INDEX    (secondary leaf)  : [page_no:4B][slot_no:2B]
  */
 static uint16_t record_phys_size(const uint8_t *page, uint16_t doff)
 {
+    //printf("\n=== record_phys_size() ===\n");
+    /* Read and print page header */
     PageHeader hdr;
     page_read_header(page, &hdr);
+    //print_page_header(&hdr);
 
-    uint16_t next_phys_hdr = hdr.free_offset;
+    /* Compute record pointer */
+    const uint8_t *rec = page + doff;
 
-    RecordHeader inf_hdr;
-    rec_hdr_decode(page + INFIMUM_OFFSET, &inf_hdr);
-    uint16_t cur   = inf_hdr.next_offset;
-    uint16_t steps = 0;
-    while (cur != SUPREMUM_DATA && cur != 0 && steps < 8192) {
-        if (cur > doff) {
-            uint16_t hs = cur - RECORD_HEADER_SIZE;
-            if (hs < next_phys_hdr) next_phys_hdr = hs;
-        }
-        RecordHeader rh;
-        rec_hdr_decode(page + cur - RECORD_HEADER_SIZE, &rh);
-        cur = rh.next_offset;
-        steps++;
+    /* Read key length */
+    uint16_t klen = ((uint16_t)rec[0] << 8) | rec[1];
+
+    /* INTERNAL page */
+    if (hdr.page_type == PAGE_TYPE_INTERNAL) {
+        uint16_t result = (uint16_t)(2 + klen + 4);
+        printf("Physical size = 2 + %u + 4 = %u\n", klen, result);
+        return result;
     }
 
-    return (next_phys_hdr > doff) ? (uint16_t)(next_phys_hdr - doff) : 0;
+    /* INDEX page */
+    if (hdr.page_type == PAGE_TYPE_INDEX) {
+        uint16_t result = (uint16_t)(2 + klen + 6);
+        printf("Physical size = 2 + %u + 6 = %u\n", klen, result);
+        return result;
+    }
+
+    uint16_t vlen = ((uint16_t)rec[2 + klen] << 8) |
+                     rec[3 + klen];
+
+    uint16_t result = (uint16_t)(4 + klen + vlen);
+
+    printf("Physical size = 4 + %u + %u = %u\n",
+           klen, vlen, result);
+
+    return result;
 }
 
 /* ------------------------------------------------------------------ */

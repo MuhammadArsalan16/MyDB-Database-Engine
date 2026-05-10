@@ -24,3 +24,10 @@ foreach(mod ${ENGINE_TEST_MODULES})
     target_link_libraries(test_${mod} PRIVATE engine)
     add_test(NAME test_${mod} COMMAND test_${mod})
 endforeach()
+
+# end-to-end lifecycle scenarios — exercises the full stack top-to-bottom
+# including cross-session persistence, schema switch flush, analyst access,
+# FK lifecycle, transactions, and drop+recreate.
+add_executable(test_integration integration/test_integration.c)
+target_link_libraries(test_integration PRIVATE engine)
+add_test(NAME test_integration COMMAND test_integration)

@@ -54,7 +54,7 @@ struct ColumnDef {
 typedef struct {
     char constraint_name[MAX_COLUMN_NAME];  /* optional user-given name */
     char column_name[MAX_COLUMN_NAME];      /* FK column in this relation */
-    char ref_table_name[MAX_TABLE_NAME];    /* referenced relation */
+    char ref_relation_name[MAX_TABLE_NAME]; /* referenced relation */
     char ref_column_name[MAX_COLUMN_NAME];  /* referenced column */
 } ForeignKey;
 

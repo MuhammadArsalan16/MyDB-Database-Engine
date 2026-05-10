@@ -6,7 +6,7 @@
 #include "buffer_pool.h"
 #include "page.h"
 
-#define TEST_FILE "/tmp/mydb_test_bp.mydb"
+#define TEST_FILE "/home/hasnat/mydb/mydb_test_bp.mydb"
 #define TABLE_ID  0
 
 static int tests_run    = 0;

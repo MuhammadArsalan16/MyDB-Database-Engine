@@ -64,7 +64,7 @@ int schema_create(const char *path, uint32_t partition_id,
  * relation's RelationDef page into memory. */
 int schema_open(const char *path, SchemaFile *out);
 
-/* Close the file descriptor. Caller is responsible for save'ing any
+/* Close the file descriptor. Caller is responsible for saving any
  * unsaved changes; every public mutator already saves. */
 int schema_close(SchemaFile *sf);
 

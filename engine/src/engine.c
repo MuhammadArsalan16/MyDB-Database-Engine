@@ -1,5 +1,6 @@
 #include "engine.h"
 #include "crypto.h"
+#include "storage.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -271,30 +272,65 @@ int engine_login(EngineState *eng,
 
 int engine_use_schema(EngineState *eng, const char *schema_name)
 {
-    if (!eng || !schema_name)         return MYDB_ERR;
-    if (!eng->logged_in)              return MYDB_ERR_PERM;
-    if (!eng->partition_open)         return MYDB_ERR_PERM;
-    if (schema_name[0] == '\0')       return MYDB_ERR;
+    if (!eng || !schema_name)   return MYDB_ERR;
+    if (!eng->logged_in)        return MYDB_ERR_PERM;
+    if (schema_name[0] == '\0') return MYDB_ERR;
 
-    /* If a schema is already active, close it first.
-     *
-     * TODO phase 9: flush dirty pages of the old schema's relations
-     * out of the buffer pool before closing.
+    /* Flush + close any currently active schema.
      * TODO phase 11: implicit COMMIT of any open transaction. */
     if (eng->schema_active) {
+        storage_flush_all_dirty();
         if (schema_close(&eng->active_schema) != MYDB_OK) return MYDB_ERR;
         eng->schema_active = 0;
         eng->current_schema_name[0] = '\0';
+        eng->current_partition_id = 0;
     }
 
-    /* Verify the schema is registered in the active partition catalog. */
-    if (cat_find_schema(&eng->active_catalog, schema_name) == NULL)
-        return MYDB_ERR_NOT_FOUND;
-
     char schema_path[256];
-    if (join2(schema_path, sizeof(schema_path),
-              eng->current_partition_path, schema_name, "__schema.mydb") < 0)
-        return MYDB_ERR;
+
+    if (eng->partition_open) {
+        /* Owner path: schema must exist in the user's own catalog. */
+        if (cat_find_schema(&eng->active_catalog, schema_name) == NULL)
+            return MYDB_ERR_NOT_FOUND;
+
+        if (join2(schema_path, sizeof(schema_path),
+                  eng->current_partition_path, schema_name, "__schema.mydb") < 0)
+            return MYDB_ERR;
+
+        /* current_partition_id was already set during engine_login. */
+    } else {
+        /* Analyst path: find a privilege grant for this user + schema. */
+        PrivilegeSlot priv;
+        memset(&priv, 0, sizeof(priv));
+
+        /* Scan privilege slots for (grantee=current_user, schema=schema_name). */
+        int found = 0;
+        PrivilegesFile *pf = &eng->system_schema.privileges;
+        for (int i = 0; i < PRIVILEGES_MAX_SLOTS; i++) {
+            PrivilegeSlot *s = &pf->slots[i];
+            if (!s->is_valid) continue;
+            if (s->grantee_id != eng->current_user_id) continue;
+            if (strncmp(s->schema_name, schema_name, sizeof(s->schema_name)) != 0)
+                continue;
+            priv  = *s;
+            found = 1;
+            break;
+        }
+        if (!found) return MYDB_ERR_PERM;
+
+        /* Resolve the owning partition's path from __database.mydb. */
+        PartitionEntry *pe = db_find_by_id(&eng->database, priv.partition_id);
+        if (!pe) return MYDB_ERR;
+
+        if (join2(schema_path, sizeof(schema_path),
+                  pe->path, schema_name, "__schema.mydb") < 0)
+            return MYDB_ERR;
+
+        eng->current_partition_id = priv.partition_id;
+        strncpy(eng->current_partition_path, pe->path,
+                sizeof(eng->current_partition_path) - 1);
+        eng->current_partition_path[sizeof(eng->current_partition_path) - 1] = '\0';
+    }
 
     int rc = schema_open(schema_path, &eng->active_schema);
     if (rc != MYDB_OK) return rc;
@@ -303,6 +339,32 @@ int engine_use_schema(EngineState *eng, const char *schema_name)
             sizeof(eng->current_schema_name) - 1);
     eng->current_schema_name[sizeof(eng->current_schema_name) - 1] = '\0';
     eng->schema_active = 1;
+    return MYDB_OK;
+}
+
+
+/* ====================================================================
+ *  Authorization
+ * ==================================================================== */
+
+int engine_check_access(EngineState *eng, int write_required)
+{
+    if (!eng || !eng->logged_in || !eng->schema_active)
+        return MYDB_ERR_PERM;
+
+    /* Owner of the active partition has full access. */
+    if (eng->partition_open)
+        return MYDB_OK;
+
+    /* Analyst: verify a privilege grant exists for this (user, partition, schema). */
+    PrivilegeSlot slot;
+    int rc = privileges_find(&eng->system_schema.privileges,
+                             eng->current_user_id,
+                             eng->current_partition_id,
+                             eng->current_schema_name,
+                             &slot);
+    if (rc != MYDB_OK)      return MYDB_ERR_PERM;
+    if (write_required)     return MYDB_ERR_PERM; /* grants are SELECT-only */
     return MYDB_OK;
 }
 

@@ -57,6 +57,11 @@ int storage_init(struct EngineState *eng);
 /* Commit any open transaction, flush everything, close all files. */
 int storage_shutdown(void);
 
+/* Flush every dirty page in the buffer pool to disk without closing any
+ * table or tearing down the runtime. Called by engine_use_schema before
+ * swapping the active schema so the old schema's pages are durable. */
+int storage_flush_all_dirty(void);
+
 /* ------------------------------------------------------------------ */
 /*  DDL                                                                 */
 /* ------------------------------------------------------------------ */

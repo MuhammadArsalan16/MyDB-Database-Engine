@@ -41,7 +41,7 @@ static void print_usage(void)
         "Usage: mydb init -u <username>\n"
         "\n"
         "Initialises a new MyDB engine at $MYDB_HOME (default ~/.mydb).\n"
-        "Prompts for the password interactively.\n");
+        "Prompts for the password.\n");
 }
 
 static int run_init(int argc, char **argv)

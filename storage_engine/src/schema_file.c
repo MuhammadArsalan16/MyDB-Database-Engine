@@ -245,7 +245,7 @@ static int relation_def_serialize(const RelationDef *r, uint8_t *page)
         const ForeignKey *fk = &r->foreign_keys[i];
         put_bytes(page, &off, fk->constraint_name, MAX_COLUMN_NAME);
         put_bytes(page, &off, fk->column_name,     MAX_COLUMN_NAME);
-        put_bytes(page, &off, fk->ref_table_name,  MAX_TABLE_NAME);
+        put_bytes(page, &off, fk->ref_relation_name,  MAX_TABLE_NAME);
         put_bytes(page, &off, fk->ref_column_name, MAX_COLUMN_NAME);
 
         if (off > PAGE_SIZE) return MYDB_ERR;
@@ -305,7 +305,7 @@ static int relation_def_deserialize(RelationDef *r, const uint8_t *page)
         ForeignKey *fk = &r->foreign_keys[i];
         get_bytes(page, &off, fk->constraint_name, MAX_COLUMN_NAME);
         get_bytes(page, &off, fk->column_name,     MAX_COLUMN_NAME);
-        get_bytes(page, &off, fk->ref_table_name,  MAX_TABLE_NAME);
+        get_bytes(page, &off, fk->ref_relation_name,  MAX_TABLE_NAME);
         get_bytes(page, &off, fk->ref_column_name, MAX_COLUMN_NAME);
     }
 

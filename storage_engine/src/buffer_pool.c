@@ -26,14 +26,14 @@ static void lru_touch(BufferPool *bp, int frame_idx)
     bp->lru_order[0] = frame_idx;
 }
 
-/* Add a newly-used frame to the front of the LRU list. */
-static void lru_add(BufferPool *bp, int frame_idx)
-{
-    /* Shift everyone right to make room at index 0 */
+/* Add a newly-used frame to the front of the LRU list.
+ static void lru_add(BufferPool *bp, int frame_idx)
+ {
+    Shift everyone right to make room at index 0
     for (int i = BUFFER_POOL_SIZE - 1; i > 0; i--)
         bp->lru_order[i] = bp->lru_order[i - 1];
     bp->lru_order[0] = frame_idx;
-}
+} */
 
 /*
  * Find a victim frame for eviction: scan from the LRU end toward MRU,
@@ -179,6 +179,23 @@ int bp_flush_table(BufferPool *bp, int table_id)
         if (disk_write_page(f->dm, f->page_no, f->data) != MYDB_OK) {
             rc = MYDB_ERR;
             /* leave is_dirty = 1 so a later flush can retry this page */
+            continue;
+        }
+        f->is_dirty = 0;
+    }
+    return rc;
+}
+
+int bp_flush_dirty_all(BufferPool *bp)
+{
+    int rc = MYDB_OK;
+    for (int i = 0; i < BUFFER_POOL_SIZE; i++) {
+        BPFrame *f = &bp->frames[i];
+        if (!f->is_valid || !f->is_dirty) continue;
+
+        page_set_checksum(f->data);
+        if (disk_write_page(f->dm, f->page_no, f->data) != MYDB_OK) {
+            rc = MYDB_ERR;
             continue;
         }
         f->is_dirty = 0;

@@ -98,16 +98,39 @@ int engine_close(EngineState *eng);
 int engine_login(EngineState *eng,
                  const char *username, const char *password);
 
-/* Switch the active schema. Caller must be logged in AND own a
- * partition (cross-partition USE is deferred — design doc §4
- * cross-schema is MYDB_ERR_CROSS_SCHEMA in future).
+/* Switch the active schema. Caller must be logged in.
  *
- *   1. If a schema is already active: close it.
- *      [TODO phase 9] flush dirty pages of old schema's relations.
+ * Owner path  (partition_open == 1):
+ *   Look up schema_name in the user's own active_catalog.
+ *
+ * Analyst path (partition_open == 0):
+ *   Scan privileges for a grant (current_user_id, *, schema_name).
+ *   On match, resolve the owning partition path from __database.mydb
+ *   and open that partition's copy of the schema.
+ *
+ *   1. Flush dirty pages of old schema's relations (if any active).
  *      [TODO phase 11] implicit COMMIT of any open transaction.
- *   2. Look up `schema_name` in active_catalog.
+ *   2. Verify access and locate the schema file.
  *   3. Open <partition>/<schema>/__schema.mydb into eng->active_schema. */
 int engine_use_schema(EngineState *eng, const char *schema_name);
+
+
+/* ------------------------------------------------------------------ */
+/*  Authorization                                                      */
+/* ------------------------------------------------------------------ */
+
+/* Check whether the current session may perform the requested operation
+ * on the active schema.
+ *
+ *   write_required == 0  →  SELECT (read)
+ *   write_required == 1  →  INSERT / UPDATE / DELETE (write)
+ *
+ * Owner of the active partition always passes for both reads and writes.
+ * A privilege-granted analyst passes for reads only.
+ *
+ * Returns MYDB_ERR_PERM if no schema is active, the user is not logged
+ * in, or the privilege level is insufficient. */
+int engine_check_access(EngineState *eng, int write_required);
 
 
 /* ------------------------------------------------------------------ */

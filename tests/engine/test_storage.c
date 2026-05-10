@@ -585,6 +585,251 @@ static void test_create_table_quota_exhausted(void)
     teardown_session();
 }
 
+/* ================================================================== */
+/*  FK constraint enforcement                                         */
+/* ================================================================== */
+
+/* departments: id INT PK (not auto-increment) */
+static RelationDef make_departments_schema(void)
+{
+    RelationDef r;
+    memset(&r, 0, sizeof(r));
+    strncpy(r.relation_name, "departments", MAX_TABLE_NAME - 1);
+    r.num_columns = 1;
+    r.pk_col_idx  = 0;
+
+    ColumnDef *id = &r.columns[0];
+    strncpy(id->name, "id", MAX_COLUMN_NAME - 1);
+    id->type = TYPE_INT; id->max_len = 4;
+    id->is_not_null = 1; id->is_primary_key = 1;
+
+    return r;
+}
+
+/* employees: id INT PK AUTOINCR, name VARCHAR(32) NOT NULL,
+ *            dept_id INT FK → departments.id (nullable) */
+static RelationDef make_employees_fk_schema(void)
+{
+    RelationDef r;
+    memset(&r, 0, sizeof(r));
+    strncpy(r.relation_name, "employees", MAX_TABLE_NAME - 1);
+    r.num_columns       = 3;
+    r.pk_col_idx        = 0;
+    r.auto_incr_counter = 1;
+
+    ColumnDef *id = &r.columns[0];
+    strncpy(id->name, "id", MAX_COLUMN_NAME - 1);
+    id->type = TYPE_INT; id->max_len = 4;
+    id->is_not_null = 1; id->is_primary_key = 1; id->is_auto_increment = 1;
+
+    ColumnDef *nm = &r.columns[1];
+    strncpy(nm->name, "name", MAX_COLUMN_NAME - 1);
+    nm->type = TYPE_VARCHAR; nm->max_len = 32; nm->is_not_null = 1;
+
+    ColumnDef *dept = &r.columns[2];
+    strncpy(dept->name, "dept_id", MAX_COLUMN_NAME - 1);
+    dept->type = TYPE_INT; dept->max_len = 4;
+    /* nullable — so NULL FK inserts are valid */
+
+    r.num_foreign_keys = 1;
+    strncpy(r.foreign_keys[0].constraint_name, "fk_dept",      MAX_COLUMN_NAME - 1);
+    strncpy(r.foreign_keys[0].column_name,     "dept_id",      MAX_COLUMN_NAME - 1);
+    strncpy(r.foreign_keys[0].ref_relation_name, "departments", MAX_TABLE_NAME  - 1);
+    strncpy(r.foreign_keys[0].ref_column_name, "id",           MAX_COLUMN_NAME - 1);
+
+    return r;
+}
+
+static Row make_dept_row(int id)
+{
+    Row r;
+    memset(&r, 0, sizeof(r));
+    r.num_cols          = 1;
+    r.cols[0].type      = TYPE_INT;
+    r.cols[0].is_null   = 0;
+    r.cols[0].v.int_val = id;
+    return r;
+}
+
+static Row make_emp_row(const char *name, int dept_id, int dept_null)
+{
+    Row r;
+    memset(&r, 0, sizeof(r));
+    r.num_cols = 3;
+
+    /* id — let AUTOINCR fill it in */
+    r.cols[0].type      = TYPE_INT;
+    r.cols[0].is_null   = 1;
+
+    r.cols[1].type    = TYPE_VARCHAR;
+    r.cols[1].is_null = 0;
+    r.cols[1].v.varchar_val.len = (uint16_t)strlen(name);
+    strncpy(r.cols[1].v.varchar_val.data, name, MAX_VARCHAR_LEN - 1);
+
+    r.cols[2].type      = TYPE_INT;
+    r.cols[2].is_null   = dept_null;
+    r.cols[2].v.int_val = dept_id;
+    return r;
+}
+
+static Value pk_int(int v)
+{
+    Value pk;
+    pk.type      = TYPE_INT;
+    pk.is_null   = 0;
+    pk.v.int_val = v;
+    return pk;
+}
+
+/* Create both FK-linked tables and return their live RelationDef pointers. */
+static void setup_fk_tables(RelationDef **dept_out, RelationDef **emp_out)
+{
+    RelationDef d = make_departments_schema();
+    storage_create_table(&d);
+    *dept_out = schema_find_relation(&g_eng.active_schema, "departments");
+
+    RelationDef e = make_employees_fk_schema();
+    storage_create_table(&e);
+    *emp_out = schema_find_relation(&g_eng.active_schema, "employees");
+}
+
+static void test_fk_insert_valid_ref(void)
+{
+    printf("\n[test_fk_insert_valid_ref]\n");
+    setup_session();
+    RelationDef *dept, *emp;
+    setup_fk_tables(&dept, &emp);
+
+    Row d = make_dept_row(1);
+    CHECK(storage_insert(dept, &d) == MYDB_OK, "insert dept id=1 OK");
+
+    Row e = make_emp_row("Alice", 1, 0);
+    CHECK(storage_insert(emp, &e) == MYDB_OK,
+          "insert employee with valid dept_id=1 → OK");
+
+    teardown_session();
+}
+
+static void test_fk_insert_invalid_ref(void)
+{
+    printf("\n[test_fk_insert_invalid_ref]\n");
+    setup_session();
+    RelationDef *dept, *emp;
+    setup_fk_tables(&dept, &emp);
+
+    /* No department inserted — dept_id=99 references nothing. */
+    Row e = make_emp_row("Bob", 99, 0);
+    CHECK(storage_insert(emp, &e) == MYDB_ERR_FK_VIOLATION,
+          "insert with non-existent FK value → MYDB_ERR_FK_VIOLATION");
+
+    teardown_session();
+}
+
+static void test_fk_insert_null_fk_allowed(void)
+{
+    printf("\n[test_fk_insert_null_fk_allowed]\n");
+    setup_session();
+    RelationDef *dept, *emp;
+    setup_fk_tables(&dept, &emp);
+
+    /* NULL dept_id — no FK check required. */
+    Row e = make_emp_row("Charlie", 0, 1 /* dept_null=1 */);
+    CHECK(storage_insert(emp, &e) == MYDB_OK,
+          "insert with NULL FK column → OK (NULL skips FK check)");
+
+    teardown_session();
+}
+
+static void test_fk_delete_referenced_row(void)
+{
+    printf("\n[test_fk_delete_referenced_row]\n");
+    setup_session();
+    RelationDef *dept, *emp;
+    setup_fk_tables(&dept, &emp);
+
+    Row d = make_dept_row(1);
+    storage_insert(dept, &d);
+
+    Row e = make_emp_row("Alice", 1, 0);
+    storage_insert(emp, &e);
+
+    /* Try to delete the department that Alice references. */
+    Value pk = pk_int(1);
+    Row *found = storage_get_by_pk(dept, &pk);
+    CHECK(found != NULL, "get_by_pk finds dept id=1");
+    if (found) {
+        RID rid = found->rid;
+        CHECK(storage_delete(dept, rid) == MYDB_ERR_FK_VIOLATION,
+              "delete referenced dept → MYDB_ERR_FK_VIOLATION");
+    }
+
+    teardown_session();
+}
+
+static void test_fk_delete_after_removing_ref(void)
+{
+    printf("\n[test_fk_delete_after_removing_ref]\n");
+    setup_session();
+    RelationDef *dept, *emp;
+    setup_fk_tables(&dept, &emp);
+
+    Row d = make_dept_row(2);
+    storage_insert(dept, &d);
+
+    Row e = make_emp_row("Dave", 2, 0);
+    storage_insert(emp, &e);
+
+    /* First delete the referencing employee. */
+    Value emp_pk = pk_int(1); /* auto-increment started at 1 */
+    Row *emp_row = storage_get_by_pk(emp, &emp_pk);
+    CHECK(emp_row != NULL, "get_by_pk finds employee");
+    if (emp_row) {
+        CHECK(storage_delete(emp, emp_row->rid) == MYDB_OK,
+              "delete employee OK");
+    }
+
+    /* Now the department has no references — delete must succeed. */
+    Value dept_pk = pk_int(2);
+    Row *dept_row = storage_get_by_pk(dept, &dept_pk);
+    CHECK(dept_row != NULL, "get_by_pk finds dept id=2");
+    if (dept_row) {
+        CHECK(storage_delete(dept, dept_row->rid) == MYDB_OK,
+              "delete unreferenced dept → OK");
+    }
+
+    teardown_session();
+}
+
+static void test_fk_update_invalid_ref(void)
+{
+    printf("\n[test_fk_update_invalid_ref]\n");
+    setup_session();
+    RelationDef *dept, *emp;
+    setup_fk_tables(&dept, &emp);
+
+    Row d = make_dept_row(1);
+    storage_insert(dept, &d);
+
+    Row e = make_emp_row("Eve", 1, 0);
+    storage_insert(emp, &e);
+
+    /* Update employee to point at dept_id=99 which does not exist. */
+    Value emp_pk = pk_int(1);
+    Row *emp_row = storage_get_by_pk(emp, &emp_pk);
+    CHECK(emp_row != NULL, "get_by_pk finds employee");
+    if (emp_row) {
+        RID rid      = emp_row->rid;
+        Row new_row  = make_emp_row("Eve", 99, 0);
+        new_row.cols[0].is_null   = 0;
+        new_row.cols[0].v.int_val = 1; /* keep same PK */
+        CHECK(storage_update(emp, rid, &new_row) == MYDB_ERR_FK_VIOLATION,
+              "update FK to non-existent target → MYDB_ERR_FK_VIOLATION");
+    }
+
+    teardown_session();
+}
+
+
 /* ------------------------------------------------------------------ */
 
 int main(void)
@@ -609,6 +854,13 @@ int main(void)
     test_insert_bumps_num_pages_eventually();
     test_drop_table_releases_quota();
     test_create_table_quota_exhausted();
+
+    test_fk_insert_valid_ref();
+    test_fk_insert_invalid_ref();
+    test_fk_insert_null_fk_allowed();
+    test_fk_delete_referenced_row();
+    test_fk_delete_after_removing_ref();
+    test_fk_update_invalid_ref();
 
     storage_shutdown();
     engine_close(&g_eng);

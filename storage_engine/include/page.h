@@ -54,30 +54,6 @@ typedef struct {
 /*
  * Record header — 5 bytes stored immediately before each record's data.
  *
- * Bit layout on disk:
- *   Byte 0: info_flags   (bit 0 = deleted mark, bit 1 = min_rec flag)
- *   Byte 1: owned_count  (records owned by this directory slot owner)
- *   Bytes 2-3: upper 13 bits = heap_no (insertion order), lower 3 bits = RecordType
- *   Bytes 4-5: next_offset (signed relative offset to next record's data)
- *             ... but we store it as 2 bytes so total = 5? No:
- *             Bytes 2-3 = heap_no<<3 | rec_type  (2 bytes)
- *             Bytes 4   = next_offset high byte  (wait, that's 6 bytes total)
- *
- * Simplification for MyDB: store as a plain struct, encode/decode handles layout.
- * We use:
- *   Byte 0: info_flags
- *   Byte 1: owned_count
- *   Bytes 2-3: packed (heap_no:13, rec_type:3) — big-endian uint16
- *   Bytes 4: next_offset_lo  \  next_offset is stored as int8 relative jump
- *   ... Actually we store next_offset as a uint16 absolute offset into the page.
- *
- * Final layout (5 bytes total):
- *   Byte 0   : info_flags
- *   Byte 1   : owned_count
- *   Bytes 2-3: (heap_no << 3) | rec_type  as big-endian uint16
- *   Bytes 4-5: next_data_offset as big-endian uint16  (absolute offset of next record's DATA)
- * That is 6 bytes. We drop owned_count for simplicity → 5 bytes.
- *
  * MyDB record header (5 bytes):
  *   Byte 0   : info_flags
  *   Bytes 1-2: (heap_no << 3) | rec_type  as big-endian uint16

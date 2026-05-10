@@ -6,7 +6,7 @@
 #include "common.h"
 #include "schema_file.h"
 
-#define TEST_FILE  "/tmp/mydb_test_schema_file.mydb"
+#define TEST_FILE  "/home/hasnat/mydb/partition/schema/mydb_test_schema_file.mydb"
 #define TEST_PID   17
 #define TEST_NAME  "mydb"
 
@@ -391,7 +391,7 @@ static void test_full_relation_def_round_trip(void)
     r.num_foreign_keys = 1;
     strncpy(r.foreign_keys[0].constraint_name, "fk_owner", MAX_COLUMN_NAME - 1);
     strncpy(r.foreign_keys[0].column_name,     "id",       MAX_COLUMN_NAME - 1);
-    strncpy(r.foreign_keys[0].ref_table_name,  "users",    MAX_TABLE_NAME  - 1);
+    strncpy(r.foreign_keys[0].ref_relation_name, "users",   MAX_TABLE_NAME  - 1);
     strncpy(r.foreign_keys[0].ref_column_name, "user_id",  MAX_COLUMN_NAME - 1);
 
     /* secondary indexes */

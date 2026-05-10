@@ -7,8 +7,8 @@
 #include "partition.h"
 #include "disk_manager.h"
 
-#define TEST_FILE      "/tmp/mydb_test_partition.mydb"
-#define TEST_RELATION  "/tmp/mydb_test_partition_relation.mydb"
+#define TEST_FILE      "/home/hasnat/mydb/partition/mydb_test_partition.mydb"
+#define TEST_RELATION  "/home/hasnat/mydb/partition/mydb_test_partition_relation.mydb"
 #define TEST_PID   42
 #define TEST_OWNER 7
 #define TEST_QUOTA (1024ULL * 1024ULL)   /* 1 MB default for most tests */

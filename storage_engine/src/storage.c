@@ -397,6 +397,12 @@ int storage_shutdown(void)
     return MYDB_OK;
 }
 
+int storage_flush_all_dirty(void)
+{
+    if (!g.initialized) return MYDB_OK;
+    return bp_flush_dirty_all(&g.bp);
+}
+
 /* ------------------------------------------------------------------ */
 /*  DDL                                                                 */
 /* ------------------------------------------------------------------ */
@@ -504,13 +510,105 @@ int storage_commit(void)   { return trx_commit(&g.trx); }
 int storage_rollback(void) { return trx_rollback(&g.trx); }
 
 /* ------------------------------------------------------------------ */
+/*  FK constraint helpers                                               */
+/* ------------------------------------------------------------------ */
+
+/* Return the index of the column named col_name in r, or -1. */
+static int find_col_idx(const RelationDef *r, const char *col_name)
+{
+    for (int i = 0; i < r->num_columns; i++)
+        if (strncmp(r->columns[i].name, col_name, MAX_COLUMN_NAME) == 0)
+            return i;
+    return -1;
+}
+
+/* On INSERT / UPDATE: verify every FK value in row exists in the
+ * referenced relation's clustered index. NULL FK values are skipped
+ * (NULL satisfies any FK constraint). */
+static int fk_check_ref_exists(const RelationDef *r, const Row *row)
+{
+    for (int i = 0; i < r->num_foreign_keys; i++) {
+        const ForeignKey *fk = &r->foreign_keys[i];
+
+        int fk_col = find_col_idx(r, fk->column_name);
+        if (fk_col < 0) return MYDB_ERR;
+
+        if (row->cols[fk_col].is_null) continue;
+
+        RelationDef *ref = schema_find_relation(&g.eng->active_schema,
+                                               fk->ref_relation_name);
+        if (!ref) return MYDB_ERR_FK_VIOLATION;
+
+        OpenTable *ref_ot = open_table(ref->relation_name);
+        if (!ref_ot) return MYDB_ERR;
+
+        Value fk_val = row->cols[fk_col];
+        BTreeSearchResult res;
+        if (btree_search(&ref_ot->clustered, &fk_val, &res) != MYDB_OK || !res.found)
+            return MYDB_ERR_FK_VIOLATION;
+    }
+    return MYDB_OK;
+}
+
+/* On DELETE: verify no other relation holds a row whose FK column
+ * points to pk_val in relation r. Scans every relation in the active
+ * schema that declares an FK referencing r's PK column. */
+static int fk_check_not_referenced(const RelationDef *r, const Value *pk_val)
+{
+    const char *pk_col_name = r->columns[r->pk_col_idx].name;
+    SchemaFile *sf = &g.eng->active_schema;
+
+    for (int i = 0; i < MAX_RELATIONS_PER_SCHEMA; i++) {
+        if (!sf->relations[i].is_valid) continue;
+        RelationDef *ref_rel = &sf->defs[i];
+
+        for (int j = 0; j < ref_rel->num_foreign_keys; j++) {
+            const ForeignKey *fk = &ref_rel->foreign_keys[j];
+
+            if (strncmp(fk->ref_relation_name, r->relation_name,
+                        MAX_TABLE_NAME) != 0) continue;
+            if (strncmp(fk->ref_column_name, pk_col_name,
+                        MAX_COLUMN_NAME) != 0) continue;
+
+            int fk_col = find_col_idx(ref_rel, fk->column_name);
+            if (fk_col < 0) continue;
+
+            OpenTable *ref_ot = open_table(ref_rel->relation_name);
+            if (!ref_ot) return MYDB_ERR;
+
+            Cursor btree_cur;
+            if (btree_cursor_open(&ref_ot->clustered, &btree_cur) != MYDB_OK)
+                return MYDB_ERR;
+
+            uint8_t  rec_buf[PAGE_SIZE];
+            uint16_t rec_len;
+            while (btree_cursor_next(&btree_cur, rec_buf, &rec_len) == MYDB_OK) {
+                uint16_t klen = ((uint16_t)rec_buf[0] << 8) | rec_buf[1];
+                uint16_t voff = 2 + klen + 2;
+                Row row;
+                memset(&row, 0, sizeof(row));
+                deserialize_row_value(rec_buf + voff, rec_len - voff,
+                                      ref_rel, &row);
+                if (value_compare(&row.cols[fk_col], pk_val) == 0) {
+                    btree_cursor_close(&btree_cur);
+                    return MYDB_ERR_FK_VIOLATION;
+                }
+            }
+            btree_cursor_close(&btree_cur);
+        }
+    }
+    return MYDB_OK;
+}
+
+
+/* ------------------------------------------------------------------ */
 /*  DML — INSERT                                                        */
 /* ------------------------------------------------------------------ */
 
 int storage_insert(RelationDef *rel, Row *row)
 {
     if (!g.initialized || !rel || !row) return MYDB_ERR;
-    if (!g.eng->schema_active) return MYDB_ERR_PERM;
+    if (engine_check_access(g.eng, 1) != MYDB_OK) return MYDB_ERR_PERM;
 
     /* Read the writable RelationDef from the active schema — caller's
      * pointer may be a parser-side const view. */
@@ -535,6 +633,13 @@ int storage_insert(RelationDef *rel, Row *row)
                 return MYDB_ERR_NULL_VIOLATION;
             }
         }
+    }
+
+    /* FK referential integrity */
+    int fk_rc = fk_check_ref_exists(r, row);
+    if (fk_rc != MYDB_OK) {
+        if (auto_txn) trx_rollback(&g.trx);
+        return fk_rc;
     }
 
     /* AUTO_INCREMENT */
@@ -615,7 +720,7 @@ static int read_record_by_rid(OpenTable *ot, RID rid,
 int storage_delete(RelationDef *rel, RID rid)
 {
     if (!g.initialized || !rel) return MYDB_ERR;
-    if (!g.eng->schema_active) return MYDB_ERR_PERM;
+    if (engine_check_access(g.eng, 1) != MYDB_OK) return MYDB_ERR_PERM;
 
     RelationDef *r = schema_find_relation(&g.eng->active_schema,
                                           rel->relation_name);
@@ -636,6 +741,13 @@ int storage_delete(RelationDef *rel, RID rid)
 
     Value pk_val;
     record_get_pk(rec, r->columns[r->pk_col_idx].type, &pk_val);
+
+    /* FK referential integrity — reject if another relation references this row */
+    int fk_rc = fk_check_not_referenced(r, &pk_val);
+    if (fk_rc != MYDB_OK) {
+        if (auto_txn) trx_rollback(&g.trx);
+        return fk_rc;
+    }
 
     uint16_t klen = ((uint16_t)rec[0] << 8) | rec[1];
     uint16_t voff = 2 + klen + 2;
@@ -662,7 +774,7 @@ int storage_delete(RelationDef *rel, RID rid)
 int storage_update(RelationDef *rel, RID rid, Row *new_row)
 {
     if (!g.initialized || !rel || !new_row) return MYDB_ERR;
-    if (!g.eng->schema_active) return MYDB_ERR_PERM;
+    if (engine_check_access(g.eng, 1) != MYDB_OK) return MYDB_ERR_PERM;
 
     RelationDef *r = schema_find_relation(&g.eng->active_schema,
                                           rel->relation_name);
@@ -701,6 +813,16 @@ int storage_update(RelationDef *rel, RID rid, Row *new_row)
     memset(&old_row, 0, sizeof(old_row));
     deserialize_row_value(old_rec + voff, old_rec_len - voff, r, &old_row);
 
+    /* FK checks: new row's FK values must reference existing rows;
+     * if the PK changes, the old PK must not be referenced by others. */
+    {
+        int fk_rc = fk_check_ref_exists(r, new_row);
+        if (fk_rc != MYDB_OK) {
+            if (auto_txn) trx_rollback(&g.trx);
+            return fk_rc;
+        }
+    }
+
     /*
      * Validate-before-delete: if any UNIQUE key changes to a value that
      * already exists for another live row, fail the update without
@@ -708,6 +830,13 @@ int storage_update(RelationDef *rel, RID rid, Row *new_row)
      */
     const Value *new_pk = &new_row->cols[r->pk_col_idx];
     int pk_changed = (value_compare(&old_pk, new_pk) != 0);
+    if (pk_changed) {
+        int fk_rc = fk_check_not_referenced(r, &old_pk);
+        if (fk_rc != MYDB_OK) {
+            if (auto_txn) trx_rollback(&g.trx);
+            return fk_rc;
+        }
+    }
     if (pk_changed) {
         BTreeSearchResult res;
         if (btree_search(&ot->clustered, new_pk, &res) == MYDB_OK && res.found) {
@@ -772,7 +901,7 @@ int storage_update(RelationDef *rel, RID rid, Row *new_row)
 Row *storage_get_by_pk(RelationDef *rel, Value *pk)
 {
     if (!g.initialized || !rel || !pk) return NULL;
-    if (!g.eng->schema_active) return NULL;
+    if (engine_check_access(g.eng, 0) != MYDB_OK) return NULL;
 
     RelationDef *r = schema_find_relation(&g.eng->active_schema,
                                           rel->relation_name);
@@ -816,7 +945,7 @@ Row *storage_get_by_pk(RelationDef *rel, Value *pk)
 Cursor *storage_scan(RelationDef *rel)
 {
     if (!g.initialized || !rel) return NULL;
-    if (!g.eng->schema_active) return NULL;
+    if (engine_check_access(g.eng, 0) != MYDB_OK) return NULL;
 
     RelationDef *r = schema_find_relation(&g.eng->active_schema,
                                           rel->relation_name);

@@ -77,6 +77,11 @@ int bp_flush_page(BufferPool *bp, int table_id, uint32_t page_no);
 /* Flush all dirty pages belonging to table_id (uses each frame's DM). */
 int bp_flush_table(BufferPool *bp, int table_id);
 
+/* Flush every dirty page in the pool regardless of table_id.
+ * Used on schema switch: makes old schema's pages durable without
+ * closing any DiskManager or tearing down the storage runtime. */
+int bp_flush_dirty_all(BufferPool *bp);
+
 /*
  * Allocate a new page on disk, load it into a frame, pin it, and
  * return a pointer to the frame data. Sets *page_no to the new page number.
