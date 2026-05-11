@@ -19,9 +19,9 @@
 /*    60..67    : size_bytes (uint64) — written as 0, recomputed      */
 /*                on load (§8 implementation note)                    */
 /*    68        : num_relations (uint8)                               */
-/*    69..71    : reserved (3 B)                                      */
-/*    72..3655  : 64 x RelationEntry, 56 B each                       */
-/*    3656..16367: reserved (12712 B)                                 */
+/*    69..127   : reserved (59 B) — headroom for future fields        */
+/*    128..3711 : 64 x RelationEntry, 56 B each                       */
+/*    3712..16367: reserved (12656 B)                                 */
 /*    16368..16375: reserved (8 B)                                    */
 /*    16376..16379: FNV-1a checksum over bytes 0..16375 (4 B)         */
 /*    16380..16383: reserved (4 B)                                    */
@@ -37,8 +37,8 @@
 /*    45..55    : reserved (11 B)                                     */
 /* ------------------------------------------------------------------ */
 
-#define SF_HEADER_SIZE         72
-#define SF_RELATION_OFFSET     72
+#define SF_HEADER_SIZE        128
+#define SF_RELATION_OFFSET    128
 #define SF_RELATION_SIZE       56
 #define SF_CHECKSUM_OFFSET  16376
 

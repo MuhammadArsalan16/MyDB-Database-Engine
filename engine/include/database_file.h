@@ -22,6 +22,7 @@ typedef struct {
     uint64_t created_at;        /* YYYYMMDDHHmmSS */
     uint64_t last_opened;       /* updated on every db_open */
     uint8_t  num_partitions;    /* count of active slots */
+    uint32_t next_partition_id; /* monotonic counter; never reused */
 } DatabaseHeader;
 
 typedef struct {
@@ -54,8 +55,9 @@ int db_close(DatabaseFile *db);
  * trailer checksum, pwrite, and fsync. */
 int db_save(DatabaseFile *db);
 
-/* Register a new partition. partition_id is allocated as
- * (max existing id) + 1. Returns MYDB_ERR_FULL if all slots are
+/* Register a new partition. partition_id is allocated from the
+ * monotonic header counter `next_partition_id` and never reused, even
+ * after db_remove_partition. Returns MYDB_ERR_FULL if all slots are
  * active. Persists immediately. */
 int db_add_partition(DatabaseFile *db, uint32_t owner_id,
                      const char *path, uint32_t *out_partition_id);

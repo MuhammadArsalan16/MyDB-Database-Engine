@@ -19,7 +19,6 @@
 
 #include "common.h"
 #include "engine.h"
-#include "storage.h"
 
 static const char *resolve_root_dir(char *buf, size_t cap)
 {
@@ -41,8 +40,8 @@ static void print_usage(void)
 {
     fprintf(stderr,
         "Usage:\n"
-        "  mydb init  -u <username>   bootstrap a new MyDB engine\n"
-        "  mydb start -u <username>   login and open the SQL REPL\n"
+        "  mydb init  -u <username>   bootstrap a new MYDB engine\n"
+        "  mydb start -u <username>   login and open the MYDB shell\n"
         "\n"
         "Engine root resolves from $MYDB_HOME (default ~/.mydb).\n");
 }
@@ -228,8 +227,6 @@ static int run_start(int argc, char **argv)
 
     printf("Logged in as %s.\n", username);
     run_repl(&eng);
-
-    storage_shutdown();   /* safe no-op until exec engine initialises storage */
     engine_close(&eng);
     printf("Goodbye.\n");
     return 0;

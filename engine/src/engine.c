@@ -192,6 +192,7 @@ int engine_init(const char *root_dir, EngineState *out)
 int engine_close(EngineState *eng)
 {
     if (!eng) return MYDB_ERR;
+    storage_shutdown();
     int rc = MYDB_OK;
 
     if (eng->schema_active && eng->active_schema.fd >= 0) {

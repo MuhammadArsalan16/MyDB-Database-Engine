@@ -15,14 +15,16 @@
 /*    40..47  : created_at (uint64)                                   */
 /*    48..55  : last_opened (uint64)                                  */
 /*    56      : num_partitions (uint8)                                */
-/*    57..63  : reserved (7 B, zero)                                  */
-/*    64..4543: 16 PartitionEntry records, 280 B each                 */
-/*    4544..  : reserved block (3644 B, zero)                         */
+/*    57..59  : reserved (3 B, zero)                                  */
+/*    60..63  : next_partition_id (uint32) — monotonic, never reused  */
+/*    64..127 : reserved (64 B, zero) — headroom for future fields    */
+/*    128..4607: 16 PartitionEntry records, 280 B each                */
+/*    4608..  : reserved block (3580 B, zero)                         */
 /*    8188..  : FNV-1a checksum over bytes 0..8187 (4 B)              */
 /* ------------------------------------------------------------------ */
 
-#define DB_HEADER_SIZE        64
-#define DB_PARTITION_OFFSET   64
+#define DB_HEADER_SIZE       128
+#define DB_PARTITION_OFFSET  128
 #define DB_PARTITION_SIZE    280
 #define DB_CHECKSUM_OFFSET  8188
 
@@ -58,7 +60,9 @@ static void serialize_header(uint8_t *buf, const DatabaseHeader *h)
     memcpy(buf + 40, &h->created_at,  8);
     memcpy(buf + 48, &h->last_opened, 8);
     buf[56] = h->num_partitions;
-    /* bytes 57..63 are zeroed by the caller's memset */
+    /* bytes 57..59 zeroed by caller's memset */
+    memcpy(buf + 60, &h->next_partition_id, 4);
+    /* bytes 64..127 zeroed by caller's memset */
 }
 
 static void deserialize_header(const uint8_t *buf, DatabaseHeader *h)
@@ -68,6 +72,7 @@ static void deserialize_header(const uint8_t *buf, DatabaseHeader *h)
     memcpy(&h->created_at,  buf + 40, 8);
     memcpy(&h->last_opened, buf + 48, 8);
     h->num_partitions = buf[56];
+    memcpy(&h->next_partition_id, buf + 60, 4);
 }
 
 static void serialize_partition(uint8_t *buf, const PartitionEntry *p)
@@ -150,6 +155,7 @@ int db_create(const char *path, const char *engine_name, DatabaseFile *out)
     out->header.created_at  = now_yyyymmddhhmmss();
     out->header.last_opened = out->header.created_at;
     out->header.num_partitions = 0;
+    out->header.next_partition_id = 1;
 
     int rc = db_save(out);
     if (rc != MYDB_OK) {
@@ -224,20 +230,14 @@ int db_add_partition(DatabaseFile *db, uint32_t owner_id,
     if (strlen(path) >= sizeof(db->partitions[0].path)) return MYDB_ERR;
 
     int slot = -1;
-    uint32_t max_id = 0;
     for (int i = 0; i < MAX_PARTITIONS; i++) {
-        if (db->partitions[i].is_active) {
-            if (db->partitions[i].partition_id > max_id)
-                max_id = db->partitions[i].partition_id;
-        } else if (slot < 0) {
-            slot = i;
-        }
+        if (!db->partitions[i].is_active) { slot = i; break; }
     }
     if (slot < 0) return MYDB_ERR_FULL;
 
     PartitionEntry *p = &db->partitions[slot];
     memset(p, 0, sizeof(*p));
-    p->partition_id = max_id + 1;
+    p->partition_id = db->header.next_partition_id++;
     strncpy(p->path, path, sizeof(p->path) - 1);
     p->owner_id  = owner_id;
     p->is_active = 1;

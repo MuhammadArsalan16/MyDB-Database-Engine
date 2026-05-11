@@ -293,9 +293,9 @@ static void test_remove_then_add_reuses_slot(void)
     db_close(&db);
 }
 
-static void test_id_allocator_uses_max_plus_one(void)
+static void test_id_allocator_monotonic(void)
 {
-    printf("\n[test_id_allocator_uses_max_plus_one]\n");
+    printf("\n[test_id_allocator_monotonic]\n");
     cleanup();
 
     DatabaseFile db;
@@ -304,12 +304,44 @@ static void test_id_allocator_uses_max_plus_one(void)
     uint32_t p1, p2, p3;
     db_add_partition(&db, 1, "/a", &p1);   /* id 1 */
     db_add_partition(&db, 2, "/b", &p2);   /* id 2 */
-    db_remove_partition(&db, p1);
-    db_add_partition(&db, 3, "/c", &p3);   /* expect id 3, NOT slot reuse */
+    db_remove_partition(&db, p2);          /* remove the trailing id */
+    db_add_partition(&db, 3, "/c", &p3);   /* expect id 3, NOT 2 */
 
     CHECK(p1 == 1, "p1 id = 1");
     CHECK(p2 == 2, "p2 id = 2");
-    CHECK(p3 == 3, "p3 id = max(2)+1 = 3, not 1");
+    CHECK(p3 == 3, "p3 id is monotonic counter, not reused trailing id");
+
+    db_close(&db);
+}
+
+static void test_next_partition_id_persists(void)
+{
+    printf("\n[test_next_partition_id_persists]\n");
+    cleanup();
+
+    /* Add three partitions, close, reopen — counter must survive. */
+    {
+        DatabaseFile db;
+        db_create(TEST_FILE, NULL, &db);
+        uint32_t pid;
+        db_add_partition(&db, 1, "/a", &pid);
+        db_add_partition(&db, 2, "/b", &pid);
+        db_add_partition(&db, 3, "/c", &pid);
+        db_close(&db);
+    }
+
+    DatabaseFile db;
+    CHECK(db_open(TEST_FILE, &db) == MYDB_OK, "reopen succeeds");
+    CHECK(db.header.next_partition_id == 4,
+          "counter resumes at 4 after three adds");
+
+    /* Remove all three, then add — counter still monotonic. */
+    db_remove_partition(&db, 1);
+    db_remove_partition(&db, 2);
+    db_remove_partition(&db, 3);
+    uint32_t pid;
+    CHECK(db_add_partition(&db, 9, "/d", &pid) == MYDB_OK, "add after wipe");
+    CHECK(pid == 4, "post-wipe id is 4, not 1");
 
     db_close(&db);
 }
@@ -392,7 +424,8 @@ int main(void)
     test_remove_partition();
     test_remove_unknown_id();
     test_remove_then_add_reuses_slot();
-    test_id_allocator_uses_max_plus_one();
+    test_id_allocator_monotonic();
+    test_next_partition_id_persists();
     test_find_by_owner();
     test_find_by_id_miss();
     test_last_opened_refreshes();

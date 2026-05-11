@@ -18,15 +18,15 @@
 /*    32..39  : quota_bytes (uint64)                                  */
 /*    40..47  : used_bytes (uint64)                                   */
 /*    48      : num_schemas (uint8)                                   */
-/*    49..63  : reserved (15 B)                                       */
-/*    64..2623: 64 × SchemaEntry, 40 B each                           */
-/*    2624..  : reserved block (1464 B)                               */
+/*    49..127 : reserved (79 B) — headroom for future fields          */
+/*    128..2687: 64 × SchemaEntry, 40 B each                          */
+/*    2688..  : reserved block (1400 B)                               */
 /*    4088..  : FNV-1a checksum over bytes 0..4087 (4 B)              */
 /*    4092..  : reserved (4 B)                                        */
 /* ------------------------------------------------------------------ */
 
-#define CAT_HEADER_SIZE       64
-#define CAT_SCHEMA_OFFSET     64
+#define CAT_HEADER_SIZE      128
+#define CAT_SCHEMA_OFFSET    128
 #define CAT_SCHEMA_SIZE       40
 #define CAT_CHECKSUM_OFFSET 4088
 

@@ -54,7 +54,7 @@
 /*  On-disk format version. Bumped when any file layout changes in    */
 /*  a way that older binaries can't read.                             */
 /* ------------------------------------------------------------------ */
-#define MYDB_FORMAT_VERSION  1
+#define MYDB_FORMAT_VERSION  2
 
 /* ------------------------------------------------------------------ */
 /*  v2 four-level hierarchy capacities                                */
