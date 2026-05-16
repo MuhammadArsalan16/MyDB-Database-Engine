@@ -1,12 +1,16 @@
 #pragma once
 #include <string>
 #include <vector>
+#include <cstdint>
+#include <stdexcept>
 
-enum class TokenType { KEYWORD, IDENTIFIER, SYMBOL, END_OF_FILE };
+enum class TokenType { KEYWORD, IDENTIFIER, NUMBER, STRING, SYMBOL, OPERATOR, END_OF_FILE };
 
 struct Token {
     TokenType type;
     std::string value;
+    uint32_t line = 1;
+    uint32_t col = 1;
 };
 
 class Lexer {
@@ -17,6 +21,8 @@ public:
 private:
     std::string source;
     size_t current_pos = 0;
+    uint32_t line = 1;
+    uint32_t col = 1;
 
     void skip_whitespace();
     bool is_keyword(const std::string& str);
