@@ -753,6 +753,26 @@ int btree_cursor_open(BTree *bt, Cursor *cur)
     return MYDB_OK;
 }
 
+int btree_cursor_open_at(BTree *bt, const Value *lo, Cursor *cur)
+{
+    cur->tree      = bt;
+    cur->done      = 0;
+    cur->next_slot = 0;
+    cur->page_no   = INVALID_PAGE;
+
+    BTreeSearchResult res;
+    if (btree_search(bt, lo, &res) != MYDB_OK) return MYDB_ERR;
+
+    if (res.page_no == INVALID_PAGE) {
+        cur->done = 1;
+        return MYDB_OK;
+    }
+
+    cur->page_no   = res.page_no;
+    cur->next_slot = res.slot_no;
+    return MYDB_OK;
+}
+
 int btree_cursor_next(Cursor *cur, uint8_t *data_out, uint16_t *len)
 {
     if (cur->done) return MYDB_ERR_NOT_FOUND;

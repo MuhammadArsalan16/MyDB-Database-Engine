@@ -325,7 +325,7 @@ typedef struct Row {
 ```
 
 - `cols[i]` must match `rel->columns[i]` in type and order.
-- `rid` is filled in by `storage_get_by_pk` and `cursor_next`. Pass it back to `storage_update` / `storage_delete`.
+- `rid` is filled in by `storage_get_by_pk`, `storage_get_by_index`, and `cursor_next`. Pass it back to `storage_update` / `storage_delete`.
 - On INSERT, `rid` is ignored.
 
 ---
@@ -551,7 +551,7 @@ int rc = storage_insert(rel, &row);
 int storage_update(RelationDef *rel, RID rid, Row *new_row);
 ```
 
-Replaces the row at `rid` with `new_row`. The RID comes from `row->rid` returned by `storage_get_by_pk` or `cursor_next`. Internally this is a delete + insert, so the same constraints apply.
+Replaces the row at `rid` with `new_row`. The RID comes from `row->rid` returned by `storage_get_by_pk`, `storage_get_by_index`, or `cursor_next`. Internally this is a delete + insert, so the same constraints apply.
 
 **Example:**
 
@@ -600,7 +600,7 @@ if (row != NULL) {
 
 ## 8. DQL — Querying Data
 
-Both `storage_get_by_pk` and `cursor_next` return `MYDB_ERR_PERM` (as NULL) if the user does not have at least SELECT access on the schema. Analyst users with a SELECT grant can read; they cannot write.
+All DQL functions return `NULL` (with `MYDB_ERR_PERM` as the internal code) if the user does not have at least SELECT access on the schema. Analyst users with a SELECT grant can read; they cannot write.
 
 ### `storage_get_by_pk`
 
@@ -635,17 +635,62 @@ if (row == NULL) {
 
 ---
 
-### `storage_scan` / `cursor_next` / `cursor_close`
+### `storage_get_by_index`
+
+```c
+Row *storage_get_by_index(RelationDef *rel, int col_idx, Value *key);
+```
+
+Point lookup by a secondary (UNIQUE) index. O(log n) on the secondary tree + one clustered page read.
+
+- `col_idx` is the column's position in `rel->columns[]`. The column must have `is_unique = 1` and a corresponding entry in `rel->secondary_col_idx[]`; returns `NULL` if no secondary index covers that column.
+- Internally: descends the secondary B+ tree to find the matching leaf record, reads the `{page_no, slot_no}` RID stored there, then fetches the full row from the clustered tree in a single page read. The two-step lookup is invisible to the caller.
+- Returns a pointer to an **internal static buffer** — valid until the next `storage_get_by_index` call.
+- `row->rid` is populated — use it for `storage_update` / `storage_delete`.
+- Returns `NULL` if the key does not exist, `col_idx` has no secondary index, or permission is denied.
+- **Cursors are never opened on secondary indexes.** Range scans on non-PK UNIQUE columns (`WHERE email BETWEEN ...`, `ORDER BY email`) are not available in Phase 1 — use `storage_scan` with an inline filter as fallback.
+
+```c
+// SELECT * FROM users WHERE email = 'ali@example.com'
+// assuming col 1 (email) is UNIQUE
+
+// find col_idx by name
+int col_idx = -1;
+for (int i = 0; i < rel->num_columns; i++) {
+    if (strcmp(rel->columns[i].name, "email") == 0) { col_idx = i; break; }
+}
+
+Value key;
+key.type = TYPE_VARCHAR;  key.is_null = 0;
+strncpy(key.v.varchar_val.data, "ali@example.com", sizeof(key.v.varchar_val.data));
+key.v.varchar_val.len = strlen("ali@example.com");
+
+Row *row = storage_get_by_index(rel, col_idx, &key);
+if (row == NULL) {
+    // not found or no index on that column
+} else {
+    // row->cols[], row->rid both valid
+}
+```
+
+> **Note:** `storage_get_by_index` requires `rel->num_secondary_indexes` and `rel->secondary_col_idx[]` to be populated. The execution engine currently sets `num_secondary_indexes = 0` in `execute_create_table_ast` — that must be fixed before index lookups work at runtime.
+
+---
+
+### `storage_scan` / `storage_scan_from` / `cursor_next` / `cursor_close`
 
 ```c
 Cursor *storage_scan(RelationDef *rel);
+Cursor *storage_scan_from(RelationDef *rel, Value *lo);
 Row    *cursor_next(Cursor *cursor);
 void    cursor_close(Cursor *cursor);
 ```
 
-Full sequential scan in **primary key order** (ascending).
+Sequential scan in **primary key order** (ascending).
 
-- `storage_scan` returns a `Cursor *`, or `NULL` on error / permission denied.
+- `storage_scan` opens a full-table scan from the smallest key.
+- `storage_scan_from` opens a scan positioned at the first row whose primary key is `>= lo`. Use this for `WHERE pk >= x`, `WHERE pk BETWEEN lo AND hi`, or any equality predicate where you want to skip the prefix of the tree. `lo` must be the PK column's type. Returns `NULL` on error / permission denied.
+- The cursor walks forward in key order; **the caller applies any upper bound** by comparing each row's PK and breaking when it passes `hi`. The storage layer does not know about upper bounds.
 - `cursor_next` returns the next row, or `NULL` at end-of-scan.
 - Each `cursor_next` call **overwrites the previous row pointer** — save the RID or copy values before calling again.
 - **Always call `cursor_close`**, even on early exit. Memory leak otherwise.
@@ -682,6 +727,20 @@ cursor_close(cur);
 ```
 
 > Deleting or updating the **current row** during a scan is safe. Do not insert rows during a scan.
+
+**Example — range scan with `storage_scan_from`:**
+
+```c
+// SELECT * FROM orders WHERE id BETWEEN 1000 AND 2000
+Value lo = { .type = TYPE_INT, .v.int_val = 1000 };
+Cursor *cur = storage_scan_from(rel, &lo);
+Row *row;
+while ((row = cursor_next(cur)) != NULL) {
+    if (row->cols[0].v.int_val > 2000) break;   // upper bound is caller's job
+    // ... emit row ...
+}
+cursor_close(cur);
+```
 
 ---
 
@@ -889,6 +948,41 @@ uint8_t idx = r->cols[3].v.enum_val;
 // idx 0 = "active", 1 = "inactive", 2 = "pending"
 // To convert: rel->columns[3].enum_values[idx]
 ```
+
+---
+
+### Example F — Secondary index lookup
+
+```c
+/* SELECT * FROM users WHERE email = 'ali@example.com'
+   assuming users.email is UNIQUE (col index 1)          */
+
+RelationDef *rel = (RelationDef *)engine_find_relation(&eng, "users");
+
+/* Find col_idx by name at runtime */
+int col_idx = -1;
+for (int i = 0; i < rel->num_columns; i++) {
+    if (strcmp(rel->columns[i].name, "email") == 0) { col_idx = i; break; }
+}
+
+Value key;
+key.type = TYPE_VARCHAR; key.is_null = 0;
+key.v.varchar_val.len = strlen("ali@example.com");
+memcpy(key.v.varchar_val.data, "ali@example.com", key.v.varchar_val.len);
+
+Row *row = storage_get_by_index(rel, col_idx, &key);
+if (row == NULL) {
+    // not found, or email column has no secondary index
+} else {
+    printf("id=%d  email=%.*s\n",
+           row->cols[0].v.int_val,
+           row->cols[1].v.varchar_val.len,
+           row->cols[1].v.varchar_val.data);
+    // row->rid is valid for storage_update / storage_delete
+}
+```
+
+> **Prerequisite:** `rel->num_secondary_indexes` and `rel->secondary_col_idx[]` must be populated by the execution engine when building the `RelationDef` for `CREATE TABLE`. Currently `ast_executor.cpp` sets `num_secondary_indexes = 0` — fix that before calling this function.
 
 ---
 

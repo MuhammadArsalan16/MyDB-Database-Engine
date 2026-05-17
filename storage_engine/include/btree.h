@@ -137,6 +137,14 @@ int btree_delete(BTree *bt, const Value *key);
 int btree_cursor_open(BTree *bt, Cursor *cur);
 
 /*
+ * Open a cursor positioned at the first record with key >= lo.
+ * If lo is greater than every key in the tree, the cursor is returned in
+ * the done state and the first btree_cursor_next call yields MYDB_ERR_NOT_FOUND.
+ * Caller is responsible for any upper-bound check.
+ */
+int btree_cursor_open_at(BTree *bt, const Value *lo, Cursor *cur);
+
+/*
  * Advance the cursor to the next live record.
  * Fills data_out (must be PAGE_SIZE bytes) and sets *len to the record size.
  * Returns MYDB_OK, or MYDB_ERR_NOT_FOUND when exhausted.

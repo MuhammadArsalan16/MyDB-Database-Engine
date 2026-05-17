@@ -944,6 +944,78 @@ int storage_update(RelationDef *rel, RID rid, Row *new_row)
 }
 
 /* ------------------------------------------------------------------ */
+/*  DQL — storage_get_by_index                                         */
+/* ------------------------------------------------------------------ */
+
+Row *storage_get_by_index(RelationDef *rel, int col_idx, Value *key)
+{
+    if (!g.initialized || !rel || !key) return NULL;
+    if (engine_check_access(g.eng, 0) != MYDB_OK) return NULL;
+
+    RelationDef *r = schema_find_relation(&g.eng->active_schema,
+                                          rel->relation_name);
+    if (!r) return NULL;
+
+    /* Find which secondary index covers col_idx */
+    int sec_idx = -1;
+    for (int i = 0; i < r->num_secondary_indexes; i++) {
+        if (r->secondary_col_idx[i] == (uint8_t)col_idx) {
+            sec_idx = i;
+            break;
+        }
+    }
+    if (sec_idx < 0) return NULL;   /* col has no secondary index */
+
+    OpenTable *ot = open_table(rel->relation_name);
+    if (!ot) return NULL;
+
+    /* Step 1: descend secondary tree → secondary record {klen, key, page_no, slot_no} */
+    BTreeSearchResult sec_res;
+    if (btree_search(&ot->secondary[sec_idx], key, &sec_res) != MYDB_OK) return NULL;
+    if (!sec_res.found) return NULL;
+
+    uint8_t *sec_page = bp_fetch_page(&g.bp, &ot->dm, ot->id, sec_res.page_no);
+    if (!sec_page) return NULL;
+
+    uint16_t doff, dsz;
+    if (page_get_record(sec_page, sec_res.slot_no, &doff, &dsz) != MYDB_OK) {
+        bp_unpin_page(&g.bp, ot->id, sec_res.page_no, 0);
+        return NULL;
+    }
+
+    /* Parse the RID out of the secondary record: [klen:2][key:klen][page_no:4][slot_no:2] */
+    const uint8_t *srec = sec_page + doff;
+    uint16_t klen = ((uint16_t)srec[0] << 8) | srec[1];
+    RID rid;
+    memcpy(&rid.page_no, srec + 2 + klen,     4);
+    memcpy(&rid.slot_no, srec + 2 + klen + 4, 2);
+    bp_unpin_page(&g.bp, ot->id, sec_res.page_no, 0);
+
+    /* Step 2: fetch full row from clustered tree using the RID */
+    uint8_t *clust_page = bp_fetch_page(&g.bp, &ot->dm, ot->id, rid.page_no);
+    if (!clust_page) return NULL;
+
+    uint16_t cdoff, cdsz;
+    if (page_get_record(clust_page, rid.slot_no, &cdoff, &cdsz) != MYDB_OK) {
+        bp_unpin_page(&g.bp, ot->id, rid.page_no, 0);
+        return NULL;
+    }
+
+    uint8_t rec[PAGE_SIZE];
+    memcpy(rec, clust_page + cdoff, cdsz);
+    bp_unpin_page(&g.bp, ot->id, rid.page_no, 0);
+
+    uint16_t cklen = ((uint16_t)rec[0] << 8) | rec[1];
+    uint16_t voff  = 2 + cklen + 2;
+
+    static Row result;
+    memset(&result, 0, sizeof(result));
+    deserialize_row_value(rec + voff, cdsz - voff, r, &result);
+    result.rid = rid;
+    return &result;
+}
+
+/* ------------------------------------------------------------------ */
 /*  DQL — storage_get_by_pk                                            */
 /* ------------------------------------------------------------------ */
 
@@ -1011,6 +1083,33 @@ Cursor *storage_scan(RelationDef *rel)
     sc->rel = r;
 
     if (btree_cursor_open(&ot->clustered, &sc->btree_cur) != MYDB_OK) {
+        free(sc);
+        return NULL;
+    }
+
+    return (Cursor *)sc;
+}
+
+Cursor *storage_scan_from(RelationDef *rel, Value *lo)
+{
+    if (!g.initialized || !rel || !lo) return NULL;
+    if (engine_check_access(g.eng, 0) != MYDB_OK) return NULL;
+
+    RelationDef *r = schema_find_relation(&g.eng->active_schema,
+                                          rel->relation_name);
+    if (!r) return NULL;
+
+    OpenTable *ot = open_table(rel->relation_name);
+    if (!ot) return NULL;
+
+    StorageScan *sc = (StorageScan *)malloc(sizeof(StorageScan));
+    if (!sc) return NULL;
+
+    memset(sc, 0, sizeof(StorageScan));
+    sc->ot  = ot;
+    sc->rel = r;
+
+    if (btree_cursor_open_at(&ot->clustered, lo, &sc->btree_cur) != MYDB_OK) {
         free(sc);
         return NULL;
     }

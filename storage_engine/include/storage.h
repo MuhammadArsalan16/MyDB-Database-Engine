@@ -129,10 +129,29 @@ int storage_delete(RelationDef *rel, RID rid);
 Row *storage_get_by_pk(RelationDef *rel, Value *pk);
 
 /*
+ * Fetch a single row by a secondary (UNIQUE) index.
+ * col_idx is the column position in rel->columns[] that has is_unique=1.
+ * Descends the secondary B+ tree to get the RID, then fetches the full
+ * row from the clustered tree in one page read.
+ * Returns a pointer to an internal static Row, or NULL if not found /
+ * col_idx has no secondary index / permission denied.
+ * The pointer is valid until the next storage_get_by_index call.
+ */
+Row *storage_get_by_index(RelationDef *rel, int col_idx, Value *key);
+
+/*
  * Open a full-table scan cursor. NULL on error.
  * The cursor must be closed with cursor_close().
  */
 Cursor *storage_scan(RelationDef *rel);
+
+/*
+ * Open a scan cursor positioned at the first row whose primary key is >= lo.
+ * The cursor walks forward in key order from there; the caller applies any
+ * upper bound by comparing each row's PK and stopping when it exceeds the
+ * desired range. NULL on error. Close with cursor_close().
+ */
+Cursor *storage_scan_from(RelationDef *rel, Value *lo);
 
 /* Advance the cursor and return a pointer to the next row, or NULL at
  * end-of-scan. The pointed-to Row is owned by the cursor. */
