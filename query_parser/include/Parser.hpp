@@ -22,10 +22,25 @@ private:
     Token peek();
     Token advance();
     bool match(TokenType type, const std::string& value = "");
+    [[noreturn]] void throw_error(const std::string& error_msg);
     void consume(TokenType type, const std::string& value, const std::string& error_msg);
+    std::string parse_qualified_ident();
 
-    // Specific statement parsers (These were the ones missing!)
+    // Specific statement parsers
     std::unique_ptr<SelectStatement> parse_select();
     std::unique_ptr<CreateTableStatement> parse_create_table();
     std::unique_ptr<InsertStatement> parse_insert();
+    std::unique_ptr<DropTableStatement> parse_drop_table();
+    std::unique_ptr<CreateDatabaseStatement> parse_create_database();
+    std::unique_ptr<DropDatabaseStatement> parse_drop_database();
+    std::unique_ptr<UseStatement> parse_use();
+    std::unique_ptr<ASTNode> parse_show();
+
+    // Expression parsing
+    std::unique_ptr<Expr> parse_expr();
+    std::unique_ptr<Expr> parse_or_expr();
+    std::unique_ptr<Expr> parse_and_expr();
+    std::unique_ptr<Expr> parse_not_expr();
+    std::unique_ptr<Expr> parse_predicate();
+    std::unique_ptr<Expr> parse_term();
 };
