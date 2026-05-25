@@ -13,6 +13,7 @@
 extern "C" {
 #include "common.h"
 #include "relation_def.h"
+#include "storage.h"
 }
 #include "AST.hpp"
 
