@@ -20,6 +20,11 @@ cd "$(dirname "$(readlink -f "$0")")"
 if [[ "${1:-}" == "--clean" ]]; then
     echo "==> --clean: removing build/"
     rm -rf build
+    MYDB_DIR="${MYDB_HOME:-$HOME/.mydb}"
+    if [[ -d "$MYDB_DIR" ]]; then
+        echo "==> --clean: removing $MYDB_DIR"
+        rm -rf "$MYDB_DIR"
+    fi
 elif [[ -n "${1:-}" ]]; then
     echo "build.sh: unknown argument '$1' (did you mean --clean?)" >&2
     exit 2

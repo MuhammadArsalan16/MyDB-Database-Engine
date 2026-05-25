@@ -31,3 +31,9 @@ endforeach()
 add_executable(test_integration integration/test_integration.c)
 target_link_libraries(test_integration PRIVATE engine)
 add_test(NAME test_integration COMMAND test_integration)
+
+# query_parser tests — links query_parser (headers exposed via its PUBLIC
+# include dirs, so #include "Parser.hpp" / "Lexer.hpp" resolve correctly).
+add_executable(test_parser query_parser/test_parser.cpp)
+target_link_libraries(test_parser PRIVATE query_parser)
+add_test(NAME test_parser COMMAND test_parser)
