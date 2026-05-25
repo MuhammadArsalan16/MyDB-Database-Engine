@@ -37,3 +37,11 @@ add_test(NAME test_integration COMMAND test_integration)
 add_executable(test_parser query_parser/test_parser.cpp)
 target_link_libraries(test_parser PRIVATE query_parser)
 add_test(NAME test_parser COMMAND test_parser)
+
+# execution_engine tests — phases 1-3 (TCL, helpers, DDL).
+# Links engine which PUBLIC-links execution_engine and query_parser,
+# so all execution_engine headers are reachable transitively.
+add_executable(test_exec_engine execution_engine/test_exec_engine.cpp)
+target_link_libraries(test_exec_engine PRIVATE engine)
+target_compile_features(test_exec_engine PRIVATE cxx_std_17)
+add_test(NAME test_exec_engine COMMAND test_exec_engine)
