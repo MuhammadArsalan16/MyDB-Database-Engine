@@ -1,18 +1,8 @@
 /*
  * dml.cpp — INSERT, UPDATE, DELETE handlers.
  *
- * Phase 4 (INSERT) and Phase 6 (UPDATE, DELETE) fill in the real logic.
- *
- * Every handler MUST follow this auto-commit pattern:
- *
- *   AUTOCOMMIT_BEGIN();
- *   rc = storage_insert(rel, &row);   // or update / delete
- *   AUTOCOMMIT_END(rc);
- *   return rc;
- *
- * The two macros from exec_internal.h handle both modes transparently:
- *   - Explicit txn (user issued BEGIN): macros do nothing, user drives it.
- *   - Auto-commit (no BEGIN): macros open, then commit or rollback.
+ * Phase 4  : exec_insert   — fully implemented.
+ * Phase 6  : exec_update, exec_delete — stubs with auto-commit pattern.
  */
 
 #include "ast_executor.hpp"
@@ -21,33 +11,246 @@
 #include "value_cast.hpp"
 #include "expr_eval.hpp"
 
+#include <cstring>
 #include <cstdio>
+#include <ctime>
 
-int exec_insert(EngineState * /*eng*/,
-                const InsertStatement * /*s*/,
+/* ======================================================================
+ * INSERT
+ * ====================================================================== */
+
+/*
+ * Get the current local time encoded as YYYYMMDDHHmmSS (DATETIME) or
+ * YYYYMMDD (DATE).  Used when a column has DEFAULT NOW.
+ */
+static Value get_now_value(DataType type)
+{
+    Value v;
+    memset(&v, 0, sizeof(v));
+    v.type = type;
+
+    time_t     t  = time(NULL);
+    struct tm *tm = localtime(&t);
+
+    if (type == TYPE_DATETIME) {
+        v.v.datetime_val = (int64_t)(tm->tm_year + 1900) * 10000000000LL
+                         + (int64_t)(tm->tm_mon  + 1)    *   100000000LL
+                         + (int64_t) tm->tm_mday          *     1000000LL
+                         + (int64_t) tm->tm_hour          *       10000LL
+                         + (int64_t) tm->tm_min           *         100LL
+                         + (int64_t) tm->tm_sec;
+    } else {
+        /* TYPE_DATE */
+        v.v.date_val = (tm->tm_year + 1900) * 10000
+                     + (tm->tm_mon  + 1)    *   100
+                     + tm->tm_mday;
+    }
+    return v;
+}
+
+/*
+ * Return true when a ColumnDef's stored default value is the NOW sentinel.
+ *
+ * The sentinel is: has_default=1, is_null=0, and the encoded value is 0
+ * (year-zero is not a valid real date in either DATE or DATETIME encoding,
+ * so 0 is safe as a special marker meaning "use current timestamp").
+ */
+static int is_now_sentinel(const ColumnDef *col)
+{
+    if (!col->has_default || col->default_value.is_null) return 0;
+    if (col->type == TYPE_DATETIME) return (col->default_value.v.datetime_val == 0);
+    if (col->type == TYPE_DATE)     return (col->default_value.v.date_val     == 0);
+    return 0;
+}
+
+int exec_insert(EngineState *eng, const InsertStatement *s,
                 char *out, size_t cap)
 {
-    /*
-     * Phase 4 implementation goes here:
+    REQUIRE_LOGIN(eng);
+    REQUIRE_SCHEMA(eng);
+
+    /* write access check */
+    int rc = engine_check_access(eng, 1);
+    if (rc != MYDB_OK) {
+        format_error(rc, out, cap, s->table_name.c_str());
+        return rc;
+    }
+
+    /* look up the table */
+    const RelationDef *rel_c = engine_find_relation(eng, s->table_name.c_str());
+    if (!rel_c) {
+        snprintf(out, cap, "ERROR: table '%s' does not exist",
+                 s->table_name.c_str());
+        return MYDB_ERR_NOT_FOUND;
+    }
+    /* storage takes non-const — safe cast: storage is the single writer */
+    RelationDef *rel = (RelationDef *)rel_c;
+
+    if (s->rows.empty()) {
+        snprintf(out, cap, "ERROR: INSERT has no values");
+        return MYDB_ERR;
+    }
+
+    /* ------------------------------------------------------------------
+     * Count non-AUTO_INCREMENT columns.
      *
-     *   AUTOCOMMIT_BEGIN();
-     *   rc = storage_insert(rel, &row);
-     *   AUTOCOMMIT_END(rc);
-     *   return rc;
-     */
-    snprintf(out, cap, "not implemented: INSERT");
-    return MYDB_ERR;
+     * Positional INSERT skips AUTO_INCREMENT columns entirely — the user
+     * provides values only for the columns the engine cannot fill in.
+     * Named INSERT must not mention any AUTO_INCREMENT column at all.
+     * ------------------------------------------------------------------ */
+    bool named = !s->target_columns.empty();
+
+    int non_ai_cols = 0;
+    for (int i = 0; i < rel->num_columns; i++) {
+        if (!rel->columns[i].is_auto_increment)
+            non_ai_cols++;
+    }
+
+    /* ------------------------------------------------------------------
+     * Validate value counts per row.
+     *
+     * Named:      expected count = number of columns listed.
+     * Positional: expected count = non-AUTO_INCREMENT columns only.
+     * ------------------------------------------------------------------ */
+    for (size_t ri = 0; ri < s->rows.size(); ri++) {
+        size_t have = s->rows[ri].size();
+        size_t want = named ? s->target_columns.size()
+                            : (size_t)non_ai_cols;
+        if (have != want) {
+            snprintf(out, cap,
+                     "ERROR: row %zu has %zu value%s but %zu %s expected",
+                     ri + 1, have, have == 1 ? "" : "s", want,
+                     named ? "columns listed"
+                           : "non-AUTO_INCREMENT columns in table");
+            return MYDB_ERR;
+        }
+    }
+
+    /* ------------------------------------------------------------------
+     * Build col_src[]:  col_src[i] = index into the row's values vector
+     *                                for column i, or -1 if not provided.
+     *
+     * Named:      scan target_columns; reject if any column is AUTO_INCREMENT
+     *             (the user should never supply a value for it).
+     * Positional: AUTO_INCREMENT columns are implicitly skipped; values map
+     *             to non-AUTO_INCREMENT columns in declaration order.
+     * ------------------------------------------------------------------ */
+    int col_src[MAX_COLUMNS];
+    memset(col_src, -1, sizeof(col_src));
+
+    if (named) {
+        for (int ci = 0; ci < (int)s->target_columns.size(); ci++) {
+            int idx = resolve_col(rel, s->target_columns[(size_t)ci]);
+            if (idx < 0) {
+                snprintf(out, cap, "ERROR: unknown column '%s'",
+                         s->target_columns[(size_t)ci].c_str());
+                return MYDB_ERR;
+            }
+            if (rel->columns[idx].is_auto_increment) {
+                snprintf(out, cap,
+                         "ERROR: column '%s' is AUTO_INCREMENT — "
+                         "value must not be provided",
+                         rel->columns[idx].name);
+                return MYDB_ERR;
+            }
+            col_src[idx] = ci;
+        }
+    } else {
+        /* Positional: skip AUTO_INCREMENT columns; assign value slots
+         * to the remaining columns in declaration order. */
+        int val_idx = 0;
+        for (int i = 0; i < rel->num_columns; i++) {
+            if (!rel->columns[i].is_auto_increment)
+                col_src[i] = val_idx++;
+            /* AUTO_INCREMENT columns keep col_src[i] = -1 */
+        }
+    }
+
+    /* ------------------------------------------------------------------
+     * Insert all rows inside one transaction (all-or-nothing).
+     * ------------------------------------------------------------------ */
+    AUTOCOMMIT_BEGIN();
+
+    size_t ninserted = 0;
+
+    for (size_t ri = 0; ri < s->rows.size(); ri++) {
+        const std::vector<std::string> &vals = s->rows[ri];
+
+        Row row;
+        memset(&row, 0, sizeof(row));
+        row.num_cols = (uint8_t)rel->num_columns;
+
+        for (int ci = 0; ci < rel->num_columns; ci++) {
+            const ColumnDef *col = &rel->columns[ci];
+            Value           *v   = &row.cols[ci];
+            v->type = col->type;
+
+            if (col_src[ci] >= 0) {
+                /* explicit value provided in the INSERT */
+                *v = cast_literal(vals[(size_t)col_src[ci]], *col);
+
+            } else if (col->is_auto_increment) {
+                /* AUTO_INCREMENT — storage fills in the next counter value */
+                v->is_null = 1;
+
+            } else if (col->has_default) {
+                if (is_now_sentinel(col)) {
+                    /* DEFAULT NOW — substitute current timestamp */
+                    *v = get_now_value(col->type);
+                } else {
+                    *v = col->default_value;
+                }
+
+            } else {
+                /* no value, no default — column gets NULL */
+                v->is_null = 1;
+            }
+
+            /*
+             * NOT NULL check.
+             * AUTO_INCREMENT columns are exempt: they arrive as is_null=1
+             * here but storage fills them in before writing the row.
+             */
+            if (col->is_not_null && !col->is_auto_increment && v->is_null) {
+                rc = MYDB_ERR_NULL_VIOLATION;
+                AUTOCOMMIT_END(rc);
+                snprintf(out, cap,
+                         "ERROR: column '%s' cannot be NULL", col->name);
+                return rc;
+            }
+        }
+
+        rc = storage_insert(rel, &row);
+        if (rc != MYDB_OK) {
+            AUTOCOMMIT_END(rc);
+            format_error(rc, out, cap, s->table_name.c_str());
+            return rc;
+        }
+        ninserted++;
+    }
+
+    rc = MYDB_OK;
+    AUTOCOMMIT_END(rc);
+
+    snprintf(out, cap, "Query OK, %zu row%s affected",
+             ninserted, ninserted == 1 ? "" : "s");
+    return MYDB_OK;
 }
+
+/* ======================================================================
+ * UPDATE  (Phase 6)
+ * ====================================================================== */
 
 int exec_update(EngineState * /*eng*/,
                 const UpdateStatement * /*s*/,
                 char *out, size_t cap)
 {
     /*
-     * Phase 6 implementation goes here:
+     * Phase 6 implementation:
      *
      *   AUTOCOMMIT_BEGIN();
-     *   rc = storage_update(rel, rid, &new_row);
+     *   // scan + filter + for each matching row: storage_update(rel, rid, &new_row)
+     *   rc = ...;
      *   AUTOCOMMIT_END(rc);
      *   return rc;
      */
@@ -55,15 +258,20 @@ int exec_update(EngineState * /*eng*/,
     return MYDB_ERR;
 }
 
+/* ======================================================================
+ * DELETE  (Phase 6)
+ * ====================================================================== */
+
 int exec_delete(EngineState * /*eng*/,
                 const DeleteStatement * /*s*/,
                 char *out, size_t cap)
 {
     /*
-     * Phase 6 implementation goes here:
+     * Phase 6 implementation:
      *
      *   AUTOCOMMIT_BEGIN();
-     *   rc = storage_delete(rel, row->rid);
+     *   // scan + filter + for each matching row: storage_delete(rel, row->rid)
+     *   rc = ...;
      *   AUTOCOMMIT_END(rc);
      *   return rc;
      */

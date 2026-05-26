@@ -1,10 +1,13 @@
 /*
- * test_exec_engine.cpp — tests for execution engine phases 1–3.
+ * test_exec_engine.cpp — tests for execution engine phases 1–5.1.
  *
- *  Phase 1 — TCL   : BEGIN / COMMIT / ROLLBACK via engine_execute_sql.
- *  Phase 2 — Helpers: unit tests for value_cast and expr_eval.
- *  Phase 3 — DDL   : CREATE/DROP DATABASE, USE, CREATE/DROP TABLE,
- *                    SHOW TABLES / SHOW DATABASES via engine_execute_sql.
+ *  Phase 1   — TCL     : BEGIN / COMMIT / ROLLBACK via engine_execute_sql.
+ *  Phase 2   — Helpers : unit tests for value_cast and expr_eval.
+ *  Phase 3   — DDL     : CREATE/DROP DATABASE, USE, CREATE/DROP TABLE,
+ *                        SHOW TABLES / SHOW DATABASES via engine_execute_sql.
+ *  Phase 4   — INSERT  : full INSERT coverage via engine_execute_sql.
+ *  Phase 5.1 — SELECT  : single-table SELECT, projection, WHERE filtering,
+ *                        access-path selection, LIMIT / OFFSET.
  *
  * Test isolation: every test group that touches the disk calls full_setup()
  * which wipes /tmp/mydb_test_exec and bootstraps a clean engine.
@@ -689,6 +692,406 @@ static void test_ddl(void)
 }
 
 /* ======================================================================
+ * PHASE 4 — INSERT tests via engine_execute_sql
+ * ====================================================================== */
+
+static void test_insert(void)
+{
+    printf("\n[test_insert]\n");
+    engine_setup();
+
+    int rc;
+
+    /* set up schema and table via SQL */
+    sql("CREATE DATABASE shop;");
+    sql("USE shop;");
+    sql("CREATE TABLE products ("
+        "  id     INT PRIMARY KEY,"
+        "  name   VARCHAR(50) NOT NULL,"
+        "  price  DECIMAL,"
+        "  active BOOL DEFAULT TRUE"
+        ");");
+
+    /* ---- basic positional INSERT ---- */
+    rc = sql("INSERT INTO products VALUES (1, 'Widget', 9.99, TRUE);");
+    CHECK(rc == MYDB_OK, "INSERT positional → MYDB_OK");
+    CHECK(strstr(g_res, "Query OK") != NULL, "INSERT result says Query OK");
+    CHECK(strstr(g_res, "1 row") != NULL,    "INSERT result says 1 row affected");
+
+    /* ---- named-column INSERT ---- */
+    rc = sql("INSERT INTO products (id, name, price) VALUES (2, 'Gadget', 19.99);");
+    CHECK(rc == MYDB_OK, "INSERT named columns → MYDB_OK");
+
+    /* ---- INSERT uses DEFAULT for omitted column ---- */
+    /* active column not provided → should default to TRUE (bool_val=1) */
+    rc = sql("INSERT INTO products (id, name) VALUES (3, 'Doohickey');");
+    CHECK(rc == MYDB_OK, "INSERT with omitted DEFAULT column → MYDB_OK");
+
+    /* ---- duplicate PK → error ---- */
+    rc = sql("INSERT INTO products VALUES (1, 'Dupe', 0.00, FALSE);");
+    CHECK(rc == MYDB_ERR_DUPLICATE, "INSERT duplicate PK → MYDB_ERR_DUPLICATE");
+
+    /* ---- NOT NULL violation ---- */
+    rc = sql("INSERT INTO products (id, price) VALUES (10, 5.00);");
+    CHECK(rc == MYDB_ERR_NULL_VIOLATION, "INSERT missing NOT NULL column → MYDB_ERR_NULL_VIOLATION");
+    CHECK(strstr(g_res, "name") != NULL,
+          "NOT NULL error message names the column");
+
+    /* ---- wrong column count ---- */
+    rc = sql("INSERT INTO products VALUES (99, 'TooFew');");
+    CHECK(rc != MYDB_OK, "INSERT wrong value count → error");
+
+    /* ---- INSERT into non-existent table ---- */
+    rc = sql("INSERT INTO nosuchtable VALUES (1, 'x');");
+    CHECK(rc == MYDB_ERR_NOT_FOUND, "INSERT unknown table → MYDB_ERR_NOT_FOUND");
+
+    /* ---- AUTO_INCREMENT table ---- */
+    sql("CREATE TABLE counters ("
+        "  id    INT AUTO_INCREMENT PRIMARY KEY,"
+        "  label VARCHAR(20) NOT NULL"
+        ");");
+
+    /* named INSERT — omit AUTO_INCREMENT column → MYDB_OK */
+    rc = sql("INSERT INTO counters (label) VALUES ('first');");
+    CHECK(rc == MYDB_OK, "INSERT AUTO_INCREMENT (omit PK, named) → MYDB_OK");
+
+    rc = sql("INSERT INTO counters (label) VALUES ('second');");
+    CHECK(rc == MYDB_OK, "INSERT AUTO_INCREMENT second row → MYDB_OK");
+
+    /* positional INSERT — value count = non-AI columns only (1 value for label) */
+    rc = sql("INSERT INTO counters VALUES ('third');");
+    CHECK(rc == MYDB_OK, "INSERT AUTO_INCREMENT positional (1 value) → MYDB_OK");
+
+    /* positional INSERT — too many values (includes AI slot) → error */
+    rc = sql("INSERT INTO counters VALUES (99, 'fourth');");
+    CHECK(rc != MYDB_OK, "INSERT AUTO_INCREMENT positional with AI value → error");
+
+    /* named INSERT — explicitly naming the AUTO_INCREMENT column → error */
+    rc = sql("INSERT INTO counters (id, label) VALUES (5, 'fifth');");
+    CHECK(rc != MYDB_OK,                      "INSERT AI column by name → error");
+    CHECK(strstr(g_res, "AUTO_INCREMENT") != NULL,
+          "INSERT AI column by name → error mentions AUTO_INCREMENT");
+
+    /*
+     * Multi-row INSERT (VALUES (a),(b),(c)) is not yet supported by the
+     * parser — it parses exactly one VALUES row per statement.
+     * The execution engine loop is already in place and will handle
+     * multiple rows correctly once the parser is updated.
+     */
+
+    engine_teardown();
+}
+
+/* ======================================================================
+ * PHASE 5.1 — SELECT (basic single-table)
+ * ====================================================================== */
+
+static void test_select(void)
+{
+    printf("\n[test_select]\n");
+    engine_setup();
+
+    int rc;
+
+    /* ---- REQUIRE_SCHEMA guard: SELECT before USE ---- */
+    rc = sql("SELECT * FROM anything;");
+    CHECK(rc != MYDB_OK, "SELECT without USE → error");
+    CHECK(strstr(g_res, "ERROR") != NULL, "SELECT without USE → error message");
+
+    /* ---- setup: create schema + table + data ---- */
+    sql("CREATE DATABASE shop;");
+    sql("USE shop;");
+
+    /*
+     * Use explicit INT PRIMARY KEY (not AUTO_INCREMENT) so test IDs are
+     * predictable regardless of the AUTO_INCREMENT start value.
+     */
+    sql("CREATE TABLE products ("
+        "  id      INT PRIMARY KEY,"
+        "  name    VARCHAR(50) NOT NULL,"
+        "  code    VARCHAR(20) UNIQUE,"
+        "  price   INT,"
+        "  active  BOOL DEFAULT TRUE"
+        ");");
+
+    /* insert 5 rows with known ids 1..5 */
+    sql("INSERT INTO products (id, name, code, price, active)"
+        " VALUES (1, 'Alpha',   'A001', 100, TRUE);");
+    sql("INSERT INTO products (id, name, code, price, active)"
+        " VALUES (2, 'Beta',    'B002', 200, FALSE);");
+    sql("INSERT INTO products (id, name, code, price, active)"
+        " VALUES (3, 'Gamma',   'G003', 150, TRUE);");
+    sql("INSERT INTO products (id, name, code, price, active)"
+        " VALUES (4, 'Delta',   'D004', 300, TRUE);");
+    sql("INSERT INTO products (id, name, code, price, active)"
+        " VALUES (5, 'Epsilon', 'E005', 250, FALSE);");
+
+    /* ---- SELECT * — all rows ---- */
+    rc = sql("SELECT * FROM products;");
+    CHECK(rc == MYDB_OK,                    "SELECT * → MYDB_OK");
+    CHECK(strstr(g_res, "id")   != NULL,    "SELECT * → header has 'id'");
+    CHECK(strstr(g_res, "name") != NULL,    "SELECT * → header has 'name'");
+    CHECK(strstr(g_res, "Alpha")  != NULL,  "SELECT * → row 'Alpha' present");
+    CHECK(strstr(g_res, "Epsilon") != NULL, "SELECT * → row 'Epsilon' present");
+    CHECK(strstr(g_res, "(5 rows)") != NULL,"SELECT * → 5 rows reported");
+
+    /* ---- SELECT named columns (projection) ---- */
+    rc = sql("SELECT name, price FROM products;");
+    CHECK(rc == MYDB_OK,                     "SELECT name,price → MYDB_OK");
+    CHECK(strstr(g_res, "name")  != NULL,    "SELECT name,price → header 'name'");
+    CHECK(strstr(g_res, "price") != NULL,    "SELECT name,price → header 'price'");
+    /* id and code must NOT appear in the header */
+    CHECK(strstr(g_res, " id ")  == NULL,    "SELECT name,price → no 'id' column");
+    CHECK(strstr(g_res, "(5 rows)") != NULL, "SELECT name,price → 5 rows");
+
+    /* ---- WHERE with full scan (non-indexed column) ---- */
+    rc = sql("SELECT * FROM products WHERE price > 150;");
+    CHECK(rc == MYDB_OK,                      "WHERE price>150 → MYDB_OK");
+    CHECK(strstr(g_res, "Beta")    != NULL,   "WHERE price>150 → Beta(200)");
+    CHECK(strstr(g_res, "Delta")   != NULL,   "WHERE price>150 → Delta(300)");
+    CHECK(strstr(g_res, "Epsilon") != NULL,   "WHERE price>150 → Epsilon(250)");
+    CHECK(strstr(g_res, "Alpha")   == NULL,   "WHERE price>150 → no Alpha(100)");
+    CHECK(strstr(g_res, "Gamma")   == NULL,   "WHERE price>150 → no Gamma(150)");
+    CHECK(strstr(g_res, "(3 rows)") != NULL,  "WHERE price>150 → 3 rows");
+
+    /* ---- WHERE pk = value → AP_GET_PK ---- */
+    rc = sql("SELECT * FROM products WHERE id = 3;");
+    CHECK(rc == MYDB_OK,                    "WHERE id=3 (PK) → MYDB_OK");
+    CHECK(strstr(g_res, "Gamma") != NULL,   "WHERE id=3 → row is Gamma");
+    CHECK(strstr(g_res, "(1 row)") != NULL, "WHERE id=3 → exactly 1 row");
+
+    /* ---- WHERE unique_col = value → AP_GET_INDEX ---- */
+    rc = sql("SELECT * FROM products WHERE code = 'D004';");
+    CHECK(rc == MYDB_OK,                    "WHERE code='D004' (UNIQUE) → MYDB_OK");
+    CHECK(strstr(g_res, "Delta") != NULL,   "WHERE code='D004' → row is Delta");
+    CHECK(strstr(g_res, "(1 row)") != NULL, "WHERE code='D004' → exactly 1 row");
+
+    /* ---- WHERE pk >= value → AP_SCAN_FROM ---- */
+    rc = sql("SELECT * FROM products WHERE id >= 4;");
+    CHECK(rc == MYDB_OK,                     "WHERE id>=4 (SCAN_FROM) → MYDB_OK");
+    CHECK(strstr(g_res, "Delta")   != NULL,  "WHERE id>=4 → Delta present");
+    CHECK(strstr(g_res, "Epsilon") != NULL,  "WHERE id>=4 → Epsilon present");
+    CHECK(strstr(g_res, "Alpha")   == NULL,  "WHERE id>=4 → Alpha absent");
+    CHECK(strstr(g_res, "(2 rows)") != NULL, "WHERE id>=4 → 2 rows");
+
+    /* ---- LIMIT (no ORDER BY → cuts stream after N rows) ---- */
+    rc = sql("SELECT * FROM products LIMIT 2;");
+    CHECK(rc == MYDB_OK,                     "SELECT LIMIT 2 → MYDB_OK");
+    CHECK(strstr(g_res, "(2 rows)") != NULL, "SELECT LIMIT 2 → exactly 2 rows");
+
+    /* ---- OFFSET (skip first N rows) ---- */
+    rc = sql("SELECT * FROM products LIMIT 10 OFFSET 3;");
+    CHECK(rc == MYDB_OK,                     "LIMIT 10 OFFSET 3 → MYDB_OK");
+    CHECK(strstr(g_res, "(2 rows)") != NULL, "LIMIT 10 OFFSET 3 → 2 rows (5-3)");
+
+    /* ---- LIMIT + OFFSET combined ---- */
+    rc = sql("SELECT * FROM products LIMIT 2 OFFSET 1;");
+    CHECK(rc == MYDB_OK,                     "LIMIT 2 OFFSET 1 → MYDB_OK");
+    CHECK(strstr(g_res, "(2 rows)") != NULL, "LIMIT 2 OFFSET 1 → 2 rows");
+    /* rows 2 and 3 in PK order: Beta, Gamma */
+    CHECK(strstr(g_res, "Beta")  != NULL,    "LIMIT 2 OFFSET 1 → Beta (row 2)");
+    CHECK(strstr(g_res, "Gamma") != NULL,    "LIMIT 2 OFFSET 1 → Gamma (row 3)");
+    CHECK(strstr(g_res, "Alpha") == NULL,    "LIMIT 2 OFFSET 1 → Alpha skipped");
+
+    /* ---- empty result set (no rows match WHERE) ---- */
+    rc = sql("SELECT * FROM products WHERE price > 9999;");
+    CHECK(rc == MYDB_OK,                     "WHERE no match → MYDB_OK");
+    CHECK(strstr(g_res, "(0 rows)") != NULL, "WHERE no match → 0 rows");
+    /* header must still be present */
+    CHECK(strstr(g_res, "id") != NULL,       "WHERE no match → header still shown");
+
+    /* ---- ORDER BY price ASC (materialise path) ---- */
+    rc = sql("SELECT * FROM products ORDER BY price ASC;");
+    CHECK(rc == MYDB_OK,                      "ORDER BY price ASC → MYDB_OK");
+    CHECK(strstr(g_res, "(5 rows)") != NULL,  "ORDER BY price ASC → 5 rows");
+    /* Alpha(100) must appear before Epsilon(250) in output */
+    CHECK(strstr(g_res, "Alpha")   != NULL,   "ORDER BY price ASC → Alpha present");
+    CHECK(strstr(g_res, "Epsilon") != NULL,   "ORDER BY price ASC → Epsilon present");
+    {
+        const char *pos_alpha   = strstr(g_res, "Alpha");
+        const char *pos_epsilon = strstr(g_res, "Epsilon");
+        CHECK(pos_alpha < pos_epsilon,        "ORDER BY price ASC → Alpha before Epsilon");
+    }
+
+    /* ---- ORDER BY price DESC ---- */
+    rc = sql("SELECT * FROM products ORDER BY price DESC;");
+    CHECK(rc == MYDB_OK,                       "ORDER BY price DESC → MYDB_OK");
+    {
+        const char *pos_delta   = strstr(g_res, "Delta");   /* price=300 */
+        const char *pos_alpha   = strstr(g_res, "Alpha");   /* price=100 */
+        CHECK(pos_delta < pos_alpha,           "ORDER BY price DESC → Delta(300) before Alpha(100)");
+    }
+
+    /* ---- ORDER BY id ASC (PK optimisation — stream path) ---- */
+    rc = sql("SELECT * FROM products ORDER BY id ASC;");
+    CHECK(rc == MYDB_OK,                       "ORDER BY id ASC (PK opt) → MYDB_OK");
+    CHECK(strstr(g_res, "(5 rows)") != NULL,   "ORDER BY id ASC → 5 rows");
+    {
+        const char *pos_alpha   = strstr(g_res, "Alpha");   /* id=1 */
+        const char *pos_epsilon = strstr(g_res, "Epsilon"); /* id=5 */
+        CHECK(pos_alpha < pos_epsilon,         "ORDER BY id ASC → id=1 before id=5");
+    }
+
+    /* ---- ORDER BY price ASC LIMIT 2 (partial_sort) ---- */
+    rc = sql("SELECT name, price FROM products ORDER BY price ASC LIMIT 2;");
+    CHECK(rc == MYDB_OK,                       "ORDER BY + LIMIT 2 → MYDB_OK");
+    CHECK(strstr(g_res, "(2 rows)") != NULL,   "ORDER BY + LIMIT 2 → 2 rows");
+    CHECK(strstr(g_res, "Alpha")  != NULL,     "ORDER BY ASC LIMIT 2 → cheapest Alpha(100)");
+    CHECK(strstr(g_res, "Gamma")  != NULL,     "ORDER BY ASC LIMIT 2 → 2nd cheapest Gamma(150)");
+    CHECK(strstr(g_res, "Beta")   == NULL,     "ORDER BY ASC LIMIT 2 → Beta(200) not included");
+
+    /* ---- ORDER BY price DESC LIMIT 1 OFFSET 1 ---- */
+    rc = sql("SELECT name, price FROM products ORDER BY price DESC LIMIT 1 OFFSET 1;");
+    CHECK(rc == MYDB_OK,                       "ORDER BY DESC LIMIT 1 OFFSET 1 → MYDB_OK");
+    CHECK(strstr(g_res, "(1 row)") != NULL,    "ORDER BY DESC LIMIT 1 OFFSET 1 → 1 row");
+    /* sorted desc: Delta(300), Epsilon(250), Beta(200), Gamma(150), Alpha(100)
+     * offset 1 skips Delta → Epsilon is the result */
+    CHECK(strstr(g_res, "Epsilon") != NULL,    "ORDER BY DESC LIMIT 1 OFFSET 1 → Epsilon");
+    CHECK(strstr(g_res, "Delta")   == NULL,    "ORDER BY DESC LIMIT 1 OFFSET 1 → Delta skipped");
+
+    /* ---- multi-column ORDER BY: price ASC, name DESC ---- */
+    rc = sql("SELECT name, price FROM products ORDER BY price ASC, name DESC;");
+    CHECK(rc == MYDB_OK,                       "multi-column ORDER BY → MYDB_OK");
+    CHECK(strstr(g_res, "(5 rows)") != NULL,   "multi-column ORDER BY → 5 rows");
+
+    /* ---- ORDER BY with WHERE ---- */
+    rc = sql("SELECT * FROM products WHERE price > 150 ORDER BY price ASC;");
+    CHECK(rc == MYDB_OK,                       "ORDER BY + WHERE → MYDB_OK");
+    CHECK(strstr(g_res, "(3 rows)") != NULL,   "ORDER BY + WHERE → 3 rows");
+    {
+        const char *pos_beta    = strstr(g_res, "Beta");    /* price=200 */
+        const char *pos_delta   = strstr(g_res, "Delta");   /* price=300 */
+        CHECK(pos_beta < pos_delta,            "ORDER BY + WHERE → Beta(200) before Delta(300)");
+    }
+
+    /* ---- ORDER BY bad column → error ---- */
+    rc = sql("SELECT * FROM products ORDER BY nosuchcol;");
+    CHECK(rc != MYDB_OK,                       "ORDER BY bad column → error");
+    CHECK(strstr(g_res, "nosuchcol") != NULL,  "ORDER BY bad column → mentions name");
+
+    /* ---- invalid column in projection ---- */
+    rc = sql("SELECT id, nosuchcol FROM products;");
+    CHECK(rc != MYDB_OK,                     "SELECT bad column → error");
+    CHECK(strstr(g_res, "nosuchcol") != NULL,"SELECT bad column → mentions name");
+
+    /* ---- invalid column in WHERE ---- */
+    rc = sql("SELECT * FROM products WHERE nosuchcol = 1;");
+    CHECK(rc != MYDB_OK,                     "WHERE bad column → error");
+    CHECK(strstr(g_res, "nosuchcol") != NULL,"WHERE bad column → mentions name");
+
+    /* ---- SELECT from non-existent table ---- */
+    rc = sql("SELECT * FROM nosuchtable;");
+    CHECK(rc == MYDB_ERR_NOT_FOUND,          "SELECT unknown table → MYDB_ERR_NOT_FOUND");
+
+    engine_teardown();
+}
+
+/* ======================================================================
+ * PHASE 5.3 — Scalar aggregates
+ * ====================================================================== */
+
+static void test_aggregates(void)
+{
+    printf("\n[test_aggregates]\n");
+    engine_setup();
+
+    int rc;
+
+    sql("CREATE DATABASE shop;");
+    sql("USE shop;");
+
+    /* table: id INT PK, name VARCHAR, price INT, active BOOL */
+    sql("CREATE TABLE products ("
+        "  id     INT PRIMARY KEY,"
+        "  name   VARCHAR(50) NOT NULL,"
+        "  price  INT,"
+        "  active BOOL DEFAULT TRUE"
+        ");");
+
+    /* 5 rows: prices 100, 200, 150, 300, 250 */
+    sql("INSERT INTO products (id, name, price, active) VALUES (1, 'Alpha',   100, TRUE);");
+    sql("INSERT INTO products (id, name, price, active) VALUES (2, 'Beta',    200, FALSE);");
+    sql("INSERT INTO products (id, name, price, active) VALUES (3, 'Gamma',   150, TRUE);");
+    sql("INSERT INTO products (id, name, price, active) VALUES (4, 'Delta',   300, TRUE);");
+    sql("INSERT INTO products (id, name, price, active) VALUES (5, 'Epsilon', 250, FALSE);");
+
+    /* ---- COUNT(*) — all rows ---- */
+    rc = sql("SELECT COUNT(*) FROM products;");
+    CHECK(rc == MYDB_OK,                    "COUNT(*) → MYDB_OK");
+    CHECK(strstr(g_res, "COUNT(*)") != NULL,"COUNT(*) → header present");
+    CHECK(strstr(g_res, "5")        != NULL,"COUNT(*) → value is 5");
+    CHECK(strstr(g_res, "(1 row)")  != NULL,"COUNT(*) → exactly 1 row");
+
+    /* ---- COUNT(*) with WHERE ---- */
+    rc = sql("SELECT COUNT(*) FROM products WHERE price > 150;");
+    CHECK(rc == MYDB_OK,                    "COUNT(*) WHERE → MYDB_OK");
+    CHECK(strstr(g_res, "3")        != NULL,"COUNT(*) WHERE price>150 → 3");
+
+    /* ---- SUM ---- */
+    rc = sql("SELECT SUM(price) FROM products;");
+    CHECK(rc == MYDB_OK,                    "SUM(price) → MYDB_OK");
+    /* 100+200+150+300+250 = 1000 */
+    CHECK(strstr(g_res, "1000")     != NULL,"SUM(price) → 1000");
+
+    /* ---- AVG ---- */
+    rc = sql("SELECT AVG(price) FROM products;");
+    CHECK(rc == MYDB_OK,                    "AVG(price) → MYDB_OK");
+    /* 1000/5 = 200.00 */
+    CHECK(strstr(g_res, "200.00")   != NULL,"AVG(price) → 200.00");
+
+    /* ---- MIN ---- */
+    rc = sql("SELECT MIN(price) FROM products;");
+    CHECK(rc == MYDB_OK,                    "MIN(price) → MYDB_OK");
+    CHECK(strstr(g_res, "100")      != NULL,"MIN(price) → 100");
+
+    /* ---- MAX ---- */
+    rc = sql("SELECT MAX(price) FROM products;");
+    CHECK(rc == MYDB_OK,                    "MAX(price) → MYDB_OK");
+    CHECK(strstr(g_res, "300")      != NULL,"MAX(price) → 300");
+
+    /* ---- multiple aggregates in one query ---- */
+    rc = sql("SELECT COUNT(*), SUM(price), MIN(price), MAX(price) FROM products;");
+    CHECK(rc == MYDB_OK,                      "multi-agg → MYDB_OK");
+    CHECK(strstr(g_res, "(1 row)")  != NULL,  "multi-agg → exactly 1 row");
+    CHECK(strstr(g_res, "5")        != NULL,  "multi-agg → COUNT=5");
+    CHECK(strstr(g_res, "1000")     != NULL,  "multi-agg → SUM=1000");
+    CHECK(strstr(g_res, "100")      != NULL,  "multi-agg → MIN=100");
+    CHECK(strstr(g_res, "300")      != NULL,  "multi-agg → MAX=300");
+
+    /* ---- COUNT(*) on empty result (WHERE matches nothing) ---- */
+    rc = sql("SELECT COUNT(*) FROM products WHERE price > 9999;");
+    CHECK(rc == MYDB_OK,                    "COUNT(*) no match → MYDB_OK");
+    CHECK(strstr(g_res, "0")        != NULL,"COUNT(*) no match → 0");
+    CHECK(strstr(g_res, "(1 row)")  != NULL,"COUNT(*) no match → still 1 row");
+
+    /* ---- SUM on empty result → NULL ---- */
+    rc = sql("SELECT SUM(price) FROM products WHERE price > 9999;");
+    CHECK(rc == MYDB_OK,                    "SUM no match → MYDB_OK");
+    CHECK(strstr(g_res, "NULL")     != NULL,"SUM no match → NULL");
+
+    /* ---- alias ---- */
+    rc = sql("SELECT COUNT(*) AS total FROM products;");
+    CHECK(rc == MYDB_OK,                    "COUNT(*) AS total → MYDB_OK");
+    CHECK(strstr(g_res, "total")    != NULL,"COUNT(*) AS total → alias in header");
+
+    /* ---- error: mix aggregate and column ---- */
+    rc = sql("SELECT name, COUNT(*) FROM products;");
+    CHECK(rc != MYDB_OK,                    "mix agg+col → error");
+    CHECK(strstr(g_res, "GROUP BY") != NULL,"mix agg+col → mentions GROUP BY");
+
+    /* ---- error: ORDER BY with scalar aggregate ---- */
+    rc = sql("SELECT COUNT(*) FROM products ORDER BY price;");
+    CHECK(rc != MYDB_OK,                    "agg + ORDER BY → error");
+
+    /* ---- error: bad column in aggregate ---- */
+    rc = sql("SELECT SUM(nosuchcol) FROM products;");
+    CHECK(rc != MYDB_OK,                     "SUM bad col → error");
+    CHECK(strstr(g_res, "nosuchcol") != NULL,"SUM bad col → mentions column");
+
+    engine_teardown();
+}
+
+/* ======================================================================
  * main
  * ====================================================================== */
 
@@ -700,6 +1103,9 @@ int main(void)
     test_value_cast();
     test_expr_eval();
     test_ddl();
+    test_insert();
+    test_select();
+    test_aggregates();
 
     rm_rf(TEST_ROOT);
 

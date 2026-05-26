@@ -133,7 +133,7 @@ static Value eval_value(const Expr *e, const RelationDef *rel,
  * All other cross-type comparisons return 0 (treated as unequal by
  * callers via the != path).
  */
-static int compare_values(const Value *a, const Value *b)
+int compare_values(const Value *a, const Value *b)
 {
     if (a->is_null || b->is_null) return 1;   /* NULL != anything */
 

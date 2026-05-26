@@ -10,38 +10,12 @@
  */
 
 #include "ast_executor.hpp"
+#include "exec_internal.h"
 #include "result_fmt.hpp"
 #include "value_cast.hpp"
 
 #include <cstring>
 #include <cstdio>
-
-/* ======================================================================
- * Internal helpers
- * ====================================================================== */
-
-/* Guard macros — write an error and return immediately when precondition
- * fails.  Each macro expands to a complete if-return statement so it is
- * safe to use without braces. */
-
-#define REQUIRE_LOGIN(eng)                                          \
-    if (!(eng)->logged_in) {                                        \
-        snprintf(out, cap, "ERROR: not logged in");                 \
-        return MYDB_ERR_PERM;                                       \
-    }
-
-#define REQUIRE_SCHEMA(eng)                                                     \
-    if (!(eng)->schema_active) {                                                \
-        snprintf(out, cap,                                                      \
-                 "ERROR: no schema selected — run USE <schema> first");         \
-        return MYDB_ERR;                                                        \
-    }
-
-#define REQUIRE_PARTITION(eng)                                          \
-    if (!(eng)->partition_open) {                                       \
-        snprintf(out, cap, "ERROR: user owns no partition");            \
-        return MYDB_ERR_PERM;                                           \
-    }
 
 /*
  * Map the parser's data_type string to a DataType enum value.
@@ -248,6 +222,25 @@ int exec_create_table(EngineState *eng, const CreateTableStatement *s,
         return MYDB_ERR;
     }
     rel.pk_col_idx = (uint8_t)pk_idx;
+
+    /*
+     * Register secondary B+ tree indexes for every UNIQUE non-PK column.
+     * storage_create_table uses rel.num_secondary_indexes to allocate the
+     * secondary root pages; storage_insert uses secondary_col_idx[] to know
+     * which B+ trees to maintain; storage_get_by_index uses it for lookups.
+     */
+    rel.num_secondary_indexes = 0;
+    for (int i = 0; i < rel.num_columns; i++) {
+        if (!rel.columns[i].is_unique || rel.columns[i].is_primary_key)
+            continue;
+        if (rel.num_secondary_indexes >= MAX_SECONDARY_IDX) {
+            snprintf(out, cap,
+                     "ERROR: too many UNIQUE columns (max %d secondary indexes)",
+                     MAX_SECONDARY_IDX);
+            return MYDB_ERR;
+        }
+        rel.secondary_col_idx[rel.num_secondary_indexes++] = (uint8_t)i;
+    }
 
     /* --- foreign keys --- */
     rel.num_foreign_keys = 0;

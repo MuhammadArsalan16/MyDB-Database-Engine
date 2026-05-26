@@ -32,6 +32,33 @@
  * AUTOCOMMIT_END does NOT change rc — the caller keeps it.
  */
 
+/*
+ * REQUIRE_LOGIN / REQUIRE_SCHEMA / REQUIRE_PARTITION
+ * ---------------------------------------------------
+ * Precondition guards used at the top of every handler.
+ * Each expands to a complete if-return so it is safe without braces.
+ * Requires: `out`, `cap` in scope (the handler's output buffer params).
+ */
+
+#define REQUIRE_LOGIN(eng)                                          \
+    if (!(eng)->logged_in) {                                        \
+        snprintf(out, cap, "ERROR: not logged in");                 \
+        return MYDB_ERR_PERM;                                       \
+    }
+
+#define REQUIRE_SCHEMA(eng)                                                     \
+    if (!(eng)->schema_active) {                                                \
+        snprintf(out, cap,                                                      \
+                 "ERROR: no schema selected — run USE <schema> first");         \
+        return MYDB_ERR;                                                        \
+    }
+
+#define REQUIRE_PARTITION(eng)                                          \
+    if (!(eng)->partition_open) {                                       \
+        snprintf(out, cap, "ERROR: user owns no partition");            \
+        return MYDB_ERR_PERM;                                           \
+    }
+
 #define AUTOCOMMIT_BEGIN()              \
     do {                                \
         if (!g_in_explicit_txn)         \

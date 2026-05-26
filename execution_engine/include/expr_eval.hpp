@@ -39,3 +39,17 @@ bool eval_expr(const Expr *e, const RelationDef *rel, const Row *r);
  * Otherwise delegates to eval_expr on the root expression.
  */
 bool where_matches(const WhereClause *w, const RelationDef *rel, const Row *r);
+
+/*
+ * Type-aware comparison of two Values.
+ * Returns: negative → a < b,  zero → a == b,  positive → a > b.
+ *
+ * NULL handling: if either value is NULL, returns 1 (treated as not-equal,
+ * NULL sorts last — callers that need IS NULL semantics check is_null first).
+ *
+ * Cross-type coercion: INT ↔ DECIMAL (scale-2 assumed for best-guess).
+ * All other cross-type comparisons return 0.
+ *
+ * Used by ORDER BY sort comparator in dql.cpp.
+ */
+int compare_values(const Value *a, const Value *b);
