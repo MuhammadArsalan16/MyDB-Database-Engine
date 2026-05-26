@@ -224,18 +224,26 @@ int exec_create_table(EngineState *eng, const CreateTableStatement *s,
     rel.pk_col_idx = (uint8_t)pk_idx;
 
     /*
-     * Register secondary B+ tree indexes for every UNIQUE non-PK column.
-     * storage_create_table uses rel.num_secondary_indexes to allocate the
-     * secondary root pages; storage_insert uses secondary_col_idx[] to know
-     * which B+ trees to maintain; storage_get_by_index uses it for lookups.
+     * Register secondary B+ tree indexes.
+     *
+     * Two sources:
+     *   1. UNIQUE non-PK columns  → unique secondary index (is_secondary=1 in BTree)
+     *   2. INDEXED non-PK columns → non-unique secondary index (is_secondary=2 in BTree)
+     *
+     * The BTree type is derived at open_table time from column.is_unique, so
+     * the secondary_col_idx[] array does not need a separate "is_unique" field.
+     * Here we just collect which columns need secondary indexes.
      */
     rel.num_secondary_indexes = 0;
     for (int i = 0; i < rel.num_columns; i++) {
-        if (!rel.columns[i].is_unique || rel.columns[i].is_primary_key)
-            continue;
+        const ASTColumnDef &ac = s->columns[(size_t)i];
+        /* Skip the PK column — it IS the clustered index */
+        if (rel.columns[i].is_primary_key) continue;
+        /* Include if UNIQUE or explicitly INDEXED */
+        if (!rel.columns[i].is_unique && !ac.is_indexed) continue;
         if (rel.num_secondary_indexes >= MAX_SECONDARY_IDX) {
             snprintf(out, cap,
-                     "ERROR: too many UNIQUE columns (max %d secondary indexes)",
+                     "ERROR: too many indexed columns (max %d secondary indexes)",
                      MAX_SECONDARY_IDX);
             return MYDB_ERR;
         }
@@ -256,11 +264,78 @@ int exec_create_table(EngineState *eng, const CreateTableStatement *s,
         strncpy(rfk.column_name,       fk.column_name.c_str(),     MAX_COLUMN_NAME - 1);
         strncpy(rfk.ref_relation_name, fk.ref_table.c_str(),       MAX_TABLE_NAME  - 1);
         strncpy(rfk.ref_column_name,   fk.ref_column.c_str(),      MAX_COLUMN_NAME - 1);
+
+        /* Map parser's on_delete string to the storage constant */
+        if (fk.on_delete == "CASCADE")
+            rfk.on_delete_action = FK_ON_DELETE_CASCADE;
+        else if (fk.on_delete == "SET_NULL")
+            rfk.on_delete_action = FK_ON_DELETE_SET_NULL;
+        else
+            rfk.on_delete_action = FK_ON_DELETE_RESTRICT;   /* default */
     }
 
     int rc = storage_create_table(&rel);
     if (rc != MYDB_OK) {
         format_error(rc, out, cap, s->table_name.c_str());
+        return rc;
+    }
+
+    snprintf(out, cap, "Query OK, 0 rows affected");
+    return MYDB_OK;
+}
+
+/* ======================================================================
+ * CREATE INDEX
+ * ====================================================================== */
+
+int exec_create_index(EngineState *eng, const CreateIndexStatement *s,
+                      char *out, size_t cap)
+{
+    REQUIRE_LOGIN(eng);
+    REQUIRE_SCHEMA(eng);
+
+    /* Resolve the table */
+    const RelationDef *rel = engine_find_relation(eng, s->table_name.c_str());
+    if (!rel) {
+        snprintf(out, cap, "ERROR: table '%s' does not exist",
+                 s->table_name.c_str());
+        return MYDB_ERR_NOT_FOUND;
+    }
+
+    /* Find the column */
+    int col_idx = -1;
+    for (int i = 0; i < rel->num_columns; i++) {
+        if (s->column_name == rel->columns[i].name) {
+            col_idx = i;
+            break;
+        }
+    }
+    if (col_idx < 0) {
+        snprintf(out, cap, "ERROR: column '%s' not found in table '%s'",
+                 s->column_name.c_str(), s->table_name.c_str());
+        return MYDB_ERR_NOT_FOUND;
+    }
+
+    /* Cannot index the primary key column — it is already the clustered index */
+    if (col_idx == rel->pk_col_idx) {
+        snprintf(out, cap,
+                 "ERROR: column '%s' is the PRIMARY KEY — already indexed",
+                 s->column_name.c_str());
+        return MYDB_ERR;
+    }
+
+    int rc = storage_add_index((RelationDef *)rel, col_idx);
+    if (rc != MYDB_OK) {
+        if (rc == MYDB_ERR_DUPLICATE)
+            snprintf(out, cap,
+                     "ERROR: column '%s' already has a secondary index",
+                     s->column_name.c_str());
+        else if (rc == MYDB_ERR_FULL)
+            snprintf(out, cap,
+                     "ERROR: too many indexes on table '%s' (max %d)",
+                     s->table_name.c_str(), MAX_SECONDARY_IDX);
+        else
+            format_error(rc, out, cap, s->table_name.c_str());
         return rc;
     }
 

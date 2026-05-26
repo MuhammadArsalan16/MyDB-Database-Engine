@@ -588,15 +588,19 @@ static void test_execute_sql_pipeline(void)
 
     char result[1024];
 
-    /* Valid statement → parser succeeds, exec engine scaffold runs.
-     * Stub returns MYDB_ERR with a "not implemented" message until the
-     * real handler is wired in (Phase 3-5). */
+    /* Valid statement → parser succeeds, exec engine runs.
+     * Before table exists: real engine returns an ERROR message.
+     * After the stub is replaced, "not implemented" is gone and
+     * the result is either a row-set or an error from the real engine. */
     int rc = engine_execute_sql(&g_eng, "SELECT * FROM users;",
                                 result, sizeof(result));
     CHECK(rc != MYDB_OK || strstr(result, "not implemented") != NULL,
           "valid SQL → scaffold reached (not implemented or real result)");
+    /* Accept "not implemented" (stub), "(N rows)" (real, table exists),
+     * or "ERROR" (real engine, table missing — pipeline is live). */
     CHECK(strstr(result, "not implemented") != NULL ||
-          strstr(result, "row") != NULL,
+          strstr(result, "row")             != NULL ||
+          strstr(result, "ERROR")           != NULL,
           "result contains scaffold or real output");
 
     /* Garbage → parser rejects, engine reports parse error. */

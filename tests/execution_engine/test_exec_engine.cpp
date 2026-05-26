@@ -1092,6 +1092,140 @@ static void test_aggregates(void)
 }
 
 /* ======================================================================
+ * test_group_by  (sub-phase 5.4)
+ *
+ * Table: orders(id INT PK, dept VARCHAR, amount INT, active BOOL)
+ *   (1,'sales',100,TRUE)  (2,'sales',200,TRUE)
+ *   (3,'tech', 150,FALSE) (4,'tech', 300,TRUE)
+ *   (5,'hr',   250,TRUE)  (6,'hr',   100,FALSE)
+ *
+ * GROUP BY dept (std::map order = alphabetical):
+ *   hr:    COUNT=2, SUM=350, AVG=175.00, MIN=100, MAX=250
+ *   sales: COUNT=2, SUM=300, AVG=150.00, MIN=100, MAX=200
+ *   tech:  COUNT=2, SUM=450, AVG=225.00, MIN=150, MAX=300
+ * ====================================================================== */
+
+static void test_group_by(void)
+{
+    printf("\n[test_group_by]\n");
+    engine_setup();
+
+    int rc;
+
+    sql("CREATE DATABASE store;");
+    sql("USE store;");
+    sql("CREATE TABLE orders ("
+        "  id     INT PRIMARY KEY,"
+        "  dept   VARCHAR(20) NOT NULL,"
+        "  amount INT,"
+        "  active BOOL DEFAULT TRUE"
+        ");");
+
+    sql("INSERT INTO orders (id, dept, amount, active) VALUES (1, 'sales', 100, TRUE);");
+    sql("INSERT INTO orders (id, dept, amount, active) VALUES (2, 'sales', 200, TRUE);");
+    sql("INSERT INTO orders (id, dept, amount, active) VALUES (3, 'tech',  150, FALSE);");
+    sql("INSERT INTO orders (id, dept, amount, active) VALUES (4, 'tech',  300, TRUE);");
+    sql("INSERT INTO orders (id, dept, amount, active) VALUES (5, 'hr',    250, TRUE);");
+    sql("INSERT INTO orders (id, dept, amount, active) VALUES (6, 'hr',    100, FALSE);");
+
+    /* ---- basic COUNT(*) GROUP BY ---- */
+    rc = sql("SELECT dept, COUNT(*) FROM orders GROUP BY dept;");
+    CHECK(rc == MYDB_OK,                          "GB COUNT(*) → MYDB_OK");
+    CHECK(strstr(g_res, "(3 rows)")  != NULL,     "GB COUNT(*) → 3 groups");
+    CHECK(strstr(g_res, "hr")        != NULL,     "GB COUNT(*) → hr present");
+    CHECK(strstr(g_res, "sales")     != NULL,     "GB COUNT(*) → sales present");
+    CHECK(strstr(g_res, "tech")      != NULL,     "GB COUNT(*) → tech present");
+
+    /* ---- SUM GROUP BY ---- */
+    rc = sql("SELECT dept, SUM(amount) FROM orders GROUP BY dept;");
+    CHECK(rc == MYDB_OK,                          "GB SUM → MYDB_OK");
+    CHECK(strstr(g_res, "350") != NULL,           "GB SUM → hr=350");
+    CHECK(strstr(g_res, "300") != NULL,           "GB SUM → sales=300");
+    CHECK(strstr(g_res, "450") != NULL,           "GB SUM → tech=450");
+
+    /* ---- AVG GROUP BY ---- */
+    rc = sql("SELECT dept, AVG(amount) FROM orders GROUP BY dept;");
+    CHECK(rc == MYDB_OK,                          "GB AVG → MYDB_OK");
+    CHECK(strstr(g_res, "175.00") != NULL,        "GB AVG → hr=175.00");
+    CHECK(strstr(g_res, "150.00") != NULL,        "GB AVG → sales=150.00");
+    CHECK(strstr(g_res, "225.00") != NULL,        "GB AVG → tech=225.00");
+
+    /* ---- MIN / MAX GROUP BY ---- */
+    rc = sql("SELECT dept, MIN(amount), MAX(amount) FROM orders GROUP BY dept;");
+    CHECK(rc == MYDB_OK,                          "GB MIN/MAX → MYDB_OK");
+    CHECK(strstr(g_res, "(3 rows)") != NULL,      "GB MIN/MAX → 3 groups");
+
+    /* ---- multiple aggregates in one GROUP BY query ---- */
+    rc = sql("SELECT dept, COUNT(*), SUM(amount), AVG(amount) FROM orders GROUP BY dept;");
+    CHECK(rc == MYDB_OK,                          "GB multi-agg → MYDB_OK");
+    CHECK(strstr(g_res, "(3 rows)") != NULL,      "GB multi-agg → 3 groups");
+
+    /* ---- GROUP BY without aggregates (dedup / DISTINCT equivalent) ---- */
+    rc = sql("SELECT dept FROM orders GROUP BY dept;");
+    CHECK(rc == MYDB_OK,                          "GB no-agg dedup → MYDB_OK");
+    CHECK(strstr(g_res, "(3 rows)") != NULL,      "GB no-agg → 3 distinct depts");
+
+    /* ---- HAVING on GROUP BY column (Option A) ---- */
+    rc = sql("SELECT dept, COUNT(*) FROM orders GROUP BY dept HAVING dept = 'sales';");
+    CHECK(rc == MYDB_OK,                          "GB HAVING dept='sales' → MYDB_OK");
+    CHECK(strstr(g_res, "sales")    != NULL,      "GB HAVING → sales present");
+    CHECK(strstr(g_res, "(1 row)")  != NULL,      "GB HAVING → exactly 1 group");
+
+    /* ---- ORDER BY on GROUP BY column ---- */
+    rc = sql("SELECT dept, COUNT(*) FROM orders GROUP BY dept ORDER BY dept;");
+    CHECK(rc == MYDB_OK,                          "GB ORDER BY dept → MYDB_OK");
+    CHECK(strstr(g_res, "(3 rows)") != NULL,      "GB ORDER BY → 3 rows");
+    /* alphabetical: hr first, tech last */
+    const char *hr_pos    = strstr(g_res, "hr");
+    const char *tech_pos  = strstr(g_res, "tech");
+    CHECK(hr_pos && tech_pos && hr_pos < tech_pos,
+          "GB ORDER BY dept ASC → hr before tech");
+
+    /* ---- ORDER BY DESC ---- */
+    rc = sql("SELECT dept, COUNT(*) FROM orders GROUP BY dept ORDER BY dept DESC;");
+    CHECK(rc == MYDB_OK,                          "GB ORDER BY DESC → MYDB_OK");
+    hr_pos   = strstr(g_res, "hr");
+    tech_pos = strstr(g_res, "tech");
+    CHECK(hr_pos && tech_pos && tech_pos < hr_pos,
+          "GB ORDER BY dept DESC → tech before hr");
+
+    /* ---- LIMIT on GROUP BY result ---- */
+    rc = sql("SELECT dept, COUNT(*) FROM orders GROUP BY dept ORDER BY dept LIMIT 2;");
+    CHECK(rc == MYDB_OK,                          "GB LIMIT 2 → MYDB_OK");
+    CHECK(strstr(g_res, "(2 rows)") != NULL,      "GB LIMIT 2 → exactly 2 rows");
+
+    /* ---- multi-column GROUP BY ---- */
+    rc = sql("SELECT dept, active, COUNT(*) FROM orders GROUP BY dept, active;");
+    CHECK(rc == MYDB_OK,                          "GB multi-col → MYDB_OK");
+    /* 5 groups: (hr,F),(hr,T),(sales,T),(tech,F),(tech,T) */
+    CHECK(strstr(g_res, "(5 rows)") != NULL,      "GB multi-col → 5 groups");
+
+    /* ---- WHERE + GROUP BY ---- */
+    rc = sql("SELECT dept, COUNT(*) FROM orders WHERE amount > 150 GROUP BY dept;");
+    CHECK(rc == MYDB_OK,                          "WHERE + GB → MYDB_OK");
+    /* amount>150: sales(200), tech(300), hr(250) → each dept has 1 row */
+    CHECK(strstr(g_res, "(3 rows)") != NULL,      "WHERE + GB → 3 groups (1 each)");
+
+    /* ---- error: SELECT * with GROUP BY ---- */
+    rc = sql("SELECT * FROM orders GROUP BY dept;");
+    CHECK(rc != MYDB_OK,                          "SELECT * GB → error");
+    CHECK(strstr(g_res, "GROUP BY") != NULL,      "SELECT * GB → mentions GROUP BY");
+
+    /* ---- error: non-GB column in SELECT without aggregate ---- */
+    rc = sql("SELECT id, dept, COUNT(*) FROM orders GROUP BY dept;");
+    CHECK(rc != MYDB_OK,                          "non-GB col → error");
+    CHECK(strstr(g_res, "id") != NULL,            "non-GB col → mentions 'id'");
+
+    /* ---- error: GROUP BY on nonexistent column ---- */
+    rc = sql("SELECT dept, COUNT(*) FROM orders GROUP BY nosuchcol;");
+    CHECK(rc != MYDB_OK,                          "GB bad col → error");
+    CHECK(strstr(g_res, "nosuchcol") != NULL,     "GB bad col → mentions column");
+
+    engine_teardown();
+}
+
+
+/* ======================================================================
  * main
  * ====================================================================== */
 
@@ -1106,6 +1240,7 @@ int main(void)
     test_insert();
     test_select();
     test_aggregates();
+    test_group_by();
 
     rm_rf(TEST_ROOT);
 

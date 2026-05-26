@@ -299,7 +299,7 @@ static void test_persistence_round_trip(void)
     schema_create(TEST_FILE, TEST_PID, TEST_NAME, &sf);
     RelationDef d = make_simple_def("persisted");
     schema_add_relation(&sf, &d);
-    schema_update_stats(&sf, "persisted", 100, 5, 80);
+    schema_update_stats(&sf, "persisted", 100, 5, 3);
     schema_close(&sf);
 
     SchemaFile sf2;
@@ -311,7 +311,7 @@ static void test_persistence_round_trip(void)
     CHECK(stat != NULL,                  "relation slot recovered");
     CHECK(stat->num_rows == 100,         "num_rows persisted");
     CHECK(stat->num_pages == 5,          "num_pages persisted");
-    CHECK(stat->avg_row_size == 80,      "avg_row_size persisted");
+    CHECK(stat->tree_height == 3,        "tree_height persisted");
 
     /* size_bytes is computed at load — verify */
     CHECK(sf2.header.size_bytes == (uint64_t)5 * PAGE_SIZE,
@@ -482,9 +482,9 @@ static void test_size_bytes_multi(void)
     schema_add_relation(&sf, &b);
     schema_add_relation(&sf, &c);
 
-    schema_update_stats(&sf, "a", 0, 3, 0);
-    schema_update_stats(&sf, "b", 0, 7, 0);
-    schema_update_stats(&sf, "c", 0, 1, 0);
+    schema_update_stats(&sf, "a", 0, 3, 1);
+    schema_update_stats(&sf, "b", 0, 7, 1);
+    schema_update_stats(&sf, "c", 0, 1, 1);
 
     CHECK(sf.header.size_bytes == (uint64_t)(3 + 7 + 1) * PAGE_SIZE,
           "size_bytes sums num_pages * PAGE_SIZE across slots");

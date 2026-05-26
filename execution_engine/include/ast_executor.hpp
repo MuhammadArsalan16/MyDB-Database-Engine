@@ -50,6 +50,8 @@ int exec_tcl(EngineState *eng, const TransactionStatement *s,
  * ------------------------------------------------------------------ */
 int exec_create_table   (EngineState *eng, const CreateTableStatement    *s,
                          char *out, size_t cap);
+int exec_create_index   (EngineState *eng, const CreateIndexStatement    *s,
+                         char *out, size_t cap);
 int exec_drop_table     (EngineState *eng, const DropTableStatement      *s,
                          char *out, size_t cap);
 int exec_create_database(EngineState *eng, const CreateDatabaseStatement *s,

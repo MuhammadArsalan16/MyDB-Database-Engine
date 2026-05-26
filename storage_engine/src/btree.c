@@ -562,7 +562,10 @@ int btree_insert(BTree *bt, const Value *key,
             leaf_search(page, enc_key, enc_len, bt->key_type, &slot, &found);
             bp_unpin_page(bt->bp, bt->table_id, cur_pno, 0);
 
-            if (found) return MYDB_ERR_DUPLICATE;
+            /* Non-unique secondary indexes (is_secondary==2) allow duplicate
+             * keys — all rows with the same key sit adjacent in leaf order,
+             * so a range cursor naturally reads them all. */
+            if (found && bt->is_secondary != 2) return MYDB_ERR_DUPLICATE;
             path[depth++] = cur_pno;
             break;
         }
@@ -735,6 +738,32 @@ static uint32_t find_leftmost_leaf(BTree *bt)
         }
 
         uint32_t next = hdr.prev_page; /* leftmost child */
+        bp_unpin_page(bt->bp, bt->table_id, pno, 0);
+        pno = next;
+    }
+}
+
+uint8_t btree_compute_height(BTree *bt)
+{
+    if (bt->root_page_no == INVALID_PAGE) return 0;
+
+    uint8_t  h   = 0;
+    uint32_t pno = bt->root_page_no;
+
+    while (1) {
+        uint8_t *page = bp_fetch_page(bt->bp, bt->dm, bt->table_id, pno);
+        if (!page) return h;   /* best-effort on I/O error */
+        h++;
+
+        PageHeader hdr;
+        page_read_header(page, &hdr);
+
+        if (hdr.page_type != PAGE_TYPE_INTERNAL) {
+            bp_unpin_page(bt->bp, bt->table_id, pno, 0);
+            return h;
+        }
+
+        uint32_t next = hdr.prev_page;  /* leftmost child */
         bp_unpin_page(bt->bp, bt->table_id, pno, 0);
         pno = next;
     }

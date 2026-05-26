@@ -37,7 +37,8 @@ typedef struct {
     uint8_t  num_columns;
     uint32_t num_rows;                /* maintained by INSERT/DELETE callers */
     uint32_t num_pages;               /* persisted source of truth for size */
-    uint16_t avg_row_size;
+    uint8_t  tree_height;             /* B+ tree height (1 = root only); CBO cost input */
+    uint8_t  reserved;               /* reserved for future CBO fields */
 } RelationEntry;
 
 /* In-memory schema file representation. relations[i] and defs[i] are
@@ -98,11 +99,11 @@ RelationEntry *schema_find_relation_stat(SchemaFile *sf, const char *relation_na
  * changes. Does NOT touch Page 0. */
 int schema_flush_relation(SchemaFile *sf, const char *relation_name);
 
-/* Update optimizer-stat fields (num_rows, num_pages, avg_row_size) on
+/* Update optimizer-stat fields (num_rows, num_pages, tree_height) on
  * the relation's slot and persist Page 0. */
 int schema_update_stats(SchemaFile *sf, const char *relation_name,
                         uint32_t num_rows, uint32_t num_pages,
-                        uint16_t avg_row_size);
+                        uint8_t tree_height);
 
 /* Increment (delta>0) or decrement (delta<0) the persisted num_pages
  * counter for one relation slot and persist Page 0. Refuses to drive
@@ -114,6 +115,16 @@ int schema_update_stats(SchemaFile *sf, const char *relation_name,
  * single-responsibility split). */
 int schema_bump_relation_pages(SchemaFile *sf, const char *relation_name,
                                int32_t delta);
+
+/* Increment (delta>0) or decrement (delta<0) the persisted num_rows
+ * counter for one relation slot and persist Page 0. Refuses to drive
+ * the counter below 0. Returns MYDB_ERR_NOT_FOUND if no valid slot
+ * matches `relation_name`.
+ *
+ * Called by storage.c after every successful storage_insert (+1) and
+ * storage_delete (-1) to keep num_rows accurate for the CBO. */
+int schema_bump_relation_rows(SchemaFile *sf, const char *relation_name,
+                              int32_t delta);
 
 /* Sum of (entry.num_pages * PAGE_SIZE) across valid slots. Computed
  * fresh — never read from disk. */

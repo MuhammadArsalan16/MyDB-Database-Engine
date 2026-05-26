@@ -33,7 +33,8 @@
 /*    34        : num_columns (uint8)                                 */
 /*    35..38    : num_rows (uint32)                                   */
 /*    39..42    : num_pages (uint32)                                  */
-/*    43..44    : avg_row_size (uint16)                               */
+/*    43        : tree_height (uint8) — B+ tree height, CBO cost input */
+/*    44        : reserved (uint8)                                    */
 /*    45..55    : reserved (11 B)                                     */
 /* ------------------------------------------------------------------ */
 
@@ -243,10 +244,11 @@ static int relation_def_serialize(const RelationDef *r, uint8_t *page)
     /* foreign keys */
     for (int i = 0; i < r->num_foreign_keys; i++) {
         const ForeignKey *fk = &r->foreign_keys[i];
-        put_bytes(page, &off, fk->constraint_name, MAX_COLUMN_NAME);
-        put_bytes(page, &off, fk->column_name,     MAX_COLUMN_NAME);
+        put_bytes(page, &off, fk->constraint_name,    MAX_COLUMN_NAME);
+        put_bytes(page, &off, fk->column_name,        MAX_COLUMN_NAME);
         put_bytes(page, &off, fk->ref_relation_name,  MAX_TABLE_NAME);
-        put_bytes(page, &off, fk->ref_column_name, MAX_COLUMN_NAME);
+        put_bytes(page, &off, fk->ref_column_name,    MAX_COLUMN_NAME);
+        put_u8   (page, &off, fk->on_delete_action);
 
         if (off > PAGE_SIZE) return MYDB_ERR;
     }
@@ -303,10 +305,11 @@ static int relation_def_deserialize(RelationDef *r, const uint8_t *page)
 
     for (int i = 0; i < r->num_foreign_keys; i++) {
         ForeignKey *fk = &r->foreign_keys[i];
-        get_bytes(page, &off, fk->constraint_name, MAX_COLUMN_NAME);
-        get_bytes(page, &off, fk->column_name,     MAX_COLUMN_NAME);
-        get_bytes(page, &off, fk->ref_relation_name,  MAX_TABLE_NAME);
-        get_bytes(page, &off, fk->ref_column_name, MAX_COLUMN_NAME);
+        get_bytes(page, &off, fk->constraint_name,   MAX_COLUMN_NAME);
+        get_bytes(page, &off, fk->column_name,       MAX_COLUMN_NAME);
+        get_bytes(page, &off, fk->ref_relation_name, MAX_TABLE_NAME);
+        get_bytes(page, &off, fk->ref_column_name,   MAX_COLUMN_NAME);
+        fk->on_delete_action = get_u8(page, &off);
     }
 
     return MYDB_OK;
@@ -347,7 +350,8 @@ static void serialize_relation_entry(uint8_t *buf, const RelationEntry *e)
     buf[34] = e->num_columns;
     memcpy(buf + 35, &e->num_rows,     4);
     memcpy(buf + 39, &e->num_pages,    4);
-    memcpy(buf + 43, &e->avg_row_size, 2);
+    buf[43] = e->tree_height;
+    buf[44] = e->reserved;
     /* bytes 45..55 zeroed by caller */
 }
 
@@ -360,7 +364,8 @@ static void deserialize_relation_entry(const uint8_t *buf, RelationEntry *e)
     e->num_columns  = buf[34];
     memcpy(&e->num_rows,     buf + 35, 4);
     memcpy(&e->num_pages,    buf + 39, 4);
-    memcpy(&e->avg_row_size, buf + 43, 2);
+    e->tree_height = buf[43];
+    e->reserved    = buf[44];
 }
 
 static void pack_page0(const SchemaFile *sf, uint8_t *buf)
@@ -585,9 +590,10 @@ int schema_add_relation(SchemaFile *sf, const RelationDef *def)
     e->is_valid     = 1;
     e->page_no      = pno;
     e->num_columns  = def->num_columns;
-    e->num_rows     = 0;
-    e->num_pages    = 0;
-    e->avg_row_size = 0;
+    e->num_rows    = 0;
+    e->num_pages   = 0;
+    e->tree_height = 1;   /* root page exists; tree starts at height 1 */
+    e->reserved    = 0;
 
     sf->defs[slot] = *def;
     sf->header.num_relations++;
@@ -652,7 +658,7 @@ int schema_flush_relation(SchemaFile *sf, const char *relation_name)
 
 int schema_update_stats(SchemaFile *sf, const char *relation_name,
                         uint32_t num_rows, uint32_t num_pages,
-                        uint16_t avg_row_size)
+                        uint8_t tree_height)
 {
     if (!sf || !relation_name || sf->fd < 0) return MYDB_ERR;
 
@@ -660,9 +666,9 @@ int schema_update_stats(SchemaFile *sf, const char *relation_name,
     if (slot < 0) return MYDB_ERR_NOT_FOUND;
 
     RelationEntry *e = &sf->relations[slot];
-    e->num_rows     = num_rows;
-    e->num_pages    = num_pages;
-    e->avg_row_size = avg_row_size;
+    e->num_rows    = num_rows;
+    e->num_pages   = num_pages;
+    e->tree_height = tree_height;
     sf->header.size_bytes = schema_compute_size_bytes(sf);
 
     return schema_save_page0(sf);
@@ -685,6 +691,25 @@ int schema_bump_relation_pages(SchemaFile *sf, const char *relation_name,
 
     e->num_pages = (uint32_t)((int64_t)e->num_pages + delta);
     sf->header.size_bytes = schema_compute_size_bytes(sf);
+
+    return schema_save_page0(sf);
+}
+
+int schema_bump_relation_rows(SchemaFile *sf, const char *relation_name,
+                              int32_t delta)
+{
+    if (!sf || !relation_name || sf->fd < 0) return MYDB_ERR;
+
+    int slot = find_slot(sf, relation_name);
+    if (slot < 0) return MYDB_ERR_NOT_FOUND;
+
+    RelationEntry *e = &sf->relations[slot];
+
+    /* Clamp at zero — a DELETE on a table that already reports 0 rows
+     * (e.g. after a crash during a previous bump) must not underflow. */
+    if (delta < 0 && (uint32_t)(-delta) > e->num_rows) return MYDB_ERR;
+
+    e->num_rows = (uint32_t)((int64_t)e->num_rows + delta);
 
     return schema_save_page0(sf);
 }

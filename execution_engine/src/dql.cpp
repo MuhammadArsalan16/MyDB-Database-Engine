@@ -4,8 +4,8 @@
  * Sub-phase 5.1 : single-table SELECT, projection, WHERE filtering,
  *                 LIMIT / OFFSET, access-path selection.
  * Sub-phase 5.2 : ORDER BY — materialise + sort; PK-ASC stream optimisation.
- * Sub-phase 5.3 : scalar aggregates                  (TODO)
- * Sub-phase 5.4 : GROUP BY + aggregates              (TODO)
+ * Sub-phase 5.3 : scalar aggregates.
+ * Sub-phase 5.4 : GROUP BY + aggregates, HAVING (GROUP BY columns only).
  * Sub-phase 5.5 : JOINs                              (TODO)
  */
 
@@ -16,6 +16,7 @@
 #include "expr_eval.hpp"
 
 #include <algorithm>
+#include <map>
 #include <vector>
 #include <cstring>
 #include <cstdio>
@@ -247,7 +248,12 @@ static void agg_accumulate(AggState *states, int n,
     for (int i = 0; i < n; i++) {
         AggState             &st   = states[i];
         const SelectItem     &item = s->select_list[(size_t)i];
-        const std::string    &func = item.agg_func;
+
+        /* Skip non-aggregate items (Column / Star) — occurs in GROUP BY
+         * queries where states[] is parallel to the full select list. */
+        if (item.kind != SelectItem::Kind::Aggregate) continue;
+
+        const std::string &func = item.agg_func;
 
         /* COUNT(*) — count every row, no column access */
         if (func == "COUNT" && st.col_idx < 0) {
@@ -374,6 +380,296 @@ struct RowLess {
 };
 
 /* ======================================================================
+ * GROUP BY helpers  (sub-phase 5.4)
+ * ====================================================================== */
+
+/*
+ * Comparison key for one group — the values of every GROUP BY column.
+ *
+ * NULL handling: two NULLs in the same position are equal (grouped
+ * together), matching standard SQL behaviour.  NULL sorts before any
+ * non-NULL value so the map ordering is deterministic.
+ */
+struct GroupKey {
+    std::vector<Value> vals;
+
+    bool operator<(const GroupKey &o) const
+    {
+        for (size_t i = 0; i < vals.size(); i++) {
+            bool an = (vals[i].is_null   != 0);
+            bool bn = (o.vals[i].is_null != 0);
+            if (an && bn) continue;        /* both NULL → same bucket */
+            if (an)       return true;     /* NULL < non-NULL */
+            if (bn)       return false;
+            int c = compare_values(&vals[i], &o.vals[i]);
+            if (c != 0) return c < 0;
+        }
+        return false;   /* equal */
+    }
+};
+
+/* Extract a GroupKey from a row given pre-resolved GROUP BY column indices. */
+static GroupKey make_group_key(const Row *row, const std::vector<int> &idxs)
+{
+    GroupKey k;
+    k.vals.reserve(idxs.size());
+    for (int idx : idxs)
+        k.vals.push_back(row->cols[idx]);
+    return k;
+}
+
+/*
+ * Build a partial Row where GROUP BY column values are placed at their
+ * real positions in rel->columns[].  Every other slot is set to NULL.
+ *
+ * This Row is used for two purposes:
+ *   1. HAVING evaluation  — eval_expr sees GROUP BY col values correctly;
+ *                           non-GROUP-BY cols are NULL and comparisons
+ *                           against them will return false (safe).
+ *   2. ORDER BY sort key  — RowLess reads only the ORDER BY columns;
+ *                           if the user orders by a GROUP BY column it
+ *                           finds the correct value; other columns are NULL
+ *                           (will compare as equal, which is fine).
+ */
+static Row make_key_row(const GroupKey      &key,
+                        const std::vector<int> &idxs,
+                        int                  num_cols)
+{
+    Row r;
+    memset(&r, 0, sizeof(r));
+    for (int i = 0; i < num_cols; i++) r.cols[i].is_null = 1;
+    for (size_t i = 0; i < idxs.size(); i++) r.cols[idxs[i]] = key.vals[i];
+    return r;
+}
+
+/*
+ * Emit one GROUP BY result row.
+ *
+ * states[] is parallel to s->select_list:
+ *   Column items   → value taken from key_row at the column's real index.
+ *   Aggregate items → value computed from states[i].
+ */
+static void emit_group_row(ResultBuf               &rb,
+                           const RelationDef       *rel,
+                           const SelectStatement   *s,
+                           const Row               &key_row,
+                           const std::vector<AggState> &states)
+{
+    char tmp[64];
+    bool first = true;
+
+    for (size_t i = 0; i < s->select_list.size(); i++) {
+        if (!first) rb.append(" | ");
+        first = false;
+
+        const SelectItem &item = s->select_list[i];
+
+        if (item.kind == SelectItem::Kind::Column) {
+            int idx = resolve_col(rel, item.column);
+            if (idx >= 0) rb.append_value(key_row.cols[idx], rel->columns[idx]);
+            else          rb.append("NULL");
+
+        } else if (item.kind == SelectItem::Kind::Aggregate) {
+            const AggState    &st   = states[i];
+            const std::string &func = item.agg_func;
+
+            if (func == "COUNT") {
+                snprintf(tmp, sizeof(tmp), "%lld", (long long)st.count);
+                rb.append(tmp);
+
+            } else if (func == "SUM") {
+                if (!st.has_value) {
+                    rb.append("NULL");
+                } else if (st.col_idx >= 0 &&
+                           rel->columns[st.col_idx].type == TYPE_INT) {
+                    snprintf(tmp, sizeof(tmp), "%lld", (long long)(int64_t)st.sum);
+                    rb.append(tmp);
+                } else {
+                    int scale = (st.col_idx >= 0 && rel->columns[st.col_idx].scale > 0)
+                                ? rel->columns[st.col_idx].scale : 2;
+                    char fmt[16];
+                    snprintf(fmt, sizeof(fmt), "%%.%df", scale);
+                    snprintf(tmp, sizeof(tmp), fmt, st.sum);
+                    rb.append(tmp);
+                }
+
+            } else if (func == "AVG") {
+                if (st.count == 0) rb.append("NULL");
+                else {
+                    snprintf(tmp, sizeof(tmp), "%.2f", st.sum / (double)st.count);
+                    rb.append(tmp);
+                }
+
+            } else if (func == "MIN" || func == "MAX") {
+                if (!st.has_value) rb.append("NULL");
+                else {
+                    const Value &val = (func == "MIN") ? st.min_val : st.max_val;
+                    if (st.col_idx >= 0)
+                        rb.append_value(val, rel->columns[st.col_idx]);
+                    else
+                        rb.append("NULL");
+                }
+            }
+        }
+        /* SelectItem::Kind::Star is blocked by the pre-check in exec_select */
+    }
+    rb.append("\n");
+}
+
+/*
+ * GROUP BY execution path.
+ *
+ * Called by exec_select after all pre-checks pass.  Performs a full
+ * scan, groups rows by the GROUP BY columns, accumulates aggregates
+ * per group, applies HAVING, sorts (ORDER BY), slices (LIMIT/OFFSET),
+ * and emits.
+ *
+ * states[] in the group map is parallel to s->select_list:
+ *   - Aggregate slots are live (col_idx, counters, etc.).
+ *   - Column slots are zero-initialised and never read.
+ */
+static int exec_group_by(const SelectStatement *s,
+                         const RelationDef     *rel,
+                         RelationDef           *rel_rw,
+                         char *out, size_t cap)
+{
+    /* Resolve GROUP BY column indices (already validated). */
+    std::vector<int> grp_idxs;
+    grp_idxs.reserve(s->group_by.size());
+    for (const auto &name : s->group_by)
+        grp_idxs.push_back(resolve_col(rel, name));
+
+    int n_sel = (int)s->select_list.size();
+
+    /* Build the zero-initialised AggState template (parallel to select_list).
+     * Non-aggregate slots stay zeroed — agg_accumulate skips them. */
+    std::vector<AggState> agg_tmpl((size_t)n_sel);
+    for (int i = 0; i < n_sel; i++) {
+        const SelectItem &item = s->select_list[(size_t)i];
+        if (item.kind != SelectItem::Kind::Aggregate) continue;
+        agg_tmpl[(size_t)i].col_idx =
+            (item.column == "*") ? -1 : resolve_col(rel, item.column);
+    }
+
+    /* Map: GroupKey → AggState vector.
+     * insert_order preserves first-seen order for stable output
+     * when there is no ORDER BY clause. */
+    std::map<GroupKey, std::vector<AggState>> groups;
+    std::vector<GroupKey> insert_order;
+
+    /* Feed one candidate row into the group map. */
+    auto feed_row = [&](const Row *row) {
+        if (!where_matches(s->where_clause.get(), rel, row)) return;
+
+        GroupKey key = make_group_key(row, grp_idxs);
+
+        auto [it, inserted] = groups.emplace(key, agg_tmpl);
+        if (inserted) insert_order.push_back(key);
+
+        agg_accumulate(it->second.data(), n_sel, s, rel, row);
+    };
+
+    /* Full scan — GROUP BY must see every row. */
+    AccessPath ap = pick_access_path(s->where_clause.get(), rel);
+
+    switch (ap.kind) {
+    case AP_GET_PK: {
+        Row *r = storage_get_by_pk(rel_rw, &ap.key);
+        if (r) feed_row(r);
+        break;
+    }
+    case AP_GET_INDEX: {
+        Row *r = storage_get_by_index(rel_rw, ap.col_idx, &ap.key);
+        if (r) feed_row(r);
+        break;
+    }
+    case AP_SCAN_FROM: {
+        Cursor *cur = storage_scan_from(rel_rw, &ap.key);
+        if (cur) {
+            Row *r;
+            while ((r = cursor_next(cur)) != NULL) feed_row(r);
+            cursor_close(cur);
+        }
+        break;
+    }
+    default: {
+        Cursor *cur = storage_scan(rel_rw);
+        if (cur) {
+            Row *r;
+            while ((r = cursor_next(cur)) != NULL) feed_row(r);
+            cursor_close(cur);
+        }
+        break;
+    }
+    }
+
+    /* Apply HAVING and build the final result list.
+     * key_row has GROUP BY column values at their real positions; all
+     * other columns are NULL.  HAVING (Option A: GROUP BY cols only)
+     * is evaluated directly by eval_expr against this row. */
+    using GResult = std::pair<Row, std::vector<AggState>>;
+    std::vector<GResult> results;
+    results.reserve(groups.size());
+
+    for (const auto &key : insert_order) {
+        const std::vector<AggState> &st = groups[key];
+        Row key_row = make_key_row(key, grp_idxs, (int)rel->num_columns);
+
+        if (s->having && !eval_expr(s->having.get(), rel, &key_row))
+            continue;
+
+        results.emplace_back(key_row, st);
+    }
+
+    /* ORDER BY — RowLess operates on key_row, which has correct values
+     * for GROUP BY columns and NULL for everything else.  Ordering by a
+     * non-GROUP-BY column will see NULLs and treat all groups as equal
+     * for that column (consistent, no crash). */
+    if (!s->order_by.empty()) {
+        RowLess row_cmp { rel, &s->order_by };
+
+        size_t total = results.size();
+        size_t start = ((size_t)s->offset < total) ? (size_t)s->offset : total;
+        size_t end   = (s->limit >= 0)
+                       ? std::min(start + (size_t)s->limit, total)
+                       : total;
+
+        auto pair_cmp = [&row_cmp](const GResult &a, const GResult &b) {
+            return row_cmp(a.first, b.first);
+        };
+
+        if (end > 0 && end < total)
+            std::partial_sort(results.begin(),
+                              results.begin() + (ptrdiff_t)end,
+                              results.end(), pair_cmp);
+        else if (total > 1)
+            std::sort(results.begin(), results.end(), pair_cmp);
+
+        ResultBuf rb(out, cap);
+        emit_header(rb, rel, s);
+        for (size_t i = start; i < end; i++)
+            emit_group_row(rb, rel, s, results[i].first, results[i].second);
+        rb.finalize(end - start);
+        return MYDB_OK;
+    }
+
+    /* No ORDER BY — insertion order, slice by LIMIT/OFFSET. */
+    size_t total = results.size();
+    size_t start = ((size_t)s->offset < total) ? (size_t)s->offset : total;
+    size_t end   = (s->limit >= 0)
+                   ? std::min(start + (size_t)s->limit, total)
+                   : total;
+
+    ResultBuf rb(out, cap);
+    emit_header(rb, rel, s);
+    for (size_t i = start; i < end; i++)
+        emit_group_row(rb, rel, s, results[i].first, results[i].second);
+    rb.finalize(end - start);
+    return MYDB_OK;
+}
+
+
+/* ======================================================================
  * exec_select — entry point
  * ====================================================================== */
 
@@ -400,22 +696,20 @@ int exec_select(EngineState *eng, const SelectStatement *s,
         snprintf(out, cap, "not implemented: JOIN");
         return MYDB_ERR;
     }
-    if (!s->group_by.empty()) {
-        snprintf(out, cap, "not implemented: GROUP BY");
-        return MYDB_ERR;
-    }
 
-    /* Mixing aggregate and non-aggregate columns without GROUP BY is
-     * undefined — which non-aggregate value would appear in the result? */
-    if (has_agg && has_col) {
+    /* Without GROUP BY: mixing aggregate and non-aggregate columns is
+     * undefined (which non-aggregate value would appear in the result?).
+     * With GROUP BY this mix is valid — non-agg cols must be in GROUP BY. */
+    if (has_agg && has_col && s->group_by.empty()) {
         snprintf(out, cap,
                  "ERROR: cannot mix aggregate and non-aggregate columns "
                  "without GROUP BY");
         return MYDB_ERR;
     }
 
-    /* ORDER BY is not meaningful for scalar aggregates (one-row result) */
-    if (has_agg && !s->order_by.empty()) {
+    /* ORDER BY is not meaningful for scalar aggregates (one-row result).
+     * With GROUP BY, ORDER BY applies to the grouped result — allowed. */
+    if (has_agg && !s->order_by.empty() && s->group_by.empty()) {
         snprintf(out, cap,
                  "ERROR: ORDER BY is not applicable to scalar aggregates");
         return MYDB_ERR;
@@ -436,6 +730,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
                  s->table_name.c_str());
         return MYDB_ERR_NOT_FOUND;
     }
+    RelationDef *rel_rw = (RelationDef *)rel;   /* storage API takes non-const */
 
     /* ------------------------------------------------------------------
      * Step 2: validate projection columns.
@@ -498,7 +793,58 @@ int exec_select(EngineState *eng, const SelectStatement *s,
     }
 
     /* ------------------------------------------------------------------
-     * Step 5b: decide execution strategy.
+     * Step 5b: GROUP BY pre-checks and routing.
+     * ------------------------------------------------------------------ */
+    if (!s->group_by.empty()) {
+
+        /* SELECT * with GROUP BY is ambiguous — which columns form the key? */
+        if (s->is_select_all) {
+            snprintf(out, cap, "ERROR: SELECT * is not allowed with GROUP BY");
+            return MYDB_ERR;
+        }
+
+        /* All GROUP BY columns must exist in the relation. */
+        for (const auto &col_name : s->group_by) {
+            if (resolve_col(rel, col_name) < 0) {
+                snprintf(out, cap,
+                         "ERROR: column '%s' does not exist in table '%s'",
+                         col_name.c_str(), s->table_name.c_str());
+                return MYDB_ERR;
+            }
+        }
+
+        /* Every non-aggregate SELECT column must appear in the GROUP BY list.
+         * Standard SQL: a non-grouped column has no single value per group. */
+        for (const auto &item : s->select_list) {
+            if (item.kind != SelectItem::Kind::Column) continue;
+            bool in_grp = false;
+            for (const auto &gc : s->group_by)
+                if (gc == item.column) { in_grp = true; break; }
+            if (!in_grp) {
+                snprintf(out, cap,
+                         "ERROR: column '%s' must appear in GROUP BY or be "
+                         "used in an aggregate function",
+                         item.column.c_str());
+                return MYDB_ERR;
+            }
+        }
+
+        /* HAVING expression columns must exist in the relation. */
+        if (s->having) {
+            const char *bad = validate_expr_cols(s->having.get(), rel);
+            if (bad) {
+                snprintf(out, cap,
+                         "ERROR: column '%s' does not exist in table '%s'",
+                         bad, s->table_name.c_str());
+                return MYDB_ERR;
+            }
+        }
+
+        return exec_group_by(s, rel, rel_rw, out, cap);
+    }
+
+    /* ------------------------------------------------------------------
+     * Step 5c: decide execution strategy for non-GROUP-BY queries.
      *
      * PK-ASC optimisation: if the first ORDER BY column is the PK and
      * direction is ASC, the B+ tree already returns rows in the correct
@@ -517,10 +863,9 @@ int exec_select(EngineState *eng, const SelectStatement *s,
     }
 
     /* ------------------------------------------------------------------
-     * Step 6: choose access path (pure AST inspection — zero I/O).
+     * Step 5d: choose access path (pure AST inspection — zero I/O).
      * ------------------------------------------------------------------ */
-    AccessPath   ap     = pick_access_path(s->where_clause.get(), rel);
-    RelationDef *rel_rw = (RelationDef *)rel;   /* storage takes non-const */
+    AccessPath ap = pick_access_path(s->where_clause.get(), rel);
 
     /* ==================================================================
      * AGGREGATE PATH — all SELECT items are aggregate functions.

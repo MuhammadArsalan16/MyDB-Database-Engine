@@ -25,6 +25,10 @@ int exec_dispatch(EngineState *eng, const ASTNode *node,
         return exec_create_table(eng,
                                  static_cast<const CreateTableStatement *>(node),
                                  out, cap);
+    case StatementType::CREATE_INDEX:
+        return exec_create_index(eng,
+                                 static_cast<const CreateIndexStatement *>(node),
+                                 out, cap);
     case StatementType::DROP_TABLE:
         return exec_drop_table(eng,
                                static_cast<const DropTableStatement *>(node),

@@ -59,9 +59,10 @@ std::string Parser::parse_qualified_ident() {
 std::unique_ptr<ASTNode> Parser::parse() {
     if (match(TokenType::KEYWORD, "SELECT")) return parse_select();
     if (match(TokenType::KEYWORD, "CREATE")) {
-        if (peek().value == "TABLE") return parse_create_table();
+        if (peek().value == "TABLE")                             return parse_create_table();
         if (peek().value == "DATABASE" || peek().value == "SCHEMA") return parse_create_database();
-        throw_error("Expected TABLE or DATABASE after CREATE");
+        if (peek().value == "INDEX")                             return parse_create_index();
+        throw_error("Expected TABLE, DATABASE, or INDEX after CREATE");
     }
     if (match(TokenType::KEYWORD, "DROP")) {
         if (peek().value == "TABLE") return parse_drop_table();
@@ -264,7 +265,8 @@ std::unique_ptr<CreateTableStatement> Parser::parse_create_table() {
     do {
         bool is_constraint = false;
         Token t = peek();
-        if (t.type == TokenType::KEYWORD && (t.value == "CONSTRAINT" || t.value == "PRIMARY" || t.value == "FOREIGN")) {
+        if (t.type == TokenType::KEYWORD && (t.value == "CONSTRAINT" || t.value == "PRIMARY"
+                                              || t.value == "FOREIGN" || t.value == "INDEX")) {
             is_constraint = true;
         }
 
@@ -293,17 +295,46 @@ std::unique_ptr<CreateTableStatement> Parser::parse_create_table() {
                 std::string col_name = parse_qualified_ident();
                 consume(TokenType::SYMBOL, ")", "Expected )");
                 consume(TokenType::KEYWORD, "REFERENCES", "Expected REFERENCES");
-                std::string ref_table = advance().value;
+                Token ref_table_tok = advance();
+                if (ref_table_tok.type != TokenType::IDENTIFIER && ref_table_tok.type != TokenType::KEYWORD)
+                    throw_error("Expected referenced table name");
+                std::string ref_table = ref_table_tok.value;
                 consume(TokenType::SYMBOL, "(", "Expected (");
                 std::string ref_col = parse_qualified_ident();
                 consume(TokenType::SYMBOL, ")", "Expected )");
-                
+
                 AstForeignKey fk;
                 fk.constraint_name = constraint_name;
-                fk.column_name = col_name;
-                fk.ref_table = ref_table;
-                fk.ref_column = ref_col;
+                fk.column_name     = col_name;
+                fk.ref_table       = ref_table;
+                fk.ref_column      = ref_col;
+                fk.on_delete       = "RESTRICT";    /* default */
+
+                /* Optional ON DELETE action */
+                if (match(TokenType::KEYWORD, "ON")) {
+                    consume(TokenType::KEYWORD, "DELETE", "Expected DELETE after ON");
+                    if (match(TokenType::KEYWORD, "CASCADE")) {
+                        fk.on_delete = "CASCADE";
+                    } else if (match(TokenType::KEYWORD, "RESTRICT")) {
+                        fk.on_delete = "RESTRICT";
+                    } else if (match(TokenType::KEYWORD, "SET")) {
+                        consume(TokenType::KEYWORD, "NULL", "Expected NULL after SET");
+                        fk.on_delete = "SET_NULL";
+                    } else {
+                        throw_error("Expected CASCADE, RESTRICT, or SET NULL after ON DELETE");
+                    }
+                }
+
                 stmt->foreign_keys.push_back(fk);
+            } else if (match(TokenType::KEYWORD, "INDEX")) {
+                /* Table-level non-unique index: [CONSTRAINT name] INDEX ON col_name */
+                consume(TokenType::KEYWORD, "ON", "Expected ON after INDEX");
+                std::string col_name = parse_qualified_ident();
+                bool found = false;
+                for (auto& c : stmt->columns) {
+                    if (c.name == col_name) { c.is_indexed = true; found = true; break; }
+                }
+                if (!found) throw_error("INDEX references unknown column");
             } else {
                 throw_error("Unknown constraint type.");
             }
@@ -363,6 +394,41 @@ std::unique_ptr<CreateTableStatement> Parser::parse_create_table() {
                     Token def_tok = advance();
                     col.default_kind = static_cast<int>(def_tok.type);
                     col.default_text = def_tok.value;
+                } else if (match(TokenType::KEYWORD, "INDEXED")) {
+                    /* Non-unique secondary index on this column */
+                    col.is_indexed = true;
+                } else if (match(TokenType::KEYWORD, "FOREIGN")) {
+                    /* Inline FK: FOREIGN KEY ref_table(ref_col) [ON DELETE action] */
+                    consume(TokenType::KEYWORD, "KEY", "Expected KEY after FOREIGN");
+                    Token ref_table_tok = advance();
+                    if (ref_table_tok.type != TokenType::IDENTIFIER && ref_table_tok.type != TokenType::KEYWORD)
+                        throw_error("Expected referenced table name");
+                    std::string ref_table = ref_table_tok.value;
+                    consume(TokenType::SYMBOL, "(", "Expected ( after ref table");
+                    std::string ref_col = parse_qualified_ident();
+                    consume(TokenType::SYMBOL, ")", "Expected ) after ref col");
+
+                    AstForeignKey fk;
+                    fk.column_name = col.name;
+                    fk.ref_table   = ref_table;
+                    fk.ref_column  = ref_col;
+                    fk.on_delete   = "RESTRICT";    /* default */
+
+                    if (match(TokenType::KEYWORD, "ON")) {
+                        consume(TokenType::KEYWORD, "DELETE", "Expected DELETE after ON");
+                        if (match(TokenType::KEYWORD, "CASCADE")) {
+                            fk.on_delete = "CASCADE";
+                        } else if (match(TokenType::KEYWORD, "RESTRICT")) {
+                            fk.on_delete = "RESTRICT";
+                        } else if (match(TokenType::KEYWORD, "SET")) {
+                            consume(TokenType::KEYWORD, "NULL", "Expected NULL after SET");
+                            fk.on_delete = "SET_NULL";
+                        } else {
+                            throw_error("Expected CASCADE, RESTRICT, or SET NULL after ON DELETE");
+                        }
+                    }
+
+                    stmt->foreign_keys.push_back(fk);
                 } else {
                     break;
                 }
@@ -718,5 +784,31 @@ std::unique_ptr<ASTNode> Parser::parse_show() {
         throw_error("Expected TABLES or DATABASES after SHOW");
     }
     consume(TokenType::SYMBOL, ";", "Expected ;");
+    return stmt;
+}
+
+// CREATE INDEX index_name ON table_name(column_name);
+std::unique_ptr<CreateIndexStatement> Parser::parse_create_index() {
+    auto stmt = std::make_unique<CreateIndexStatement>();
+
+    consume(TokenType::KEYWORD, "INDEX", "Expected INDEX");
+
+    Token name_tok = advance();
+    if (name_tok.type != TokenType::IDENTIFIER)
+        throw_error("Expected index name after CREATE INDEX");
+    stmt->index_name = name_tok.value;
+
+    consume(TokenType::KEYWORD, "ON", "Expected ON after index name");
+
+    Token table_tok = advance();
+    if (table_tok.type != TokenType::IDENTIFIER)
+        throw_error("Expected table name after ON");
+    stmt->table_name = table_tok.value;
+
+    consume(TokenType::SYMBOL, "(", "Expected ( after table name");
+    stmt->column_name = parse_qualified_ident();
+    consume(TokenType::SYMBOL, ")", "Expected ) after column name");
+    consume(TokenType::SYMBOL, ";", "Expected ;");
+
     return stmt;
 }

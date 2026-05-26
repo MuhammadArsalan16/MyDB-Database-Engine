@@ -12,8 +12,11 @@
  * pages of the clustered index store the full serialised row. Internal
  * (non-leaf) pages store (separator_key, child_page_no) pairs.
  *
- * Tables with UNIQUE columns get a secondary index per unique column.
- * Leaf pages of a secondary index store (key_value, RID) pairs that
+ * Tables with UNIQUE columns get a unique secondary index (is_secondary=1).
+ * Tables with INDEXED (non-unique) columns get a non-unique secondary index
+ * (is_secondary=2) — duplicate keys are allowed, all rows with the same key
+ * sit adjacent in leaf order.
+ * Leaf pages of both secondary index types store (key_value, RID) pairs that
  * point back into the clustered index.
  *
  * On-disk record format — clustered leaf:
@@ -52,7 +55,9 @@ typedef struct {
     int          table_id;
     uint32_t     root_page_no;  /* INVALID_PAGE when tree is empty */
     DataType     key_type;
-    uint8_t      is_secondary;  /* 0 = clustered, 1 = secondary */
+    uint8_t      is_secondary;  /* 0 = clustered
+                                   1 = unique secondary (UNIQUE col)
+                                   2 = non-unique secondary (INDEXED col) */
 } BTree;
 
 /* ------------------------------------------------------------------ */
@@ -153,5 +158,10 @@ int btree_cursor_next(Cursor *cur, uint8_t *data_out, uint16_t *len);
 
 /* Close the cursor, unpinning any held pages. */
 void btree_cursor_close(Cursor *cur);
+
+/* Return the height of the B+ tree (1 = root is a leaf, 2 = root +
+ * one level of leaves, ...).  Returns 0 for an empty tree.
+ * Used by the CBO to estimate index traversal cost. */
+uint8_t btree_compute_height(BTree *bt);
 
 #endif /* BTREE_H */

@@ -51,11 +51,18 @@ struct ColumnDef {
 /* ------------------------------------------------------------------ */
 /*  ForeignKey — one FK constraint on a relation                      */
 /* ------------------------------------------------------------------ */
+
+/* ON DELETE action codes — stored in ForeignKey.on_delete_action */
+#define FK_ON_DELETE_RESTRICT  0   /* default: reject DELETE if row is referenced */
+#define FK_ON_DELETE_CASCADE   1   /* delete referencing rows automatically */
+#define FK_ON_DELETE_SET_NULL  2   /* set referencing FK column to NULL */
+
 typedef struct {
-    char constraint_name[MAX_COLUMN_NAME];  /* optional user-given name */
-    char column_name[MAX_COLUMN_NAME];      /* FK column in this relation */
-    char ref_relation_name[MAX_TABLE_NAME]; /* referenced relation */
-    char ref_column_name[MAX_COLUMN_NAME];  /* referenced column */
+    char    constraint_name[MAX_COLUMN_NAME];  /* optional user-given name */
+    char    column_name[MAX_COLUMN_NAME];      /* FK column in this relation */
+    char    ref_relation_name[MAX_TABLE_NAME]; /* referenced relation */
+    char    ref_column_name[MAX_COLUMN_NAME];  /* referenced column */
+    uint8_t on_delete_action;                  /* FK_ON_DELETE_* above */
 } ForeignKey;
 
 /* ------------------------------------------------------------------ */

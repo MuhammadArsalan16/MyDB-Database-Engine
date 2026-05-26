@@ -35,6 +35,7 @@ private:
     std::unique_ptr<DropDatabaseStatement> parse_drop_database();
     std::unique_ptr<UseStatement> parse_use();
     std::unique_ptr<ASTNode> parse_show();
+    std::unique_ptr<CreateIndexStatement> parse_create_index();
 
     // Expression parsing
     std::unique_ptr<Expr> parse_expr();

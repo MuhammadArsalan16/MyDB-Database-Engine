@@ -892,6 +892,168 @@ static void test_fk_update_invalid_ref(void)
 
 
 /* ------------------------------------------------------------------ */
+/*  storage_range_by_index tests                                        */
+/*                                                                      */
+/*  Table: products(id INT PK AUTOINCR, code INT NOT NULL UNIQUE,       */
+/*                  name VARCHAR(32) NOT NULL)                           */
+/*  Rows inserted with code = 10, 20, 30, 40, 50.                       */
+/* ------------------------------------------------------------------ */
+
+static RelationDef *create_products_table(void)
+{
+    RelationDef r;
+    memset(&r, 0, sizeof(r));
+    strncpy(r.relation_name, "products", MAX_TABLE_NAME - 1);
+    r.num_columns       = 3;
+    r.pk_col_idx        = 0;
+    r.auto_incr_counter = 1;
+
+    ColumnDef *id = &r.columns[0];
+    strncpy(id->name, "id", MAX_COLUMN_NAME - 1);
+    id->type = TYPE_INT; id->max_len = 4;
+    id->is_not_null = 1; id->is_primary_key = 1; id->is_auto_increment = 1;
+
+    ColumnDef *code = &r.columns[1];
+    strncpy(code->name, "code", MAX_COLUMN_NAME - 1);
+    code->type = TYPE_INT; code->max_len = 4;
+    code->is_not_null = 1; code->is_unique = 1;
+
+    ColumnDef *nm = &r.columns[2];
+    strncpy(nm->name, "name", MAX_COLUMN_NAME - 1);
+    nm->type = TYPE_VARCHAR; nm->max_len = 32; nm->is_not_null = 1;
+
+    r.num_secondary_indexes  = 1;
+    r.secondary_col_idx[0]   = 1;   /* secondary index on code */
+
+    storage_create_table(&r);
+    return schema_find_relation(&g_eng.active_schema, "products");
+}
+
+static Row make_product_row(int code, const char *name)
+{
+    Row r;
+    memset(&r, 0, sizeof(r));
+    r.num_cols = 3;
+
+    r.cols[0].type    = TYPE_INT; r.cols[0].is_null = 1;  /* AUTO_INCREMENT */
+
+    r.cols[1].type = TYPE_INT; r.cols[1].is_null = 0;
+    r.cols[1].v.int_val = code;
+
+    r.cols[2].type = TYPE_VARCHAR; r.cols[2].is_null = 0;
+    r.cols[2].v.varchar_val.len = (uint16_t)strlen(name);
+    strncpy(r.cols[2].v.varchar_val.data, name, MAX_VARCHAR_LEN - 1);
+
+    return r;
+}
+
+static Value int_val(int v)
+{
+    Value val;
+    memset(&val, 0, sizeof(val));
+    val.type = TYPE_INT; val.is_null = 0; val.v.int_val = v;
+    return val;
+}
+
+/* Count rows returned by a cursor, applying an optional INT upper bound
+ * on col_idx (pass hi_val = INT_MIN to disable the upper bound check). */
+static int count_cursor_rows(Cursor *cur, int col_idx, int hi_val, int hi_incl)
+{
+    int n = 0;
+    Row *row;
+    while ((row = cursor_next(cur)) != NULL) {
+        if (hi_val != (int)0x80000000) {
+            int v = row->cols[col_idx].v.int_val;
+            if (v > hi_val)              break;
+            if (v == hi_val && !hi_incl) break;
+        }
+        n++;
+    }
+    cursor_close(cur);
+    return n;
+}
+
+static void test_scan_by_index(void)
+{
+    printf("\n[test_scan_by_index]\n");
+    setup_session();
+
+    RelationDef *rel = create_products_table();
+
+    /* Insert 5 rows with code = 10, 20, 30, 40, 50. */
+    Row p1 = make_product_row(10, "alpha");
+    Row p2 = make_product_row(20, "beta");
+    Row p3 = make_product_row(30, "gamma");
+    Row p4 = make_product_row(40, "delta");
+    Row p5 = make_product_row(50, "epsilon");
+    storage_insert(rel, &p1);
+    storage_insert(rel, &p2);
+    storage_insert(rel, &p3);
+    storage_insert(rel, &p4);
+    storage_insert(rel, &p5);
+
+    Cursor *cur;
+    Row    *row;
+
+    /* Full scan: lo=NULL → all 5 rows in key order */
+    cur = storage_scan_by_index(rel, 1, NULL);
+    CHECK(cur != NULL, "full index scan cursor opens");
+    CHECK(count_cursor_rows(cur, 1, (int)0x80000000, 1) == 5,
+          "full index scan yields 5 rows");
+
+    /* Range [20, 40]: open at 20, stop when code > 40 */
+    Value lo20 = int_val(20);
+    cur = storage_scan_by_index(rel, 1, &lo20);
+    CHECK(cur != NULL, "[20,inf) cursor opens");
+    CHECK(count_cursor_rows(cur, 1, 40, 1) == 3,
+          "[20,40] yields 3 rows (20,30,40)");
+
+    /* Range [30, ∞): open at 30, no upper bound */
+    Value lo30 = int_val(30);
+    cur = storage_scan_by_index(rel, 1, &lo30);
+    CHECK(cur != NULL, "[30,inf) cursor opens");
+    CHECK(count_cursor_rows(cur, 1, (int)0x80000000, 1) == 3,
+          "[30,inf) yields 3 rows (30,40,50)");
+
+    /* Upper bound only (−∞, 30]: open at start, stop after code 30 */
+    cur = storage_scan_by_index(rel, 1, NULL);
+    CHECK(cur != NULL, "(-inf,30] cursor opens");
+    CHECK(count_cursor_rows(cur, 1, 30, 1) == 3,
+          "(-inf,30] yields 3 rows (10,20,30)");
+
+    /* Exclusive upper bound (−∞, 30): stop before code 30 */
+    cur = storage_scan_by_index(rel, 1, NULL);
+    CHECK(cur != NULL, "(-inf,30) cursor opens");
+    CHECK(count_cursor_rows(cur, 1, 30, 0) == 2,
+          "(-inf,30) yields 2 rows (10,20)");
+
+    /* Start beyond all values [60, ∞): cursor opens but yields 0 rows */
+    Value lo60 = int_val(60);
+    cur = storage_scan_by_index(rel, 1, &lo60);
+    CHECK(cur != NULL, "[60,inf) cursor opens (done state)");
+    CHECK(count_cursor_rows(cur, 1, (int)0x80000000, 1) == 0,
+          "[60,inf) yields 0 rows");
+
+    /* Verify full row data is returned correctly */
+    cur = storage_scan_by_index(rel, 1, &lo30);
+    CHECK(cur != NULL, "cursor for data verify opens");
+    row = cursor_next(cur);
+    CHECK(row != NULL,                              "first row not NULL");
+    CHECK(row && row->cols[1].v.int_val == 30,      "first row code == 30");
+    CHECK(row && strcmp(row->cols[2].v.varchar_val.data, "gamma") == 0,
+          "first row name == gamma");
+    cursor_close(cur);
+
+    /* Non-indexed column → NULL */
+    cur = storage_scan_by_index(rel, 2, NULL);
+    CHECK(cur == NULL, "non-indexed column returns NULL cursor");
+
+    /* NULL rel → NULL */
+    cur = storage_scan_by_index(NULL, 1, NULL);
+    CHECK(cur == NULL, "NULL rel returns NULL cursor");
+
+    teardown_session();
+}
 
 int main(void)
 {
@@ -926,6 +1088,8 @@ int main(void)
     test_fk_delete_referenced_row();
     test_fk_delete_after_removing_ref();
     test_fk_update_invalid_ref();
+
+    test_scan_by_index();
 
     storage_shutdown();
     engine_close(&g_eng);

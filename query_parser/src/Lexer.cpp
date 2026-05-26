@@ -35,7 +35,8 @@ bool Lexer::is_keyword(const std::string& str) {
         "DROP", "DATABASE", "SCHEMA", "USE", "SHOW", "TABLES", "DATABASES",
         "ORDER", "BY", "ASC", "DESC", "LIMIT", "OFFSET",
         "GROUP", "HAVING", "DISTINCT",
-        "COUNT", "SUM", "AVG", "MIN", "MAX"
+        "COUNT", "SUM", "AVG", "MIN", "MAX",
+        "INDEX", "INDEXED", "CASCADE", "RESTRICT"
     };
     std::string upper_str = to_upper(str);
     return std::find(keywords.begin(), keywords.end(), upper_str) != keywords.end();

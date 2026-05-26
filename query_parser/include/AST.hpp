@@ -6,7 +6,7 @@
 #include "Lexer.hpp"
 
 // --- 1. ENUMS ---
-enum class StatementType { SELECT, CREATE_TABLE, INSERT, UPDATE, DELETE, TRANSACTION, DROP_TABLE, CREATE_DATABASE, DROP_DATABASE, USE, SHOW_TABLES, SHOW_DATABASES, UNKNOWN };
+enum class StatementType { SELECT, CREATE_TABLE, INSERT, UPDATE, DELETE, TRANSACTION, DROP_TABLE, CREATE_DATABASE, DROP_DATABASE, USE, SHOW_TABLES, SHOW_DATABASES, CREATE_INDEX, UNKNOWN };
 enum class JoinType { INNER, LEFT, RIGHT, FULL };
 enum class TransactionCommand { BEGIN, COMMIT, ROLLBACK };
 
@@ -131,6 +131,7 @@ struct ASTColumnDef {
     bool is_unique = false;
     bool is_auto_increment = false;
     bool has_default = false;
+    bool is_indexed = false;     /* INDEXED keyword — triggers non-unique secondary index */
     // default value literals
     int default_kind = -1; // -1 for none, or cast to TokenType
     std::string default_text;
@@ -141,6 +142,7 @@ struct AstForeignKey {
     std::string column_name;
     std::string ref_table;
     std::string ref_column;
+    std::string on_delete = "RESTRICT"; /* "RESTRICT" | "CASCADE" | "SET_NULL" */
 };
 
 struct CreateTableStatement : public ASTNode {
@@ -254,6 +256,22 @@ struct ShowTablesStatement : public ASTNode {
 struct ShowDatabasesStatement : public ASTNode {
     ShowDatabasesStatement() { type = StatementType::SHOW_DATABASES; }
     void print() const override { std::cout << "\n[AST] Action: SHOW DATABASES\n"; }
+};
+
+// CREATE INDEX
+struct CreateIndexStatement : public ASTNode {
+    std::string index_name;
+    std::string table_name;
+    std::string column_name;   /* single-column only (Phase 1) */
+
+    CreateIndexStatement() { type = StatementType::CREATE_INDEX; }
+
+    void print() const override {
+        std::cout << "\n[AST] Action: CREATE INDEX\n";
+        std::cout << "      Name  : " << index_name << "\n";
+        std::cout << "      Table : " << table_name << "\n";
+        std::cout << "      Col   : " << column_name << "\n";
+    }
 };
 
 // TRANSACTION (TCL)

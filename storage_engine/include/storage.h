@@ -94,6 +94,19 @@ int storage_create_table(RelationDef *rel);
  * __schema.mydb. */
 int storage_drop_table(RelationDef *rel);
 
+/*
+ * Add a secondary index on column col_idx of an existing table.
+ * Works for both UNIQUE (is_secondary=1) and non-unique (is_secondary=2)
+ * columns — the B-tree type is derived from rel->columns[col_idx].is_unique.
+ *
+ * Allocates a new root page, backfills all existing rows, then persists
+ * the updated RelationDef into __schema.mydb.
+ *
+ * Returns MYDB_ERR_DUPLICATE if col_idx is already indexed.
+ * Returns MYDB_ERR_FULL      if MAX_SECONDARY_IDX is reached or quota exceeded.
+ */
+int storage_add_index(RelationDef *rel, int col_idx);
+
 /* ------------------------------------------------------------------ */
 /*  DML                                                                 */
 /* ------------------------------------------------------------------ */
@@ -138,6 +151,21 @@ Row *storage_get_by_pk(RelationDef *rel, Value *pk);
  * The pointer is valid until the next storage_get_by_index call.
  */
 Row *storage_get_by_index(RelationDef *rel, int col_idx, Value *key);
+
+/*
+ * Open a scan cursor on a secondary (UNIQUE) index, positioned at the
+ * first key >= lo.  Pass lo = NULL to start from the leftmost key.
+ *
+ * cursor_next() returns full rows fetched from the clustered index
+ * (same Row * as a clustered scan — RID, all columns present).
+ * The caller applies any upper bound by comparing the indexed column
+ * value from each returned row and breaking when it exceeds the
+ * desired range — the same pattern as storage_scan_from() for PK ranges.
+ *
+ * Returns NULL if col_idx has no secondary index, on permission
+ * failure, or on internal error. Close with cursor_close().
+ */
+Cursor *storage_scan_by_index(RelationDef *rel, int col_idx, Value *lo);
 
 /*
  * Open a full-table scan cursor. NULL on error.
