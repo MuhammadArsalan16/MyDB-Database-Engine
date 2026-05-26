@@ -201,27 +201,25 @@ static int run_start(int argc, char **argv)
         fprintf(stderr, "mydb: password may not be empty\n");
         return 1;
     }
+    /* Copy out before getpass clobbers its static buffer, then wipe. */
+    char password[128];
+    strncpy(password, pw, sizeof(password) - 1);
+    password[sizeof(password) - 1] = '\0';
+    memset(pw, 0, strlen(pw));
 
     EngineState eng;
-    int rc = engine_init(root_dir, &eng);
-    if (rc != MYDB_OK) {
-        fprintf(stderr, "mydb: engine_init failed (rc=%d). "
-                        "Is %s initialised? Run `mydb init` first.\n",
-                rc, root_dir);
-        return 1;
-    }
-
-    rc = engine_login(&eng, username, pw);
-    /* Wipe the password buffer regardless of outcome. */
-    memset(pw, 0, strlen(pw));
+    int rc = engine_start(root_dir, username, password, &eng);
+    /* Wipe our copy regardless of outcome. */
+    memset(password, 0, sizeof(password));
     if (rc != MYDB_OK) {
         if (rc == MYDB_ERR_NOT_FOUND)
             fprintf(stderr, "mydb: unknown user '%s'\n", username);
         else if (rc == MYDB_ERR_PERM)
             fprintf(stderr, "mydb: authentication failed\n");
         else
-            fprintf(stderr, "mydb: login failed (rc=%d)\n", rc);
-        engine_close(&eng);
+            fprintf(stderr, "mydb: engine_start failed (rc=%d). "
+                            "Is %s initialised? Run `mydb init` first.\n",
+                    rc, root_dir);
         return 1;
     }
 

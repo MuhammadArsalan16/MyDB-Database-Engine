@@ -81,9 +81,31 @@ int engine_bootstrap(const char *root_dir,
 /* Open an already-bootstrapped engine. No user is logged in yet. */
 int engine_init (const char *root_dir, EngineState *out);
 
-/* Close all open files. Safe to call on a partially-initialized
- * EngineState (each fd is checked individually). */
+/* Close all open files, including the storage layer. Safe to call on a
+ * partially-initialized EngineState (each fd is checked individually). */
 int engine_close(EngineState *eng);
+
+
+/* ------------------------------------------------------------------ */
+/*  Combined start / stop (for bin — the only caller)                 */
+/* ------------------------------------------------------------------ */
+
+/* Open an engine, authenticate a user, and initialise the storage
+ * layer in one call.  This is the single function bin/mydb uses to
+ * bring the engine fully up before entering the REPL.
+ *
+ * Internally it sequences:
+ *   1. engine_init   (open __database.mydb + system_schema files)
+ *   2. engine_login  (authenticate, open partition catalog)
+ *   3. storage_init  (buffer pool + B+ tree layer, needs partition ctx)
+ *
+ * On any failure the partially-initialised state is cleaned up and
+ * MYDB_ERR / MYDB_ERR_NOT_FOUND / MYDB_ERR_PERM is returned.
+ * On success *out is fully ready and engine_close() will tear it down. */
+int engine_start(const char *root_dir,
+                 const char *username,
+                 const char *password,
+                 EngineState *out);
 
 
 /* ------------------------------------------------------------------ */

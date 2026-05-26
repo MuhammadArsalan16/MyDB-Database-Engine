@@ -215,6 +215,36 @@ int engine_close(EngineState *eng)
 
 
 /* ====================================================================
+ *  Combined start (the single call bin/mydb makes)
+ * ==================================================================== */
+
+int engine_start(const char *root_dir,
+                 const char *username,
+                 const char *password,
+                 EngineState *out)
+{
+    if (!root_dir || !username || !password || !out) return MYDB_ERR;
+
+    int rc = engine_init(root_dir, out);
+    if (rc != MYDB_OK) return rc;
+
+    rc = engine_login(out, username, password);
+    if (rc != MYDB_OK) {
+        engine_close(out);
+        return rc;
+    }
+
+    rc = storage_init(out);
+    if (rc != MYDB_OK) {
+        engine_close(out);
+        return rc;
+    }
+
+    return MYDB_OK;
+}
+
+
+/* ====================================================================
  *  Login
  * ==================================================================== */
 
