@@ -734,7 +734,10 @@ int storage_add_index(RelationDef *rel, int col_idx)
 
         RID rid = { btree_cur.last_page_no, btree_cur.last_slot };
 
-        uint8_t  srec[PAGE_SIZE];
+        /* Secondary record: 2B klen + key bytes + 4B page_no + 2B slot_no.
+         * Maximum key size is MAX_VARCHAR_LEN, so the tight bound is
+         * MAX_VARCHAR_LEN+2+4+2 = 158 B — no need for a full PAGE_SIZE buffer. */
+        uint8_t  srec[MAX_VARCHAR_LEN + 2 + 4 + 2];
         uint16_t slen = build_secondary_record(&row.cols[col_idx], rid, srec);
 
         rc = btree_insert(&ot->secondary[idx_slot],
@@ -851,10 +854,8 @@ static int fk_check_not_referenced(const RelationDef *r, const Value *pk_val)
     return MYDB_OK;
 }
 
-/* Maximum referencing rows processed per CASCADE / SET_NULL pass.
- * We collect all matching RIDs before mutating to avoid cursor
- * invalidation while the table is being modified. */
-#define FK_ACTION_MAX_ROWS 256
+/* (FK_ACTION_MAX_ROWS removed — RID collection now uses a heap-allocated
+ * growing array, so there is no per-operation row limit.) */
 
 /*
  * fk_apply_on_delete — enforce ON DELETE actions for every FK that
@@ -919,13 +920,21 @@ static int fk_apply_on_delete(const RelationDef *r, const Value *pk_val)
 
             /* ---- CASCADE / SET_NULL: collect matching RIDs first,
              *     then apply the action outside the scan loop to avoid
-             *     cursor invalidation while the table is being mutated. ---- */
-            RID rids[FK_ACTION_MAX_ROWS];
-            int nfound = 0;
+             *     cursor invalidation while the table is being mutated.
+             *
+             *     Heap-allocated growing array — no arbitrary row cap.
+             *     Starts at 64, doubles on overflow.  Freed before every
+             *     return path (success or failure). ---- */
+            int   rid_cap = 64;
+            int   nfound  = 0;
+            RID  *rids    = (RID *)malloc((size_t)rid_cap * sizeof(RID));
+            if (!rids) return MYDB_ERR;
 
             Cursor btree_cur;
-            if (btree_cursor_open(&ref_ot->clustered, &btree_cur) != MYDB_OK)
+            if (btree_cursor_open(&ref_ot->clustered, &btree_cur) != MYDB_OK) {
+                free(rids);
                 return MYDB_ERR;
+            }
 
             uint8_t  rec_buf[PAGE_SIZE];
             uint16_t rec_len;
@@ -939,9 +948,16 @@ static int fk_apply_on_delete(const RelationDef *r, const Value *pk_val)
 
                 if (value_compare(&row.cols[fk_col], pk_val) != 0) continue;
 
-                if (nfound >= FK_ACTION_MAX_ROWS) {
-                    btree_cursor_close(&btree_cur);
-                    return MYDB_ERR;   /* Phase 1 batch limit exceeded */
+                /* Grow the array if full */
+                if (nfound == rid_cap) {
+                    rid_cap *= 2;
+                    RID *tmp = (RID *)realloc(rids, (size_t)rid_cap * sizeof(RID));
+                    if (!tmp) {
+                        btree_cursor_close(&btree_cur);
+                        free(rids);
+                        return MYDB_ERR;
+                    }
+                    rids = tmp;
                 }
                 rids[nfound].page_no = btree_cur.last_page_no;
                 rids[nfound].slot_no = btree_cur.last_slot;
@@ -949,21 +965,24 @@ static int fk_apply_on_delete(const RelationDef *r, const Value *pk_val)
             }
             btree_cursor_close(&btree_cur);
 
-            /* Apply the action for every collected RID */
+            /* Apply the action for every collected RID.
+             * Use fk_rc + break so rids is always freed before returning. */
+            int fk_rc = MYDB_OK;
             for (int k = 0; k < nfound; k++) {
                 if (action == FK_ON_DELETE_CASCADE) {
                     /* Recursive: storage_delete may itself cascade further */
-                    int rc = storage_delete(ref_rel, rids[k]);
-                    if (rc != MYDB_OK) return rc;
+                    fk_rc = storage_delete(ref_rel, rids[k]);
+                    if (fk_rc != MYDB_OK) break;
                 } else {
                     /* SET_NULL: re-fetch the row, zero the FK column, update */
                     ref_ot = open_table(ref_rel->relation_name);
-                    if (!ref_ot) return MYDB_ERR;
+                    if (!ref_ot) { fk_rc = MYDB_ERR; break; }
 
                     uint8_t  r_buf[PAGE_SIZE];
                     uint16_t r_len;
-                    if (read_record_by_rid(ref_ot, rids[k], r_buf, &r_len) != MYDB_OK)
-                        return MYDB_ERR;
+                    if (read_record_by_rid(ref_ot, rids[k], r_buf, &r_len) != MYDB_OK) {
+                        fk_rc = MYDB_ERR; break;
+                    }
 
                     uint16_t klen = ((uint16_t)r_buf[0] << 8) | r_buf[1];
                     uint16_t voff = 2 + klen + 2;
@@ -973,10 +992,12 @@ static int fk_apply_on_delete(const RelationDef *r, const Value *pk_val)
                                           ref_rel, &updated_row);
                     updated_row.cols[fk_col].is_null = 1;
 
-                    int rc = storage_update(ref_rel, rids[k], &updated_row);
-                    if (rc != MYDB_OK) return rc;
+                    fk_rc = storage_update(ref_rel, rids[k], &updated_row);
+                    if (fk_rc != MYDB_OK) break;
                 }
             }
+            free(rids);
+            if (fk_rc != MYDB_OK) return fk_rc;
         }
     }
     return MYDB_OK;
@@ -1271,7 +1292,12 @@ int storage_update(RelationDef *rel, RID rid, Row *new_row)
         int ci = r->secondary_col_idx[i];
         uint8_t  srec[MAX_VARCHAR_LEN + 2 + 4 + 2];
         uint16_t slen = build_secondary_record(&new_row->cols[ci], new_rid, srec);
-        btree_insert(&ot->secondary[i], &new_row->cols[ci], srec, slen, NULL);
+        rc = btree_insert(&ot->secondary[i], &new_row->cols[ci], srec, slen, NULL);
+        if (rc != MYDB_OK) {
+            reconcile_growth(ot, rel->relation_name, pages_before);
+            if (auto_txn) trx_rollback(&g.trx);
+            return rc;
+        }
     }
 
     reconcile_growth(ot, rel->relation_name, pages_before);

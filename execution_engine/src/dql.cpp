@@ -93,10 +93,11 @@ static const char *validate_expr_cols(const Expr *e, const RelationDef *rel)
  *   anything else                 → AP_SCAN (full scan + filter)
  * ====================================================================== */
 
-#define AP_SCAN       0
-#define AP_SCAN_FROM  1
-#define AP_GET_PK     2
-#define AP_GET_INDEX  3
+#define AP_SCAN           0
+#define AP_SCAN_FROM      1
+#define AP_GET_PK         2
+#define AP_GET_INDEX      3
+#define AP_SCAN_BY_INDEX  4   /* storage_scan_by_index — secondary range scan */
 
 struct AccessPath {
     int   kind;
@@ -494,11 +495,21 @@ static AccessPath plan_to_ap(const PlanNode    &plan,
         break;
     }
 
-    case ACCESS_INDEX_RANGE:
-        /* Phase 1: no secondary index range scan API.
-         * WHERE filter at full-scan time handles the predicate. */
-        ap.kind = AP_SCAN;
+    case ACCESS_INDEX_RANGE: {
+        /* Use storage_scan_by_index(lo) when a lower bound exists on the
+         * indexed column.  Upper-bound-only predicates (e.g. col < 100)
+         * fall back to AP_SCAN — the WHERE filter handles the bound during
+         * the full scan. */
+        Value lo_key;
+        memset(&lo_key, 0, sizeof(lo_key));
+        if (root && find_range_lo(root, rel, plan.index_col_idx, &lo_key)) {
+            ap.kind    = AP_SCAN_BY_INDEX;
+            ap.col_idx = plan.index_col_idx;
+            ap.key     = lo_key;
+        }
+        /* else: stays AP_SCAN */
         break;
+    }
     }
 
     return ap;
@@ -792,6 +803,23 @@ struct RowLess {
         for (const auto &item : *order_by) {
             int idx = resolve_col(rel, item.column);
             if (idx < 0) continue;
+
+            /*
+             * NULL-first policy (mirrors GroupKey::operator<):
+             *   NULL < non-NULL for ASC  → NULL rows sort to the top.
+             *   NULL > non-NULL for DESC → NULL rows sort to the bottom.
+             * Two NULLs are considered equal for this column; move on.
+             *
+             * This guarantees strict-weak-ordering for std::sort — without
+             * it, compare_values() returns 1 whenever either operand is NULL,
+             * which breaks the irreflexivity requirement and causes UB.
+             */
+            bool an = (a.cols[idx].is_null != 0);
+            bool bn = (b.cols[idx].is_null != 0);
+            if (an && bn) continue;          /* both NULL → equal, next col */
+            if (an) return !item.descending; /* a is NULL: a < b for ASC    */
+            if (bn) return  item.descending; /* b is NULL: a > b for ASC    */
+
             int cmp = compare_values(&a.cols[idx], &b.cols[idx]);
             if (cmp != 0)
                 return item.descending ? (cmp > 0) : (cmp < 0);
@@ -932,6 +960,15 @@ static int exec_group_by(const SelectStatement *s,
     }
     case AP_SCAN_FROM: {
         Cursor *cur = storage_scan_from(rel_rw, &ap.key);
+        if (cur) {
+            Row *r;
+            while ((r = cursor_next(cur)) != NULL) feed_row(r);
+            cursor_close(cur);
+        }
+        break;
+    }
+    case AP_SCAN_BY_INDEX: {
+        Cursor *cur = storage_scan_by_index(rel_rw, ap.col_idx, &ap.key);
         if (cur) {
             Row *r;
             while ((r = cursor_next(cur)) != NULL) feed_row(r);
@@ -1098,6 +1135,18 @@ int exec_select(EngineState *eng, const SelectStatement *s,
     }
 
     /* ------------------------------------------------------------------
+     * Step 3b: strict LIKE type check — LIKE is only valid on VARCHAR.
+     * Check before any scan so the user gets a clear error, not zero rows.
+     * ------------------------------------------------------------------ */
+    {
+        const char *like_err = where_validate_likes(s->where_clause.get(), rel);
+        if (like_err) {
+            snprintf(out, cap, "  Error: %s", like_err);
+            return MYDB_ERR;
+        }
+    }
+
+    /* ------------------------------------------------------------------
      * Step 4: validate ORDER BY columns (non-aggregate queries only).
      * ------------------------------------------------------------------ */
     if (!has_agg) {
@@ -1246,6 +1295,17 @@ int exec_select(EngineState *eng, const SelectStatement *s,
             }
             break;
         }
+        case AP_SCAN_BY_INDEX: {
+            Cursor *cur = storage_scan_by_index(rel_rw, ap.col_idx, &ap.key);
+            if (cur) {
+                Row *row;
+                while ((row = cursor_next(cur)) != NULL)
+                    if (where_matches(s->where_clause.get(), rel, row))
+                        agg_accumulate(states, n, s, rel, row);
+                cursor_close(cur);
+            }
+            break;
+        }
         default: {
             Cursor *cur = storage_scan(rel_rw);
             if (cur) {
@@ -1291,6 +1351,17 @@ int exec_select(EngineState *eng, const SelectStatement *s,
     }
     case AP_SCAN_FROM: {
         Cursor *cur = storage_scan_from(rel_rw, &ap.key);
+        if (cur) {
+            Row *row;
+            while ((row = cursor_next(cur)) != NULL)
+                if (where_matches(s->where_clause.get(), rel, row))
+                    all_rows.push_back(*row);
+            cursor_close(cur);
+        }
+        break;
+    }
+    case AP_SCAN_BY_INDEX: {
+        Cursor *cur = storage_scan_by_index(rel_rw, ap.col_idx, &ap.key);
         if (cur) {
             Row *row;
             while ((row = cursor_next(cur)) != NULL)

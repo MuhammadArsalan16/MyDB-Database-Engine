@@ -54,7 +54,10 @@ int exec_create_database(EngineState *eng,
 
     int rc = storage_create_schema(s->name.c_str());
     if (rc != MYDB_OK) {
-        format_error(rc, out, cap, s->name.c_str());
+        if (rc == MYDB_ERR_DUPLICATE)
+            snprintf(out, cap, "  Error: database '%s' already exists", s->name.c_str());
+        else
+            format_error(rc, out, cap, s->name.c_str());
         return rc;
     }
 
@@ -274,10 +277,16 @@ int exec_create_table(EngineState *eng, const CreateTableStatement *s,
             } else {
                 /* Reject literals whose text cannot be parsed as the column's type. */
                 if (!validate_literal(ac.default_text, cd)) {
-                    snprintf(out, cap,
-                             "  Error: DEFAULT value '%s' is not valid for column '%s' (%s)",
-                             ac.default_text.c_str(), ac.name.c_str(),
-                             ac.data_type.c_str());
+                    if (cd.type == TYPE_INT)
+                        snprintf(out, cap,
+                                 "  Error: DEFAULT value '%s' is out of range for column '%s'"
+                                 " (INT is 32-bit signed: -2147483648 to 2147483647)",
+                                 ac.default_text.c_str(), ac.name.c_str());
+                    else
+                        snprintf(out, cap,
+                                 "  Error: DEFAULT value '%s' is not valid for column '%s' (%s)",
+                                 ac.default_text.c_str(), ac.name.c_str(),
+                                 ac.data_type.c_str());
                     return MYDB_ERR;
                 }
                 cd.default_value = cast_literal(ac.default_text, cd);
@@ -397,7 +406,11 @@ int exec_create_table(EngineState *eng, const CreateTableStatement *s,
 
     int rc = storage_create_table(&rel);
     if (rc != MYDB_OK) {
-        format_error(rc, out, cap, s->table_name.c_str());
+        if (rc == MYDB_ERR_DUPLICATE)
+            snprintf(out, cap, "  Error: table '%s' already exists",
+                     s->table_name.c_str());
+        else
+            format_error(rc, out, cap, s->table_name.c_str());
         return rc;
     }
 

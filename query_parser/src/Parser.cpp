@@ -406,6 +406,21 @@ std::unique_ptr<CreateTableStatement> Parser::parse_create_table() {
                     Token def_tok = advance();
                     col.default_kind = static_cast<int>(def_tok.type);
                     col.default_text = def_tok.value;
+
+                    /*
+                     * ENUM DEFAULT validation — must happen at parse time so
+                     * the user gets a clear error instead of a cryptic storage
+                     * failure later.  NULL is always a legal default (any type).
+                     */
+                    if (!col.enum_values.empty() && col.default_text != "NULL") {
+                        bool found = false;
+                        for (const auto &ev : col.enum_values)
+                            if (ev == col.default_text) { found = true; break; }
+                        if (!found)
+                            throw_error("DEFAULT value '" + col.default_text +
+                                        "' is not a valid ENUM value for column '" +
+                                        col.name + "'");
+                    }
                 } else if (match(TokenType::KEYWORD, "INDEXED")) {
                     /* Non-unique secondary index on this column */
                     col.is_indexed = true;

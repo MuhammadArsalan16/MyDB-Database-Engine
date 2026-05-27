@@ -41,6 +41,14 @@ bool eval_expr(const Expr *e, const RelationDef *rel, const Row *r);
 bool where_matches(const WhereClause *w, const RelationDef *rel, const Row *r);
 
 /*
+ * Strict LIKE type check — call once before any scan.
+ * Walks the WHERE tree and returns a static error string if any LIKE node
+ * targets a non-VARCHAR column (or an unknown column), nullptr if clean.
+ * LIKE on a non-text column is a type error: use = / != for those types.
+ */
+const char *where_validate_likes(const WhereClause *w, const RelationDef *rel);
+
+/*
  * Type-aware comparison of two Values.
  * Returns: negative → a < b,  zero → a == b,  positive → a > b.
  *

@@ -396,3 +396,86 @@ bool where_matches(const WhereClause *w, const RelationDef *rel, const Row *r)
     if (!w) return true;
     return eval_expr(w->root.get(), rel, r);
 }
+
+/* ======================================================================
+ * LIKE type validator  (strict: LIKE is only legal on VARCHAR columns)
+ * ====================================================================== */
+
+/*
+ * Recursively walk an Expr tree and return the first error found:
+ *   - LIKE on a column that is not TYPE_VARCHAR → type-error string
+ *   - LIKE on an unknown column name            → "unknown column" string
+ * Returns nullptr if the tree contains no LIKE problems.
+ *
+ * The returned pointer is into a static buffer — valid until the next call.
+ * Callers use it immediately to populate the output buffer, so this is safe.
+ */
+static const char *validate_like_expr(const Expr *e, const RelationDef *rel)
+{
+    if (!e) return nullptr;
+
+    switch (e->kind) {
+
+    case Expr::Kind::Like: {
+        const LikeExpr *lk = static_cast<const LikeExpr *>(e);
+        /* The LHS of LIKE must be a column reference */
+        if (!lk->v || lk->v->kind != Expr::Kind::ColumnRef)
+            return nullptr;  /* literal LIKE — unusual but harmless */
+        const ColumnRefExpr *cr = static_cast<const ColumnRefExpr *>(lk->v.get());
+        int idx = resolve_col(rel, cr->column);
+        if (idx < 0) {
+            static char ebuf[256];
+            snprintf(ebuf, sizeof(ebuf),
+                     "unknown column '%s' in LIKE expression",
+                     cr->column.c_str());
+            return ebuf;
+        }
+        if (rel->columns[idx].type != TYPE_VARCHAR) {
+            static char ebuf[256];
+            snprintf(ebuf, sizeof(ebuf),
+                     "LIKE requires a VARCHAR column, but '%s' is %s "
+                     "(use = or != for non-text columns)",
+                     rel->columns[idx].name,
+                     rel->columns[idx].type == TYPE_INT      ? "INT"      :
+                     rel->columns[idx].type == TYPE_DECIMAL  ? "DECIMAL"  :
+                     rel->columns[idx].type == TYPE_BOOL     ? "BOOL"     :
+                     rel->columns[idx].type == TYPE_ENUM     ? "ENUM"     :
+                     rel->columns[idx].type == TYPE_DATE     ? "DATE"     :
+                     rel->columns[idx].type == TYPE_DATETIME ? "DATETIME" : "unknown");
+            return ebuf;
+        }
+        return nullptr;
+    }
+
+    case Expr::Kind::Binary: {
+        const BinaryExpr *bin = static_cast<const BinaryExpr *>(e);
+        const char *err = validate_like_expr(bin->lhs.get(), rel);
+        if (err) return err;
+        return validate_like_expr(bin->rhs.get(), rel);
+    }
+
+    case Expr::Kind::Unary: {
+        const UnaryExpr *un = static_cast<const UnaryExpr *>(e);
+        return validate_like_expr(un->child.get(), rel);
+    }
+
+    case Expr::Kind::Between: {
+        const BetweenExpr *bt = static_cast<const BetweenExpr *>(e);
+        return validate_like_expr(bt->v.get(), rel);
+    }
+
+    case Expr::Kind::In: {
+        const InExpr *in = static_cast<const InExpr *>(e);
+        return validate_like_expr(in->v.get(), rel);
+    }
+
+    default:
+        return nullptr;
+    }
+}
+
+const char *where_validate_likes(const WhereClause *w, const RelationDef *rel)
+{
+    if (!w) return nullptr;
+    return validate_like_expr(w->root.get(), rel);
+}

@@ -187,7 +187,23 @@ int exec_insert(EngineState *eng, const InsertStatement *s,
 
             if (col_src[ci] >= 0) {
                 /* explicit value provided in the INSERT */
-                *v = cast_literal(vals[(size_t)col_src[ci]], *col);
+                const std::string &raw = vals[(size_t)col_src[ci]];
+                if (!validate_literal(raw, *col)) {
+                    rc = MYDB_ERR;
+                    AUTOCOMMIT_END(rc);
+                    if (col->type == TYPE_INT)
+                        snprintf(out, cap,
+                                 "  Error: value '%s' is out of range for column '%s'"
+                                 " (INT is 32-bit signed: -2147483648 to 2147483647)",
+                                 raw.c_str(), col->name);
+                    else
+                        snprintf(out, cap,
+                                 "  Error: value '%s' is not valid for column '%s' (%s)",
+                                 raw.c_str(), col->name,
+                                 vals[(size_t)col_src[ci]].c_str());
+                    return rc;
+                }
+                *v = cast_literal(raw, *col);
 
             } else if (col->is_auto_increment) {
                 /* AUTO_INCREMENT — storage fills in the next counter value */

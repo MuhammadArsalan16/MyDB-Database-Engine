@@ -39,7 +39,7 @@ int disk_create(DiskManager *dm, const char *path)
     FileHeader fh;
     memset(&fh, 0, sizeof(fh));
     fh.magic        = MYDB_MAGIC;
-    fh.version      = 1;
+    fh.version      = MYDB_FORMAT_VERSION;
     fh.num_pages    = 1;             /* only page 0 exists right now */
     fh.root_page_no = INVALID_PAGE;  /* no B+ Tree yet */
     fh.auto_incr    = 1;             /* AUTO_INCREMENT starts at 1 */
@@ -72,6 +72,10 @@ int disk_open(DiskManager *dm, const char *path)
     if (fh.magic != MYDB_MAGIC) {   /* sanity check */
         close(fd);
         return MYDB_ERR;
+    }
+    if (fh.version > MYDB_FORMAT_VERSION) {   /* reject future-format files */
+        close(fd);
+        return MYDB_ERR_BAD_VERSION;
     }
 
     snprintf(dm->path, sizeof(dm->path), "%s", path);
