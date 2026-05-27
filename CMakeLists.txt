@@ -21,6 +21,10 @@ add_subdirectory(system_schema)
 # Query parser — Lexer/Parser plus parser_api C bridge. Built before
 # engine so engine can link it.
 add_subdirectory(query_parser)
+# Planner — cost-based access path selection.  Pure C, depends only on
+# storage_engine (for stats.h).  Built before execution_engine so the
+# executor can link against it.
+add_subdirectory(planner)
 # Execution engine — AST walker. Built after query_parser, before engine.
 add_subdirectory(execution_engine)
 # Engine orchestrator — owns __database.mydb, EngineState, login/use_schema

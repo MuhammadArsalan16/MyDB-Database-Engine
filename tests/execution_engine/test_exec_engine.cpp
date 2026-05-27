@@ -146,7 +146,7 @@ static void test_tcl(void)
     /* COMMIT without prior BEGIN → MYDB_ERR_NO_TXN */
     rc = sql("COMMIT;");
     CHECK(rc == MYDB_ERR_NO_TXN, "COMMIT without BEGIN → MYDB_ERR_NO_TXN");
-    CHECK(strstr(g_res, "ERROR") != NULL, "result has ERROR text");
+    CHECK(strstr(g_res, "Error") != NULL, "result has ERROR text");
 
     /* ROLLBACK without prior BEGIN → MYDB_ERR_NO_TXN */
     rc = sql("ROLLBACK;");
@@ -156,7 +156,7 @@ static void test_tcl(void)
     sql("BEGIN;");
     rc = sql("BEGIN;");
     CHECK(rc != MYDB_OK, "nested BEGIN returns error");
-    CHECK(strstr(g_res, "ERROR") != NULL, "nested BEGIN result has ERROR");
+    CHECK(strstr(g_res, "Error") != NULL, "nested BEGIN result has ERROR");
     sql("ROLLBACK;");   /* clean up */
 
     engine_teardown();
@@ -597,7 +597,7 @@ static void test_ddl(void)
     /* ---- CREATE DATABASE ---- */
     rc = sql("CREATE DATABASE testdb;");
     CHECK(rc == MYDB_OK, "CREATE DATABASE testdb → MYDB_OK");
-    CHECK(strstr(g_res, "Query OK") != NULL,
+    CHECK(strstr(g_res, "OK") != NULL,
           "CREATE DATABASE result says Query OK");
 
     /* duplicate schema → error */
@@ -629,7 +629,7 @@ static void test_ddl(void)
              "  name VARCHAR(50) NOT NULL"
              ");");
     CHECK(rc == MYDB_OK, "CREATE TABLE users → MYDB_OK");
-    CHECK(strstr(g_res, "Query OK") != NULL,
+    CHECK(strstr(g_res, "OK") != NULL,
           "CREATE TABLE result says Query OK");
 
     /* table with no PRIMARY KEY → error */
@@ -667,7 +667,7 @@ static void test_ddl(void)
     /* ---- DROP TABLE ---- */
     rc = sql("DROP TABLE users;");
     CHECK(rc == MYDB_OK, "DROP TABLE users → MYDB_OK");
-    CHECK(strstr(g_res, "Query OK") != NULL,
+    CHECK(strstr(g_res, "OK") != NULL,
           "DROP TABLE result says Query OK");
 
     /* users no longer visible */
@@ -681,12 +681,41 @@ static void test_ddl(void)
     rc = sql("DROP TABLE users;");
     CHECK(rc != MYDB_OK, "DROP TABLE non-existent → error");
 
-    /* ---- DROP DATABASE — not supported yet ---- */
+    /* ---- DROP DATABASE ---- */
+    /* Cannot drop the active schema */
     rc = sql("DROP DATABASE testdb;");
-    CHECK(rc != MYDB_OK, "DROP DATABASE → not supported (error expected)");
-    CHECK(strstr(g_res, "not yet supported") != NULL ||
-          strstr(g_res, "ERROR") != NULL,
-          "DROP DATABASE result has error text");
+    CHECK(rc != MYDB_OK, "DROP DATABASE active schema → error");
+    CHECK(strstr(g_res, "Error") != NULL,
+          "DROP DATABASE active → error message");
+
+    /* Create and drop a non-active schema */
+    rc = sql("CREATE DATABASE tempdb;");
+    CHECK(rc == MYDB_OK, "CREATE DATABASE tempdb → MYDB_OK");
+    rc = sql("DROP DATABASE tempdb;");
+    CHECK(rc == MYDB_OK, "DROP DATABASE non-active → MYDB_OK");
+    CHECK(strstr(g_res, "OK") != NULL, "DROP DATABASE → says OK");
+
+    /* ---- CREATE INDEX ---- */
+    rc = sql("CREATE INDEX ON products(price);");
+    CHECK(rc == MYDB_OK, "CREATE INDEX ON products(price) → MYDB_OK");
+    CHECK(strstr(g_res, "OK") != NULL, "CREATE INDEX → says OK");
+
+    /* Duplicate index → error */
+    rc = sql("CREATE INDEX ON products(price);");
+    CHECK(rc != MYDB_OK, "CREATE INDEX duplicate → error");
+    CHECK(strstr(g_res, "Error") != NULL, "CREATE INDEX dup → error message");
+
+    /* Index on PK column → error */
+    rc = sql("CREATE INDEX ON products(id);");
+    CHECK(rc != MYDB_OK, "CREATE INDEX on PK → error");
+
+    /* Index on non-existent column → error */
+    rc = sql("CREATE INDEX ON products(nosuchcol);");
+    CHECK(rc != MYDB_OK, "CREATE INDEX bad col → error");
+
+    /* Index on non-existent table → error */
+    rc = sql("CREATE INDEX ON nosuchTable(price);");
+    CHECK(rc != MYDB_OK, "CREATE INDEX bad table → error");
 
     engine_teardown();
 }
@@ -715,7 +744,7 @@ static void test_insert(void)
     /* ---- basic positional INSERT ---- */
     rc = sql("INSERT INTO products VALUES (1, 'Widget', 9.99, TRUE);");
     CHECK(rc == MYDB_OK, "INSERT positional → MYDB_OK");
-    CHECK(strstr(g_res, "Query OK") != NULL, "INSERT result says Query OK");
+    CHECK(strstr(g_res, "OK") != NULL, "INSERT result says Query OK");
     CHECK(strstr(g_res, "1 row") != NULL,    "INSERT result says 1 row affected");
 
     /* ---- named-column INSERT ---- */
@@ -796,7 +825,7 @@ static void test_select(void)
     /* ---- REQUIRE_SCHEMA guard: SELECT before USE ---- */
     rc = sql("SELECT * FROM anything;");
     CHECK(rc != MYDB_OK, "SELECT without USE → error");
-    CHECK(strstr(g_res, "ERROR") != NULL, "SELECT without USE → error message");
+    CHECK(strstr(g_res, "Error") != NULL, "SELECT without USE → error message");
 
     /* ---- setup: create schema + table + data ---- */
     sql("CREATE DATABASE shop;");
@@ -1226,6 +1255,332 @@ static void test_group_by(void)
 
 
 /* ======================================================================
+ * WHERE SQL operators — end-to-end via engine_execute_sql
+ * Tests BETWEEN, IN, IS NULL/NOT NULL, LIKE, AND/OR/NOT through SQL.
+ * ====================================================================== */
+
+static void test_where_sql(void)
+{
+    printf("\n[test_where_sql]\n");
+    engine_setup();
+
+    int rc;
+
+    sql("CREATE DATABASE shop;");
+    sql("USE shop;");
+    sql("CREATE TABLE items ("
+        "  id     INT PRIMARY KEY,"
+        "  name   VARCHAR(50),"
+        "  price  INT,"
+        "  active BOOL DEFAULT TRUE"
+        ");");
+
+    /* 6 rows: prices 10,20,30,40,50 + one NULL price */
+    sql("INSERT INTO items (id, name, price, active) VALUES (1, 'Alpha',  10, TRUE);");
+    sql("INSERT INTO items (id, name, price, active) VALUES (2, 'Beta',   20, FALSE);");
+    sql("INSERT INTO items (id, name, price, active) VALUES (3, 'Gamma',  30, TRUE);");
+    sql("INSERT INTO items (id, name, price, active) VALUES (4, 'Delta',  40, TRUE);");
+    sql("INSERT INTO items (id, name, price, active) VALUES (5, 'Epsilon',50, FALSE);");
+    sql("INSERT INTO items (id, name, active) VALUES (6, 'Zeta', TRUE);"); /* price = NULL */
+
+    /* ---- BETWEEN inclusive ---- */
+    rc = sql("SELECT * FROM items WHERE price BETWEEN 20 AND 40;");
+    CHECK(rc == MYDB_OK,                      "BETWEEN → MYDB_OK");
+    CHECK(strstr(g_res, "(3 rows)") != NULL,  "BETWEEN 20-40 → 3 rows");
+    CHECK(strstr(g_res, "Beta")   != NULL,    "BETWEEN → Beta(20) present");
+    CHECK(strstr(g_res, "Delta")  != NULL,    "BETWEEN → Delta(40) present");
+    CHECK(strstr(g_res, "Alpha")  == NULL,    "BETWEEN → Alpha(10) absent");
+    CHECK(strstr(g_res, "Epsilon")== NULL,    "BETWEEN → Epsilon(50) absent");
+
+    /* ---- NOT BETWEEN ---- */
+    rc = sql("SELECT * FROM items WHERE price NOT BETWEEN 20 AND 40;");
+    CHECK(rc == MYDB_OK,                      "NOT BETWEEN → MYDB_OK");
+    CHECK(strstr(g_res, "Alpha")  != NULL,    "NOT BETWEEN → Alpha(10) present");
+    CHECK(strstr(g_res, "Epsilon")!= NULL,    "NOT BETWEEN → Epsilon(50) present");
+    CHECK(strstr(g_res, "Beta")   == NULL,    "NOT BETWEEN → Beta(20) absent");
+
+    /* ---- IN ---- */
+    rc = sql("SELECT * FROM items WHERE price IN (10, 30, 50);");
+    CHECK(rc == MYDB_OK,                      "IN → MYDB_OK");
+    CHECK(strstr(g_res, "(3 rows)") != NULL,  "IN(10,30,50) → 3 rows");
+    CHECK(strstr(g_res, "Alpha")  != NULL,    "IN → Alpha(10) present");
+    CHECK(strstr(g_res, "Gamma")  != NULL,    "IN → Gamma(30) present");
+    CHECK(strstr(g_res, "Epsilon")!= NULL,    "IN → Epsilon(50) present");
+    CHECK(strstr(g_res, "Beta")   == NULL,    "IN → Beta(20) absent");
+
+    /* ---- NOT IN ---- */
+    rc = sql("SELECT * FROM items WHERE price NOT IN (10, 20);");
+    CHECK(rc == MYDB_OK,                      "NOT IN → MYDB_OK");
+    CHECK(strstr(g_res, "Alpha")  == NULL,    "NOT IN → Alpha absent");
+    CHECK(strstr(g_res, "Beta")   == NULL,    "NOT IN → Beta absent");
+    CHECK(strstr(g_res, "Gamma")  != NULL,    "NOT IN → Gamma present");
+
+    /* ---- IS NULL ---- */
+    rc = sql("SELECT * FROM items WHERE price IS NULL;");
+    CHECK(rc == MYDB_OK,                      "IS NULL → MYDB_OK");
+    CHECK(strstr(g_res, "(1 row)") != NULL,   "IS NULL → exactly 1 row");
+    CHECK(strstr(g_res, "Zeta")   != NULL,    "IS NULL → Zeta (null price) found");
+
+    /* ---- IS NOT NULL ---- */
+    rc = sql("SELECT * FROM items WHERE price IS NOT NULL;");
+    CHECK(rc == MYDB_OK,                      "IS NOT NULL → MYDB_OK");
+    CHECK(strstr(g_res, "(5 rows)") != NULL,  "IS NOT NULL → 5 rows");
+    CHECK(strstr(g_res, "Zeta")   == NULL,    "IS NOT NULL → Zeta absent");
+
+    /* ---- LIKE prefix ---- */
+    rc = sql("SELECT * FROM items WHERE name LIKE 'G%';");
+    CHECK(rc == MYDB_OK,                      "LIKE 'G%' → MYDB_OK");
+    CHECK(strstr(g_res, "(1 row)") != NULL,   "LIKE 'G%' → 1 row");
+    CHECK(strstr(g_res, "Gamma")  != NULL,    "LIKE 'G%' → Gamma found");
+
+    /* ---- LIKE single-char wildcard ---- */
+    rc = sql("SELECT * FROM items WHERE name LIKE 'Bet_';");
+    CHECK(rc == MYDB_OK,                      "LIKE 'Bet_' → MYDB_OK");
+    CHECK(strstr(g_res, "Beta")   != NULL,    "LIKE 'Bet_' → Beta found");
+
+    /* ---- NOT LIKE ---- */
+    rc = sql("SELECT * FROM items WHERE name NOT LIKE 'A%';");
+    CHECK(rc == MYDB_OK,                      "NOT LIKE 'A%' → MYDB_OK");
+    CHECK(strstr(g_res, "Alpha")  == NULL,    "NOT LIKE 'A%' → Alpha absent");
+    CHECK(strstr(g_res, "Beta")   != NULL,    "NOT LIKE 'A%' → Beta present");
+
+    /* ---- AND ---- */
+    rc = sql("SELECT * FROM items WHERE price > 10 AND active = TRUE;");
+    CHECK(rc == MYDB_OK,                      "AND → MYDB_OK");
+    CHECK(strstr(g_res, "Gamma")  != NULL,    "AND → Gamma(30,T) present");
+    CHECK(strstr(g_res, "Delta")  != NULL,    "AND → Delta(40,T) present");
+    CHECK(strstr(g_res, "Alpha")  == NULL,    "AND → Alpha(10) absent (price=10)");
+    CHECK(strstr(g_res, "Beta")   == NULL,    "AND → Beta(F) absent");
+
+    /* ---- OR ---- */
+    rc = sql("SELECT * FROM items WHERE price = 10 OR price = 50;");
+    CHECK(rc == MYDB_OK,                      "OR → MYDB_OK");
+    CHECK(strstr(g_res, "(2 rows)") != NULL,  "OR → 2 rows");
+    CHECK(strstr(g_res, "Alpha")  != NULL,    "OR → Alpha(10) present");
+    CHECK(strstr(g_res, "Epsilon")!= NULL,    "OR → Epsilon(50) present");
+
+    /* ---- NOT ---- */
+    rc = sql("SELECT * FROM items WHERE NOT active = TRUE;");
+    CHECK(rc == MYDB_OK,                      "NOT → MYDB_OK");
+    CHECK(strstr(g_res, "Beta")   != NULL,    "NOT → Beta(FALSE) present");
+    CHECK(strstr(g_res, "Epsilon")!= NULL,    "NOT → Epsilon(FALSE) present");
+    CHECK(strstr(g_res, "Alpha")  == NULL,    "NOT → Alpha(TRUE) absent");
+
+    engine_teardown();
+}
+
+/* ======================================================================
+ * DESCRIBE TABLE
+ * ====================================================================== */
+
+static void test_describe_table(void)
+{
+    printf("\n[test_describe_table]\n");
+    engine_setup();
+
+    int rc;
+
+    sql("CREATE DATABASE shop;");
+    sql("USE shop;");
+
+    /* Table with all column types and modifiers */
+    sql("CREATE TABLE catalog ("
+        "  id       INT AUTO_INCREMENT PRIMARY KEY,"
+        "  sku      VARCHAR(30) NOT NULL UNIQUE,"
+        "  price    DECIMAL,"
+        "  active   BOOL DEFAULT TRUE,"
+        "  status   ENUM(new, used, refurb) DEFAULT new,"
+        "  created  DATETIME"
+        ");");
+
+    /* ---- DESCRIBE TABLE ---- */
+    rc = sql("DESCRIBE TABLE catalog;");
+    CHECK(rc == MYDB_OK,                       "DESCRIBE TABLE → MYDB_OK");
+    /* headers */
+    CHECK(strstr(g_res, "Field")   != NULL,    "DESCRIBE → 'Field' header");
+    CHECK(strstr(g_res, "Type")    != NULL,    "DESCRIBE → 'Type' header");
+    CHECK(strstr(g_res, "Null")    != NULL,    "DESCRIBE → 'Null' header");
+    CHECK(strstr(g_res, "Key")     != NULL,    "DESCRIBE → 'Key' header");
+    /* rows */
+    CHECK(strstr(g_res, "id")      != NULL,    "DESCRIBE → id column");
+    CHECK(strstr(g_res, "PRI")     != NULL,    "DESCRIBE → id is PRI");
+    CHECK(strstr(g_res, "AUTO_INCREMENT") != NULL, "DESCRIBE → id has AUTO_INCREMENT");
+    CHECK(strstr(g_res, "sku")     != NULL,    "DESCRIBE → sku column");
+    CHECK(strstr(g_res, "UNI")     != NULL,    "DESCRIBE → sku is UNI");
+    CHECK(strstr(g_res, "price")   != NULL,    "DESCRIBE → price column");
+    CHECK(strstr(g_res, "active")  != NULL,    "DESCRIBE → active column");
+    CHECK(strstr(g_res, "status")  != NULL,    "DESCRIBE → status column");
+    CHECK(strstr(g_res, "created") != NULL,    "DESCRIBE → created column");
+    /* type names */
+    CHECK(strstr(g_res, "INT")     != NULL,    "DESCRIBE → INT type shown");
+    CHECK(strstr(g_res, "VARCHAR") != NULL,    "DESCRIBE → VARCHAR type shown");
+    CHECK(strstr(g_res, "BOOL")    != NULL,    "DESCRIBE → BOOL type shown");
+    CHECK(strstr(g_res, "ENUM")    != NULL,    "DESCRIBE → ENUM type shown");
+    CHECK(strstr(g_res, "DATETIME")!= NULL,    "DESCRIBE → DATETIME type shown");
+    /* null constraints */
+    CHECK(strstr(g_res, "NO")      != NULL,    "DESCRIBE → NOT NULL cols show 'NO'");
+    CHECK(strstr(g_res, "YES")     != NULL,    "DESCRIBE → nullable cols show 'YES'");
+
+    /* ---- DESCRIBE without TABLE keyword (optional) ---- */
+    rc = sql("DESCRIBE catalog;");
+    CHECK(rc == MYDB_OK,                       "DESCRIBE (no TABLE keyword) → MYDB_OK");
+    CHECK(strstr(g_res, "id")      != NULL,    "DESCRIBE short form → id present");
+
+    /* ---- DESCRIBE non-existent table → error ---- */
+    rc = sql("DESCRIBE TABLE nosuchone;");
+    CHECK(rc != MYDB_OK,                       "DESCRIBE missing table → error");
+    CHECK(strstr(g_res, "Error")   != NULL,    "DESCRIBE missing table → error message");
+
+    /* ---- DESCRIBE TABLE FULL — stats section present ---- */
+    /* Run ANALYZE first so stats exist, then check FULL output */
+    sql("INSERT INTO catalog (sku, price, active, status, created)"
+        " VALUES ('S001', 9.99, TRUE, 'new', '2024-01-15 10:00:00');");
+    sql("INSERT INTO catalog (sku, price, active, status, created)"
+        " VALUES ('S002', 19.99, FALSE, 'used', '2024-02-20 12:30:00');");
+    sql("ANALYZE TABLE catalog;");
+
+    rc = sql("DESCRIBE TABLE FULL catalog;");
+    CHECK(rc == MYDB_OK,                       "DESCRIBE TABLE FULL → MYDB_OK");
+    CHECK(strstr(g_res, "Field")   != NULL,    "DESCRIBE FULL → base table present");
+    /* Stats section (rendered only when ANALYZE has run) */
+    CHECK(strstr(g_res, "Stats")   != NULL ||
+          strstr(g_res, "N/A")     != NULL,    "DESCRIBE FULL → stats section present");
+
+    engine_teardown();
+}
+
+/* ======================================================================
+ * ANALYZE TABLE
+ * ====================================================================== */
+
+static void test_analyze_table(void)
+{
+    printf("\n[test_analyze_table]\n");
+    engine_setup();
+
+    int rc;
+
+    sql("CREATE DATABASE shop;");
+    sql("USE shop;");
+    sql("CREATE TABLE products ("
+        "  id    INT PRIMARY KEY,"
+        "  name  VARCHAR(50) NOT NULL,"
+        "  price INT"
+        ");");
+
+    sql("INSERT INTO products (id, name, price) VALUES (1, 'Alpha', 100);");
+    sql("INSERT INTO products (id, name, price) VALUES (2, 'Beta',  200);");
+    sql("INSERT INTO products (id, name, price) VALUES (3, 'Gamma', 150);");
+
+    /* ---- basic ANALYZE TABLE ---- */
+    rc = sql("ANALYZE TABLE products;");
+    CHECK(rc == MYDB_OK,                        "ANALYZE TABLE → MYDB_OK");
+    CHECK(strstr(g_res, "OK") != NULL,          "ANALYZE TABLE → says OK");
+    CHECK(strstr(g_res, "products") != NULL,    "ANALYZE TABLE → mentions table name");
+
+    /* ---- ANALYZE non-existent table → error ---- */
+    rc = sql("ANALYZE TABLE nosuchone;");
+    CHECK(rc != MYDB_OK,                        "ANALYZE missing table → error");
+    CHECK(strstr(g_res, "Error") != NULL,       "ANALYZE missing table → error message");
+
+    /* ---- ANALYZE without USE → error ---- */
+    engine_teardown();
+    engine_setup();
+    rc = sql("ANALYZE TABLE products;");
+    CHECK(rc != MYDB_OK,                        "ANALYZE without USE → error");
+
+    engine_teardown();
+}
+
+/* ======================================================================
+ * CREATE USER / DROP USER / ALTER USER via SQL
+ * ====================================================================== */
+
+static void test_user_ddl(void)
+{
+    printf("\n[test_user_ddl]\n");
+    engine_setup();
+
+    int rc;
+
+    /* ---- CREATE USER ---- */
+    rc = sql("CREATE USER alice IDENTIFIED BY 'secret';");
+    CHECK(rc == MYDB_OK,                        "CREATE USER alice → MYDB_OK");
+    CHECK(strstr(g_res, "OK") != NULL,          "CREATE USER → says OK");
+    CHECK(strstr(g_res, "alice") != NULL,       "CREATE USER → mentions username");
+
+    /* ---- Duplicate user → error ---- */
+    rc = sql("CREATE USER alice IDENTIFIED BY 'pass2';");
+    CHECK(rc != MYDB_OK,                        "CREATE USER duplicate → error");
+    CHECK(strstr(g_res, "Error") != NULL,       "CREATE USER dup → error message");
+
+    /* ---- CREATE USER with quota ---- */
+    rc = sql("CREATE USER bob IDENTIFIED BY 'bobpass' QUOTA 200M;");
+    CHECK(rc == MYDB_OK,                        "CREATE USER bob QUOTA 200M → MYDB_OK");
+
+    /* ---- ALTER USER password ---- */
+    rc = sql("ALTER USER alice IDENTIFIED BY 'newpass';");
+    CHECK(rc == MYDB_OK,                        "ALTER USER password → MYDB_OK");
+    CHECK(strstr(g_res, "OK") != NULL,          "ALTER USER → says OK");
+    CHECK(strstr(g_res, "alice") != NULL,       "ALTER USER → mentions username");
+
+    /* ---- ALTER USER non-existent → error ---- */
+    rc = sql("ALTER USER nobody IDENTIFIED BY 'x';");
+    CHECK(rc != MYDB_OK,                        "ALTER USER non-existent → error");
+    CHECK(strstr(g_res, "Error") != NULL,       "ALTER USER non-existent → error message");
+
+    /* ---- ALTER USER SET QUOTA ---- */
+    rc = sql("ALTER USER bob SET QUOTA 500M;");
+    CHECK(rc == MYDB_OK,                        "ALTER USER SET QUOTA → MYDB_OK");
+    CHECK(strstr(g_res, "OK") != NULL,          "ALTER USER QUOTA → says OK");
+
+    /* ---- DROP USER ---- */
+    rc = sql("DROP USER bob;");
+    CHECK(rc == MYDB_OK,                        "DROP USER bob → MYDB_OK");
+    CHECK(strstr(g_res, "OK") != NULL,          "DROP USER → says OK");
+    CHECK(strstr(g_res, "bob") != NULL,         "DROP USER → mentions username");
+
+    /* ---- DROP non-existent user → error ---- */
+    rc = sql("DROP USER nobody;");
+    CHECK(rc != MYDB_OK,                        "DROP USER non-existent → error");
+    CHECK(strstr(g_res, "Error") != NULL,       "DROP USER non-existent → error message");
+
+    /* ---- root may not drop itself ---- */
+    rc = sql("DROP USER root;");
+    CHECK(rc != MYDB_OK,                        "DROP USER root (self) → error");
+    CHECK(strstr(g_res, "Error") != NULL,       "DROP USER self → error message");
+
+    engine_teardown();
+}
+
+/* ======================================================================
+ * UPDATE / DELETE — currently stubs; verify they return an error message
+ * ====================================================================== */
+
+static void test_dml_stubs(void)
+{
+    printf("\n[test_dml_stubs]\n");
+    engine_setup();
+
+    sql("CREATE DATABASE shop;");
+    sql("USE shop;");
+    sql("CREATE TABLE items (id INT PRIMARY KEY, val INT);");
+    sql("INSERT INTO items (id, val) VALUES (1, 10);");
+
+    int rc;
+
+    /* UPDATE is a stub — returns non-OK */
+    rc = sql("UPDATE items SET val = 99 WHERE id = 1;");
+    CHECK(rc != MYDB_OK,                   "UPDATE (stub) → non-OK");
+
+    /* DELETE is a stub — returns non-OK */
+    rc = sql("DELETE FROM items WHERE id = 1;");
+    CHECK(rc != MYDB_OK,                   "DELETE (stub) → non-OK");
+
+    engine_teardown();
+}
+
+/* ======================================================================
  * main
  * ====================================================================== */
 
@@ -1241,6 +1596,11 @@ int main(void)
     test_select();
     test_aggregates();
     test_group_by();
+    test_where_sql();
+    test_describe_table();
+    test_analyze_table();
+    test_user_ddl();
+    test_dml_stubs();
 
     rm_rf(TEST_ROOT);
 

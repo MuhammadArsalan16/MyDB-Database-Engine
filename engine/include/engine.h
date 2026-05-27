@@ -33,10 +33,13 @@ extern "C" {
 /* ------------------------------------------------------------------ */
 
 
-/* Default per-partition quota assigned at bootstrap. 1 GB is plenty
- * for the academic workload; configurable via a future `mydb` admin
- * subcommand. */
-#define ENGINE_DEFAULT_QUOTA_BYTES   (1024ULL * 1024ULL * 1024ULL)
+/* Per-partition quota constants.
+ *   DEFAULT — assigned at bootstrap and for new users when no QUOTA clause given.
+ *   MIN     — smallest quota accepted by CREATE USER / ALTER USER SET QUOTA.
+ *   MAX     — largest quota accepted. */
+#define ENGINE_DEFAULT_QUOTA_BYTES  (1024ULL * 1024ULL * 1024ULL)         /* 1 GB */
+#define ENGINE_MIN_QUOTA_BYTES      (100ULL  * 1024ULL * 1024ULL)         /* 100 MB */
+#define ENGINE_MAX_QUOTA_BYTES      (5ULL    * 1024ULL * 1024ULL * 1024ULL) /* 5 GB */
 
 
 typedef struct EngineState {
@@ -51,6 +54,8 @@ typedef struct EngineState {
     uint32_t       current_partition_id;
     char           current_partition_path[256];
     char           current_schema_name[32];
+
+    char           current_username[MAX_USERNAME]; /* set by engine_login */
 
     uint8_t        logged_in;
     uint8_t        partition_open;    /* 0 if user owns no partition (analyst) */
@@ -171,6 +176,58 @@ int engine_check_access(EngineState *eng, int write_required);
  * pointer is valid until the next USE / engine_close. */
 const RelationDef *engine_find_relation(EngineState *eng,
                                         const char *relation_name);
+
+
+/* ------------------------------------------------------------------ */
+/*  User management                                                    */
+/* ------------------------------------------------------------------ */
+
+/* Create a new user account, partition directory, and catalog.
+ *
+ *   username       — must be unique, non-empty, < MAX_USERNAME chars.
+ *   password       — plain-text; hashed + salted internally.
+ *   partition_name — directory name under engine root; NULL → username.
+ *                    Must not already exist as a partition path.
+ *   quota_bytes    — 0 → ENGINE_DEFAULT_QUOTA_BYTES.
+ *                    Clamped to [ENGINE_MIN_QUOTA_BYTES, ENGINE_MAX_QUOTA_BYTES].
+ *
+ * Returns MYDB_ERR_DUPLICATE  if username or partition_name already taken.
+ *         MYDB_ERR_FULL       if the partition directory limit is reached.
+ *         MYDB_ERR_PERM       if caller is not root (user_id == 1).  */
+int engine_create_user(EngineState *eng,
+                       const char  *username,
+                       const char  *password,
+                       const char  *partition_name,
+                       uint64_t     quota_bytes);
+
+/* Drop a user account, their partition directory and all its contents.
+ * Only root (user_id == 1) may call this.
+ * Rejects DROP USER root.
+ *
+ * Returns MYDB_ERR_PERM      if caller is not root.
+ *         MYDB_ERR_NOT_FOUND if the username does not exist. */
+int engine_drop_user(EngineState *eng, const char *username);
+
+/* Change a user's password.  Root may change any user's password.
+ * A non-root user may only change their own password (future — for
+ * Phase 1 only root uses these commands).
+ *
+ * Returns MYDB_ERR_NOT_FOUND if the username does not exist. */
+int engine_alter_user_password(EngineState *eng,
+                               const char  *username,
+                               const char  *new_password);
+
+/* Change a user's partition quota.
+ *   new_quota_bytes must be in [ENGINE_MIN_QUOTA_BYTES, ENGINE_MAX_QUOTA_BYTES].
+ *   Rejects if new_quota_bytes < current used_bytes (cannot set quota
+ *   below what has already been allocated).
+ *
+ * Returns MYDB_ERR_NOT_FOUND if the username does not exist.
+ *         MYDB_ERR_FULL      if new quota < current used_bytes.
+ *         MYDB_ERR           if quota is outside the allowed range. */
+int engine_alter_user_quota(EngineState *eng,
+                            const char  *username,
+                            uint64_t     new_quota_bytes);
 
 
 /* ------------------------------------------------------------------ */

@@ -16,6 +16,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <readline/readline.h>
+#include <readline/history.h>
 
 #include "common.h"
 #include "engine.h"
@@ -132,45 +134,76 @@ static int is_exit_command(const char *buf)
 
 static void run_repl(EngineState *eng)
 {
-    char query[REPL_QUERY_CAP];
-    char line[REPL_LINE_CAP];
-    char result[REPL_RESULT_CAP];
+    char   query[REPL_QUERY_CAP];
+    char   result[REPL_RESULT_CAP];
     size_t qlen = 0;
 
     printf("Type `exit` or Ctrl-D to quit.\n");
     query[0] = '\0';
 
     for (;;) {
-        fputs(qlen == 0 ? "mydb> " : "  ... ", stdout);
-        fflush(stdout);
+        const char *prompt = (qlen == 0) ? "mydb> " : "  ... ";
 
-        if (!fgets(line, sizeof(line), stdin)) {
+        char *line = readline(prompt);
+
+        /* Ctrl-D → EOF */
+        if (!line) {
             putchar('\n');
-            break;   /* EOF — Ctrl-D */
+            break;
         }
 
-        /* skip empty lines at the start of a fresh query */
-        if (qlen == 0 && is_blank(line)) continue;
-        if (qlen == 0 && is_exit_command(line)) break;
-
-        size_t llen = strlen(line);
-        if (qlen + llen + 1 >= sizeof(query)) {
-            fprintf(stderr, "mydb: query too long, discarded\n");
-            qlen = 0; query[0] = '\0';
+        /* clear command — erase the visible screen (scrollback preserved) */
+        if (qlen == 0 && strcmp(line, "clear") == 0) {
+            printf("\033[2J\033[H");
+            fflush(stdout);
+            free(line);
             continue;
         }
-        memcpy(query + qlen, line, llen + 1);
-        qlen += llen;
 
-        /* submit when the buffer ends with ';' (after stripping whitespace) */
+        /* skip blank lines at the start of a fresh query */
+        if (qlen == 0 && is_blank(line)) {
+            free(line);
+            continue;
+        }
+        if (qlen == 0 && is_exit_command(line)) {
+            free(line);
+            break;
+        }
+
+        /* append line + newline into query buffer */
+        size_t llen = strlen(line);
+        if (qlen + llen + 2 >= sizeof(query)) {
+            fprintf(stderr, "mydb: query too long, discarded\n");
+            qlen = 0; query[0] = '\0';
+            free(line);
+            continue;
+        }
+        memcpy(query + qlen, line, llen);
+        qlen += llen;
+        query[qlen++] = '\n';
+        query[qlen]   = '\0';
+        free(line);
+
+        /* submit when the buffer ends with ';' (ignore trailing whitespace) */
         const char *end = query + qlen;
         while (end > query && (end[-1] == '\n' || end[-1] == '\r' ||
-                               end[-1] == ' ' || end[-1] == '\t')) end--;
+                               end[-1] == ' '  || end[-1] == '\t')) end--;
         if (end == query || end[-1] != ';') continue;
+
+        /* add the completed query to readline history (strip trailing newline) */
+        char hist_entry[REPL_QUERY_CAP];
+        strncpy(hist_entry, query, sizeof(hist_entry) - 1);
+        hist_entry[sizeof(hist_entry) - 1] = '\0';
+        /* trim trailing whitespace for a clean history entry */
+        char *h = hist_entry + strlen(hist_entry) - 1;
+        while (h >= hist_entry && (*h == '\n' || *h == '\r' ||
+                                   *h == ' '  || *h == '\t')) *h-- = '\0';
+        if (hist_entry[0] != '\0')
+            add_history(hist_entry);
 
         int rc = engine_execute_sql(eng, query, result, sizeof(result));
         if (rc == MYDB_OK) printf("%s\n", result);
-        else               fprintf(stderr, "error: %s (rc=%d)\n", result, rc);
+        else               fprintf(stderr, "%s\n", result);
 
         qlen = 0; query[0] = '\0';
     }

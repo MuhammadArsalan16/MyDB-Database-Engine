@@ -12,6 +12,9 @@
  * On COMMIT or ROLLBACK failure we still clear g_in_explicit_txn
  * because the transaction is dead regardless of what the storage
  * layer did — leaving the flag set would block every future BEGIN.
+ *
+ * Design 3 output: "OK  BEGIN/COMMIT/ROLLBACK".
+ * Errors:          "  Error: ..."
  */
 
 #include "ast_executor.hpp"
@@ -31,48 +34,48 @@ int exec_tcl(EngineState * /*eng*/, const TransactionStatement *s,
 
     case TransactionCommand::BEGIN:
         if (g_in_explicit_txn) {
-            snprintf(out, cap, "ERROR: there is already an open transaction");
+            snprintf(out, cap, "  Error: there is already an open transaction");
             return MYDB_ERR;
         }
         rc = storage_begin();
         if (rc != MYDB_OK) {
-            snprintf(out, cap, "ERROR: storage_begin failed (rc=%d)", rc);
+            snprintf(out, cap, "  Error: storage_begin failed (rc=%d)", rc);
             return rc;
         }
         g_in_explicit_txn = true;
-        snprintf(out, cap, "BEGIN");
+        snprintf(out, cap, "OK  BEGIN");
         return MYDB_OK;
 
     case TransactionCommand::COMMIT:
         if (!g_in_explicit_txn) {
-            snprintf(out, cap, "ERROR: no active transaction");
+            snprintf(out, cap, "  Error: no active transaction");
             return MYDB_ERR_NO_TXN;
         }
         rc = storage_commit();
         g_in_explicit_txn = false;   /* clear even on error — txn is dead */
         if (rc != MYDB_OK) {
-            snprintf(out, cap, "ERROR: commit failed (rc=%d)", rc);
+            snprintf(out, cap, "  Error: commit failed (rc=%d)", rc);
             return rc;
         }
-        snprintf(out, cap, "COMMIT");
+        snprintf(out, cap, "OK  COMMIT");
         return MYDB_OK;
 
     case TransactionCommand::ROLLBACK:
         if (!g_in_explicit_txn) {
-            snprintf(out, cap, "ERROR: no active transaction");
+            snprintf(out, cap, "  Error: no active transaction");
             return MYDB_ERR_NO_TXN;
         }
         rc = storage_rollback();
         g_in_explicit_txn = false;
         if (rc != MYDB_OK) {
-            snprintf(out, cap, "ERROR: rollback failed (rc=%d)", rc);
+            snprintf(out, cap, "  Error: rollback failed (rc=%d)", rc);
             return rc;
         }
-        snprintf(out, cap, "ROLLBACK");
+        snprintf(out, cap, "OK  ROLLBACK");
         return MYDB_OK;
 
     default:
-        snprintf(out, cap, "ERROR: unknown transaction command");
+        snprintf(out, cap, "  Error: unknown transaction command");
         return MYDB_ERR;
     }
 }

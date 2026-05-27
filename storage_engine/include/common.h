@@ -49,6 +49,7 @@
 #define FILETYPE_RELATION    4   /* <relation>.mydb        — B+ tree data file */
 #define FILETYPE_USERS       5   /* system_schema/users.mydb */
 #define FILETYPE_PRIVILEGES  6   /* system_schema/privileges.mydb */
+#define FILETYPE_STATS       7   /* __stats.mydb           — CBO optimizer stats */
 
 /* ------------------------------------------------------------------ */
 /*  On-disk format version. Bumped when any file layout changes in    */

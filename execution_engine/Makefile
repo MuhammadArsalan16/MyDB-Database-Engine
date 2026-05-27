@@ -140,6 +140,102 @@ execution_engine/fast:
 	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f execution_engine/CMakeFiles/execution_engine.dir/build.make execution_engine/CMakeFiles/execution_engine.dir/build
 .PHONY : execution_engine/fast
 
+src/ddl.o: src/ddl.cpp.o
+.PHONY : src/ddl.o
+
+# target to build an object file
+src/ddl.cpp.o:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f execution_engine/CMakeFiles/execution_engine.dir/build.make execution_engine/CMakeFiles/execution_engine.dir/src/ddl.cpp.o
+.PHONY : src/ddl.cpp.o
+
+src/ddl.i: src/ddl.cpp.i
+.PHONY : src/ddl.i
+
+# target to preprocess a source file
+src/ddl.cpp.i:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f execution_engine/CMakeFiles/execution_engine.dir/build.make execution_engine/CMakeFiles/execution_engine.dir/src/ddl.cpp.i
+.PHONY : src/ddl.cpp.i
+
+src/ddl.s: src/ddl.cpp.s
+.PHONY : src/ddl.s
+
+# target to generate assembly for a file
+src/ddl.cpp.s:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f execution_engine/CMakeFiles/execution_engine.dir/build.make execution_engine/CMakeFiles/execution_engine.dir/src/ddl.cpp.s
+.PHONY : src/ddl.cpp.s
+
+src/dispatch.o: src/dispatch.cpp.o
+.PHONY : src/dispatch.o
+
+# target to build an object file
+src/dispatch.cpp.o:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f execution_engine/CMakeFiles/execution_engine.dir/build.make execution_engine/CMakeFiles/execution_engine.dir/src/dispatch.cpp.o
+.PHONY : src/dispatch.cpp.o
+
+src/dispatch.i: src/dispatch.cpp.i
+.PHONY : src/dispatch.i
+
+# target to preprocess a source file
+src/dispatch.cpp.i:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f execution_engine/CMakeFiles/execution_engine.dir/build.make execution_engine/CMakeFiles/execution_engine.dir/src/dispatch.cpp.i
+.PHONY : src/dispatch.cpp.i
+
+src/dispatch.s: src/dispatch.cpp.s
+.PHONY : src/dispatch.s
+
+# target to generate assembly for a file
+src/dispatch.cpp.s:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f execution_engine/CMakeFiles/execution_engine.dir/build.make execution_engine/CMakeFiles/execution_engine.dir/src/dispatch.cpp.s
+.PHONY : src/dispatch.cpp.s
+
+src/dml.o: src/dml.cpp.o
+.PHONY : src/dml.o
+
+# target to build an object file
+src/dml.cpp.o:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f execution_engine/CMakeFiles/execution_engine.dir/build.make execution_engine/CMakeFiles/execution_engine.dir/src/dml.cpp.o
+.PHONY : src/dml.cpp.o
+
+src/dml.i: src/dml.cpp.i
+.PHONY : src/dml.i
+
+# target to preprocess a source file
+src/dml.cpp.i:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f execution_engine/CMakeFiles/execution_engine.dir/build.make execution_engine/CMakeFiles/execution_engine.dir/src/dml.cpp.i
+.PHONY : src/dml.cpp.i
+
+src/dml.s: src/dml.cpp.s
+.PHONY : src/dml.s
+
+# target to generate assembly for a file
+src/dml.cpp.s:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f execution_engine/CMakeFiles/execution_engine.dir/build.make execution_engine/CMakeFiles/execution_engine.dir/src/dml.cpp.s
+.PHONY : src/dml.cpp.s
+
+src/dql.o: src/dql.cpp.o
+.PHONY : src/dql.o
+
+# target to build an object file
+src/dql.cpp.o:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f execution_engine/CMakeFiles/execution_engine.dir/build.make execution_engine/CMakeFiles/execution_engine.dir/src/dql.cpp.o
+.PHONY : src/dql.cpp.o
+
+src/dql.i: src/dql.cpp.i
+.PHONY : src/dql.i
+
+# target to preprocess a source file
+src/dql.cpp.i:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f execution_engine/CMakeFiles/execution_engine.dir/build.make execution_engine/CMakeFiles/execution_engine.dir/src/dql.cpp.i
+.PHONY : src/dql.cpp.i
+
+src/dql.s: src/dql.cpp.s
+.PHONY : src/dql.s
+
+# target to generate assembly for a file
+src/dql.cpp.s:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f execution_engine/CMakeFiles/execution_engine.dir/build.make execution_engine/CMakeFiles/execution_engine.dir/src/dql.cpp.s
+.PHONY : src/dql.cpp.s
+
 src/exec_engine_api.o: src/exec_engine_api.cpp.o
 .PHONY : src/exec_engine_api.o
 
@@ -164,6 +260,102 @@ src/exec_engine_api.cpp.s:
 	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f execution_engine/CMakeFiles/execution_engine.dir/build.make execution_engine/CMakeFiles/execution_engine.dir/src/exec_engine_api.cpp.s
 .PHONY : src/exec_engine_api.cpp.s
 
+src/expr_eval.o: src/expr_eval.cpp.o
+.PHONY : src/expr_eval.o
+
+# target to build an object file
+src/expr_eval.cpp.o:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f execution_engine/CMakeFiles/execution_engine.dir/build.make execution_engine/CMakeFiles/execution_engine.dir/src/expr_eval.cpp.o
+.PHONY : src/expr_eval.cpp.o
+
+src/expr_eval.i: src/expr_eval.cpp.i
+.PHONY : src/expr_eval.i
+
+# target to preprocess a source file
+src/expr_eval.cpp.i:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f execution_engine/CMakeFiles/execution_engine.dir/build.make execution_engine/CMakeFiles/execution_engine.dir/src/expr_eval.cpp.i
+.PHONY : src/expr_eval.cpp.i
+
+src/expr_eval.s: src/expr_eval.cpp.s
+.PHONY : src/expr_eval.s
+
+# target to generate assembly for a file
+src/expr_eval.cpp.s:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f execution_engine/CMakeFiles/execution_engine.dir/build.make execution_engine/CMakeFiles/execution_engine.dir/src/expr_eval.cpp.s
+.PHONY : src/expr_eval.cpp.s
+
+src/result_fmt.o: src/result_fmt.cpp.o
+.PHONY : src/result_fmt.o
+
+# target to build an object file
+src/result_fmt.cpp.o:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f execution_engine/CMakeFiles/execution_engine.dir/build.make execution_engine/CMakeFiles/execution_engine.dir/src/result_fmt.cpp.o
+.PHONY : src/result_fmt.cpp.o
+
+src/result_fmt.i: src/result_fmt.cpp.i
+.PHONY : src/result_fmt.i
+
+# target to preprocess a source file
+src/result_fmt.cpp.i:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f execution_engine/CMakeFiles/execution_engine.dir/build.make execution_engine/CMakeFiles/execution_engine.dir/src/result_fmt.cpp.i
+.PHONY : src/result_fmt.cpp.i
+
+src/result_fmt.s: src/result_fmt.cpp.s
+.PHONY : src/result_fmt.s
+
+# target to generate assembly for a file
+src/result_fmt.cpp.s:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f execution_engine/CMakeFiles/execution_engine.dir/build.make execution_engine/CMakeFiles/execution_engine.dir/src/result_fmt.cpp.s
+.PHONY : src/result_fmt.cpp.s
+
+src/tcl.o: src/tcl.cpp.o
+.PHONY : src/tcl.o
+
+# target to build an object file
+src/tcl.cpp.o:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f execution_engine/CMakeFiles/execution_engine.dir/build.make execution_engine/CMakeFiles/execution_engine.dir/src/tcl.cpp.o
+.PHONY : src/tcl.cpp.o
+
+src/tcl.i: src/tcl.cpp.i
+.PHONY : src/tcl.i
+
+# target to preprocess a source file
+src/tcl.cpp.i:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f execution_engine/CMakeFiles/execution_engine.dir/build.make execution_engine/CMakeFiles/execution_engine.dir/src/tcl.cpp.i
+.PHONY : src/tcl.cpp.i
+
+src/tcl.s: src/tcl.cpp.s
+.PHONY : src/tcl.s
+
+# target to generate assembly for a file
+src/tcl.cpp.s:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f execution_engine/CMakeFiles/execution_engine.dir/build.make execution_engine/CMakeFiles/execution_engine.dir/src/tcl.cpp.s
+.PHONY : src/tcl.cpp.s
+
+src/value_cast.o: src/value_cast.cpp.o
+.PHONY : src/value_cast.o
+
+# target to build an object file
+src/value_cast.cpp.o:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f execution_engine/CMakeFiles/execution_engine.dir/build.make execution_engine/CMakeFiles/execution_engine.dir/src/value_cast.cpp.o
+.PHONY : src/value_cast.cpp.o
+
+src/value_cast.i: src/value_cast.cpp.i
+.PHONY : src/value_cast.i
+
+# target to preprocess a source file
+src/value_cast.cpp.i:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f execution_engine/CMakeFiles/execution_engine.dir/build.make execution_engine/CMakeFiles/execution_engine.dir/src/value_cast.cpp.i
+.PHONY : src/value_cast.cpp.i
+
+src/value_cast.s: src/value_cast.cpp.s
+.PHONY : src/value_cast.s
+
+# target to generate assembly for a file
+src/value_cast.cpp.s:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f execution_engine/CMakeFiles/execution_engine.dir/build.make execution_engine/CMakeFiles/execution_engine.dir/src/value_cast.cpp.s
+.PHONY : src/value_cast.cpp.s
+
 # Help Target
 help:
 	@echo "The following are some of the valid targets for this Makefile:"
@@ -174,9 +366,33 @@ help:
 	@echo "... rebuild_cache"
 	@echo "... test"
 	@echo "... execution_engine"
+	@echo "... src/ddl.o"
+	@echo "... src/ddl.i"
+	@echo "... src/ddl.s"
+	@echo "... src/dispatch.o"
+	@echo "... src/dispatch.i"
+	@echo "... src/dispatch.s"
+	@echo "... src/dml.o"
+	@echo "... src/dml.i"
+	@echo "... src/dml.s"
+	@echo "... src/dql.o"
+	@echo "... src/dql.i"
+	@echo "... src/dql.s"
 	@echo "... src/exec_engine_api.o"
 	@echo "... src/exec_engine_api.i"
 	@echo "... src/exec_engine_api.s"
+	@echo "... src/expr_eval.o"
+	@echo "... src/expr_eval.i"
+	@echo "... src/expr_eval.s"
+	@echo "... src/result_fmt.o"
+	@echo "... src/result_fmt.i"
+	@echo "... src/result_fmt.s"
+	@echo "... src/tcl.o"
+	@echo "... src/tcl.i"
+	@echo "... src/tcl.s"
+	@echo "... src/value_cast.o"
+	@echo "... src/value_cast.i"
+	@echo "... src/value_cast.s"
 .PHONY : help
 
 

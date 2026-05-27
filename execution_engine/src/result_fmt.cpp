@@ -1,25 +1,27 @@
 /*
- * result_fmt.cpp — format storage rows and error codes into result strings.
+ * result_fmt.cpp — Design 3 output formatting implementation.
  *
- * format_error  — already implemented (maps MYDB_* codes to text).
- * ResultBuf     — already implemented (safe append-only buffer).
+ * format_error  — maps MYDB_* codes to "  Error: ..." strings.
+ * value_to_str  — Value → std::string for any column type.
+ * ResultBuf     — safe append-only buffer (unchanged interface).
+ * TableBuilder  — two-pass column-aligned table renderer.
  *
- * Phase 2 adds:
- *   append_value  — type-aware Value → text formatting.
- *   emit_header   — column names line followed by a separator.
- *   emit_row      — one pipe-separated data row.
- *
- * Output format example:
- *   id | name | age
- *   ---+------+----
- *   1 | Alice | 30
- *   2 | Bob | 25
+ * Design 3 table format:
+ *   id    name        age
+ *   ---   ----------  ---
+ *   1     Alice        30
+ *   2     Bob          25
  *
  *   (2 rows)
+ *
+ * Column separator: two spaces ("  ").
+ * All columns are left-aligned.
+ * Footer produced by finalize(): "\n(N rows)".
  */
 
 #include "result_fmt.hpp"
 
+#include <algorithm>
 #include <cstring>
 #include <cstdio>
 
@@ -31,24 +33,90 @@ void format_error(int rc, char *out, size_t cap, const char *ctx)
 {
     const char *msg;
     switch (rc) {
-    case MYDB_OK:                 msg = "OK";                              break;
-    case MYDB_ERR_NOT_FOUND:      msg = "not found";                       break;
-    case MYDB_ERR_DUPLICATE:      msg = "duplicate key value";             break;
-    case MYDB_ERR_FULL:           msg = "storage full";                    break;
-    case MYDB_ERR_FK_VIOLATION:   msg = "foreign key violation";           break;
-    case MYDB_ERR_NULL_VIOLATION: msg = "NULL not allowed";                break;
-    case MYDB_ERR_NO_TXN:         msg = "no active transaction";           break;
-    case MYDB_ERR_PERM:           msg = "permission denied";               break;
-    case MYDB_ERR_CROSS_SCHEMA:   msg = "cross-schema query not supported";break;
+    case MYDB_OK:                 msg = "OK";                               break;
+    case MYDB_ERR_NOT_FOUND:      msg = "not found";                        break;
+    case MYDB_ERR_DUPLICATE:      msg = "duplicate key value";              break;
+    case MYDB_ERR_FULL:           msg = "storage full";                     break;
+    case MYDB_ERR_FK_VIOLATION:   msg = "foreign key violation";            break;
+    case MYDB_ERR_NULL_VIOLATION: msg = "NULL not allowed";                 break;
+    case MYDB_ERR_NO_TXN:         msg = "no active transaction";            break;
+    case MYDB_ERR_PERM:           msg = "permission denied";                break;
+    case MYDB_ERR_CROSS_SCHEMA:   msg = "cross-schema query not supported"; break;
     case MYDB_ERR_BAD_MAGIC:
     case MYDB_ERR_BAD_FILE_TYPE:
     case MYDB_ERR_BAD_VERSION:
-    case MYDB_ERR_BAD_CHECKSUM:   msg = "database corruption";             break;
-    default:                      msg = "internal error";                  break;
+    case MYDB_ERR_BAD_CHECKSUM:   msg = "database corruption";              break;
+    default:                      msg = "internal error";                   break;
     }
 
-    if (ctx) snprintf(out, cap, "%s: %s", msg, ctx);
-    else     snprintf(out, cap, "%s",     msg);
+    if (ctx) snprintf(out, cap, "  Error: %s: %s", msg, ctx);
+    else     snprintf(out, cap, "  Error: %s",     msg);
+}
+
+/* ======================================================================
+ * value_to_str
+ * ====================================================================== */
+
+std::string value_to_str(const Value &v, const ColumnDef &col)
+{
+    if (v.is_null) return "NULL";
+
+    char tmp[128];
+
+    switch (col.type) {
+
+    case TYPE_INT:
+        snprintf(tmp, sizeof(tmp), "%d", v.v.int_val);
+        return tmp;
+
+    case TYPE_DECIMAL: {
+        int scale   = (col.scale > 0) ? col.scale : 2;
+        int64_t div = 1;
+        for (int i = 0; i < scale; i++) div *= 10;
+        int64_t whole = v.v.decimal_val / div;
+        int64_t frac  = v.v.decimal_val % div;
+        if (frac < 0) frac = -frac;
+        char fmt[24];
+        snprintf(fmt, sizeof(fmt), "%%lld.%%0%dlld", scale);
+        snprintf(tmp, sizeof(tmp), fmt, (long long)whole, (long long)frac);
+        return tmp;
+    }
+
+    case TYPE_VARCHAR:
+        return std::string(v.v.varchar_val.data);
+
+    case TYPE_BOOL:
+        return v.v.bool_val ? "true" : "false";
+
+    case TYPE_ENUM:
+        if (v.v.enum_val < col.num_enum_values)
+            return col.enum_values[v.v.enum_val];
+        return "?";
+
+    case TYPE_DATE: {
+        int y = v.v.date_val / 10000;
+        int m = (v.v.date_val / 100) % 100;
+        int d = v.v.date_val % 100;
+        snprintf(tmp, sizeof(tmp), "%02d-%02d-%04d", d, m, y);
+        return tmp;
+    }
+
+    case TYPE_DATETIME: {
+        int64_t dt  = v.v.datetime_val;
+        int sec  = (int)(dt % 100); dt /= 100;
+        int min  = (int)(dt % 100); dt /= 100;
+        int hour = (int)(dt % 100); dt /= 100;
+        int day  = (int)(dt % 100); dt /= 100;
+        int mon  = (int)(dt % 100); dt /= 100;
+        int year = (int)dt;
+        snprintf(tmp, sizeof(tmp), "%04d-%02d-%02d %02d:%02d:%02d",
+                 year, mon, day, hour, min, sec);
+        return tmp;
+    }
+
+    default:
+        return "?";
+    }
 }
 
 /* ======================================================================
@@ -89,205 +157,92 @@ void ResultBuf::append_char(char c)
     append(tmp);
 }
 
-/* ======================================================================
- * append_value — format one Value as human-readable text
- * ====================================================================== */
-
 void ResultBuf::append_value(const Value &v, const ColumnDef &col)
 {
-    char tmp[64];
-
-    if (v.is_null) { append("NULL"); return; }
-
-    switch (col.type) {
-
-    case TYPE_INT:
-        snprintf(tmp, sizeof(tmp), "%d", v.v.int_val);
-        append(tmp);
-        break;
-
-    case TYPE_DECIMAL: {
-        /*
-         * Stored as integer * 10^scale.
-         * Reconstruct whole and fractional parts for display.
-         * Example: stored=314, scale=2 → "3.14"
-         */
-        int scale = (col.scale > 0) ? col.scale : 2;
-        int64_t divisor = 1;
-        for (int i = 0; i < scale; i++) divisor *= 10;
-
-        int64_t whole = v.v.decimal_val / divisor;
-        int64_t frac  = v.v.decimal_val % divisor;
-        if (frac < 0) frac = -frac;
-
-        /* build format string: e.g. "%lld.%02lld" for scale=2 */
-        char fmt[24];
-        snprintf(fmt, sizeof(fmt), "%%lld.%%0%dlld", scale);
-        snprintf(tmp, sizeof(tmp), fmt, (long long)whole, (long long)frac);
-        append(tmp);
-        break;
-    }
-
-    case TYPE_VARCHAR:
-        /* data is always NUL-terminated (cast_literal ensures this) */
-        append(v.v.varchar_val.data);
-        break;
-
-    case TYPE_BOOL:
-        append(v.v.bool_val ? "true" : "false");
-        break;
-
-    case TYPE_ENUM:
-        if (v.v.enum_val < col.num_enum_values)
-            append(col.enum_values[v.v.enum_val]);
-        else
-            append("?");
-        break;
-
-    case TYPE_DATE: {
-        /* stored as YYYYMMDD → display as DD-MM-YYYY */
-        int y = v.v.date_val / 10000;
-        int m = (v.v.date_val / 100) % 100;
-        int d = v.v.date_val % 100;
-        snprintf(tmp, sizeof(tmp), "%02d-%02d-%04d", d, m, y);
-        append(tmp);
-        break;
-    }
-
-    case TYPE_DATETIME: {
-        /* stored as YYYYMMDDHHmmSS → display as YYYY-MM-DD HH:MM:SS */
-        int64_t dt  = v.v.datetime_val;
-        int sec  = (int)(dt % 100);  dt /= 100;
-        int min  = (int)(dt % 100);  dt /= 100;
-        int hour = (int)(dt % 100);  dt /= 100;
-        int day  = (int)(dt % 100);  dt /= 100;
-        int mon  = (int)(dt % 100);  dt /= 100;
-        int year = (int)dt;
-        snprintf(tmp, sizeof(tmp), "%04d-%02d-%02d %02d:%02d:%02d",
-                 year, mon, day, hour, min, sec);
-        append(tmp);
-        break;
-    }
-
-    default:
-        append("?");
-        break;
-    }
+    std::string s = value_to_str(v, col);
+    append(s.c_str());
 }
-
-/* ======================================================================
- * finalize
- * ====================================================================== */
 
 void ResultBuf::finalize(size_t nrows)
 {
+    /* Blank line + footer.  Engine timing ("  (0.01s)") is appended
+     * by engine_execute_sql() directly after this footer. */
     char footer[64];
-    snprintf(footer, sizeof(footer), "\n(%zu row%s)\n",
+    snprintf(footer, sizeof(footer), "\n(%zu row%s)",
              nrows, nrows == 1 ? "" : "s");
     if (!truncated) append(footer);
 }
 
 /* ======================================================================
- * emit_header — column names + separator line
+ * TableBuilder
  * ====================================================================== */
 
-void emit_header(ResultBuf &rb, const RelationDef *rel,
-                 const SelectStatement *stmt)
+void TableBuilder::set_headers(const std::vector<std::string> &h)
 {
-    bool first = true;
-
-    if (stmt->is_select_all) {
-        /* SELECT * — print every column */
-        for (int i = 0; i < (int)rel->num_columns; i++) {
-            if (!first) rb.append(" | ");
-            rb.append(rel->columns[i].name);
-            first = false;
-        }
-    } else {
-        /* Specific column list */
-        for (const auto &item : stmt->select_list) {
-            if (!first) rb.append(" | ");
-
-            if (item.kind == SelectItem::Kind::Aggregate) {
-                /* e.g. COUNT(id) or SUM(price) AS total */
-                char tmp[128];
-                if (!item.alias.empty())
-                    snprintf(tmp, sizeof(tmp), "%s", item.alias.c_str());
-                else
-                    snprintf(tmp, sizeof(tmp), "%s(%s)",
-                             item.agg_func.c_str(), item.column.c_str());
-                rb.append(tmp);
-            } else {
-                /* Kind::Column — use alias if provided, else column name */
-                const char *label = item.alias.empty()
-                                    ? item.column.c_str()
-                                    : item.alias.c_str();
-                rb.append(label);
-            }
-            first = false;
-        }
-    }
-
-    rb.append("\n");
-
-    /*
-     * Separator line: replace every non-separator character with '-'
-     * and every ' | ' with '-+-'.
-     * Simple approach: just emit a fixed-width dashes line.
-     * We use the last-written position as an approximation of width.
-     */
-    size_t header_len = rb.pos;   /* length up to and including \n */
-    /* emit dashes equal to the header width (minus the newline) */
-    for (size_t i = 0; i + 1 < header_len; i++) {
-        char c = rb.buf[i];
-        if (c == '|')      rb.append_char('+');
-        else if (c == ' ') rb.append_char('-');
-        else               rb.append_char('-');
-    }
-    rb.append("\n");
+    headers_ = h;
 }
 
-/* ======================================================================
- * emit_row — one pipe-separated data row
- * ====================================================================== */
-
-void emit_row(ResultBuf &rb, const RelationDef *rel,
-              const Row *row, const SelectStatement *stmt)
+void TableBuilder::add_row(const std::vector<std::string> &r)
 {
-    bool first = true;
+    rows_.push_back(r);
+}
 
-    if (stmt->is_select_all) {
-        for (int i = 0; i < (int)rel->num_columns; i++) {
-            if (!first) rb.append(" | ");
-            rb.append_value(row->cols[i], rel->columns[i]);
-            first = false;
-        }
-    } else {
-        for (const auto &item : stmt->select_list) {
-            if (!first) rb.append(" | ");
-
-            if (item.kind == SelectItem::Kind::Aggregate) {
-                /* aggregates are resolved before emit_row is called —
-                 * Phase 5 (dql.cpp) computes them and passes a pre-built
-                 * row; for now just print NULL as a placeholder */
-                rb.append("NULL");
-            } else {
-                /* find the column index by name */
-                int idx = -1;
-                for (int i = 0; i < (int)rel->num_columns; i++) {
-                    if (strcmp(rel->columns[i].name, item.column.c_str()) == 0) {
-                        idx = i;
-                        break;
-                    }
-                }
-                if (idx >= 0)
-                    rb.append_value(row->cols[idx], rel->columns[idx]);
-                else
-                    rb.append("NULL");
-            }
-            first = false;
-        }
+/*
+ * render() — two-pass aligned table.
+ *
+ * Pass 1: compute max width per column (max of header and all cell widths).
+ * Pass 2: emit header, separator, data rows, and "(N rows)" footer.
+ *
+ * Column separator: two spaces.
+ * All columns left-aligned (trailing spaces on all but the last column).
+ */
+void TableBuilder::render(ResultBuf &rb) const
+{
+    if (headers_.empty()) {
+        rb.finalize(0);
+        return;
     }
 
+    int ncols = (int)headers_.size();
+
+    /* Pass 1 — compute per-column widths. */
+    std::vector<size_t> widths(ncols, 0);
+    for (int i = 0; i < ncols; i++)
+        widths[i] = headers_[i].size();
+    for (const auto &row : rows_)
+        for (int i = 0; i < ncols && i < (int)row.size(); i++)
+            widths[i] = std::max(widths[i], row[i].size());
+
+    /* Pass 2a — header row. */
+    for (int i = 0; i < ncols; i++) {
+        if (i > 0) rb.append("  ");
+        const std::string &h = headers_[i];
+        rb.append(h.c_str());
+        /* Pad to column width (skip trailing pad on last column). */
+        if (i + 1 < ncols)
+            for (size_t p = h.size(); p < widths[i]; p++) rb.append_char(' ');
+    }
     rb.append("\n");
+
+    /* Pass 2b — separator row (dashes). */
+    for (int i = 0; i < ncols; i++) {
+        if (i > 0) rb.append("  ");
+        for (size_t p = 0; p < widths[i]; p++) rb.append_char('-');
+    }
+    rb.append("\n");
+
+    /* Pass 2c — data rows. */
+    for (const auto &row : rows_) {
+        for (int i = 0; i < ncols; i++) {
+            if (i > 0) rb.append("  ");
+            const std::string &cell = (i < (int)row.size()) ? row[i] : "";
+            rb.append(cell.c_str());
+            if (i + 1 < ncols)
+                for (size_t p = cell.size(); p < widths[i]; p++) rb.append_char(' ');
+        }
+        rb.append("\n");
+    }
+
+    /* Footer. */
+    rb.finalize(rows_.size());
 }

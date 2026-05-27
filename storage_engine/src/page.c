@@ -476,14 +476,14 @@ static uint16_t record_phys_size(const uint8_t *page, uint16_t doff)
     /* INTERNAL page */
     if (hdr.page_type == PAGE_TYPE_INTERNAL) {
         uint16_t result = (uint16_t)(2 + klen + 4);
-        printf("Physical size = 2 + %u + 4 = %u\n", klen, result);
+        /* printf("Physical size = 2 + %u + 4 = %u\n", klen, result); */
         return result;
     }
 
     /* INDEX page */
     if (hdr.page_type == PAGE_TYPE_INDEX) {
         uint16_t result = (uint16_t)(2 + klen + 6);
-        printf("Physical size = 2 + %u + 6 = %u\n", klen, result);
+        /* printf("Physical size = 2 + %u + 6 = %u\n", klen, result); */
         return result;
     }
 
@@ -492,8 +492,7 @@ static uint16_t record_phys_size(const uint8_t *page, uint16_t doff)
 
     uint16_t result = (uint16_t)(4 + klen + vlen);
 
-    printf("Physical size = 4 + %u + %u = %u\n",
-           klen, vlen, result);
+    /* printf("Physical size = 4 + %u + %u = %u\n", klen, vlen, result); */
 
     return result;
 }

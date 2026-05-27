@@ -14,6 +14,73 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstdio>
+#include <cctype>
+
+bool validate_literal(const std::string &token, const ColumnDef &col)
+{
+    /* NULL is valid for any type (DEFAULT NULL is always legal). */
+    if (token == "NULL") return true;
+
+    const char *s = token.c_str();
+    char       *end = nullptr;
+
+    switch (col.type) {
+
+    case TYPE_INT:
+        /*
+         * Must be an optional leading '-' or '+' followed by at least one
+         * digit, with nothing left over.  strtol sets end to the first
+         * character it could not consume.
+         */
+        strtol(s, &end, 10);
+        return (end != s) && (*end == '\0');
+
+    case TYPE_DECIMAL:
+        /*
+         * Must be a valid floating-point literal with nothing left over.
+         * Rejects pure alphabetic strings like "hello" which strtod silently
+         * converts to 0.0.
+         */
+        strtod(s, &end);
+        return (end != s) && (*end == '\0');
+
+    case TYPE_BOOL:
+        /*
+         * Only the six canonical boolean literals are accepted.
+         * Rejects numeric values like 42 — use 1 or 0 explicitly.
+         */
+        return (token == "TRUE"  || token == "true"  ||
+                token == "FALSE" || token == "false" ||
+                token == "1"     || token == "0");
+
+    case TYPE_ENUM:
+        /* Token must match one of the column's declared enum labels. */
+        for (int i = 0; i < col.num_enum_values; i++)
+            if (strcmp(col.enum_values[i], s) == 0) return true;
+        return false;
+
+    case TYPE_VARCHAR:
+        /* Any string is valid; length is clamped elsewhere. */
+        return true;
+
+    case TYPE_DATE: {
+        /* Must parse as DD-MM-YYYY, DD/MM/YYYY, or YYYY-MM-DD. */
+        int a = 0, b = 0, c = 0;
+        int parsed = sscanf(s, "%d-%d-%d", &a, &b, &c);
+        if (parsed != 3) parsed = sscanf(s, "%d/%d/%d", &a, &b, &c);
+        return parsed == 3;
+    }
+
+    case TYPE_DATETIME: {
+        /* Must parse as YYYY-MM-DD HH:MM:SS. */
+        int Y = 0, Mo = 0, D = 0, h = 0, mi = 0, sec = 0;
+        return sscanf(s, "%d-%d-%d %d:%d:%d", &Y, &Mo, &D, &h, &mi, &sec) == 6;
+    }
+
+    default:
+        return false;
+    }
+}
 
 Value cast_literal(const std::string &token, const ColumnDef &col)
 {

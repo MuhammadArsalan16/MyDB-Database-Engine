@@ -1,6 +1,7 @@
 /*
  * ddl.cpp — CREATE TABLE, DROP TABLE, CREATE DATABASE, DROP DATABASE,
- *            USE, SHOW TABLES, SHOW DATABASES handlers.
+ *            USE, SHOW TABLES, SHOW DATABASES,
+ *            CREATE USER, DROP USER, ALTER USER handlers.
  *
  * Guard macros used in most handlers:
  *
@@ -13,9 +14,13 @@
 #include "exec_internal.h"
 #include "result_fmt.hpp"
 #include "value_cast.hpp"
+#include "stats.h"
 
 #include <cstring>
 #include <cstdio>
+#include <cctype>
+#include <string>
+#include <stdexcept>
 
 /*
  * Map the parser's data_type string to a DataType enum value.
@@ -53,7 +58,7 @@ int exec_create_database(EngineState *eng,
         return rc;
     }
 
-    snprintf(out, cap, "Query OK, 1 row affected");
+    snprintf(out, cap, "OK  Database '%s' created", s->name.c_str());
     return MYDB_OK;
 }
 
@@ -61,20 +66,37 @@ int exec_create_database(EngineState *eng,
  * DROP DATABASE
  * ====================================================================== */
 
-int exec_drop_database(EngineState * /*eng*/,
-                       const DropDatabaseStatement * /*s*/,
+int exec_drop_database(EngineState *eng,
+                       const DropDatabaseStatement *s,
                        char *out, size_t cap)
 {
-    /*
-     * storage_drop_schema() does not exist in the storage API yet.
-     * Dropping a schema requires removing all its relation files,
-     * rmdir-ing the schema directory, and updating __catalog.mydb —
-     * none of which are exposed through a single storage call today.
-     * This will be supported once storage_drop_schema is added to
-     * the storage engine.
-     */
-    snprintf(out, cap, "ERROR: DROP DATABASE not yet supported");
-    return MYDB_ERR;
+    REQUIRE_LOGIN(eng);
+    REQUIRE_PARTITION(eng);
+
+    /* The user must not be inside the schema they are dropping.
+     * storage_drop_schema rejects that with MYDB_ERR — surface a
+     * clearer message here. */
+    if (eng->schema_active &&
+        s->name == eng->current_schema_name) {
+        snprintf(out, cap,
+                 "  Error: cannot drop the currently active database '%s' "
+                 "— run USE <another_db> or disconnect first",
+                 s->name.c_str());
+        return MYDB_ERR;
+    }
+
+    int rc = storage_drop_schema(s->name.c_str());
+    if (rc == MYDB_ERR_NOT_FOUND) {
+        snprintf(out, cap, "  Error: database '%s' does not exist", s->name.c_str());
+        return rc;
+    }
+    if (rc != MYDB_OK) {
+        format_error(rc, out, cap, s->name.c_str());
+        return rc;
+    }
+
+    snprintf(out, cap, "OK  Database '%s' dropped", s->name.c_str());
+    return MYDB_OK;
 }
 
 /* ======================================================================
@@ -112,7 +134,7 @@ int exec_use(EngineState *eng, const UseStatement *s,
         return rc;
     }
 
-    snprintf(out, cap, "Database changed");
+    snprintf(out, cap, "OK  Database changed to '%s'", s->schema_name.c_str());
     return MYDB_OK;
 }
 
@@ -127,11 +149,11 @@ int exec_create_table(EngineState *eng, const CreateTableStatement *s,
     REQUIRE_SCHEMA(eng);
 
     if (s->columns.empty()) {
-        snprintf(out, cap, "ERROR: CREATE TABLE with no columns");
+        snprintf(out, cap, "  Error: CREATE TABLE with no columns");
         return MYDB_ERR;
     }
     if ((int)s->columns.size() > MAX_COLUMNS) {
-        snprintf(out, cap, "ERROR: too many columns (max %d)", MAX_COLUMNS);
+        snprintf(out, cap, "  Error: too many columns (max %d)", MAX_COLUMNS);
         return MYDB_ERR;
     }
 
@@ -152,7 +174,7 @@ int exec_create_table(EngineState *eng, const CreateTableStatement *s,
         /* --- data type --- */
         int dt = str_to_datatype(ac.data_type.c_str());
         if (dt < 0) {
-            snprintf(out, cap, "ERROR: unknown type '%s' for column '%s'",
+            snprintf(out, cap, "  Error: unknown type '%s' for column '%s'",
                      ac.data_type.c_str(), ac.name.c_str());
             return MYDB_ERR;
         }
@@ -176,7 +198,7 @@ int exec_create_table(EngineState *eng, const CreateTableStatement *s,
         if (ac.is_primary_key) {
             if (pk_idx >= 0) {
                 snprintf(out, cap,
-                         "ERROR: table '%s' has more than one PRIMARY KEY",
+                         "  Error: table '%s' has more than one PRIMARY KEY",
                          s->table_name.c_str());
                 return MYDB_ERR;
             }
@@ -204,10 +226,24 @@ int exec_create_table(EngineState *eng, const CreateTableStatement *s,
              * substitutes the actual current timestamp at insert time.
              */
             if (ac.default_text == "NOW" || ac.default_text == "NOW()") {
-                cd.default_value.type          = cd.type;
-                cd.default_value.is_null       = 0;
+                if (cd.type != TYPE_DATETIME) {
+                    snprintf(out, cap,
+                             "  Error: DEFAULT NOW is only valid for DATETIME columns"
+                             " (column '%s')", ac.name.c_str());
+                    return MYDB_ERR;
+                }
+                cd.default_value.type           = cd.type;
+                cd.default_value.is_null        = 0;
                 cd.default_value.v.datetime_val = 0;   /* sentinel = "use NOW" */
             } else {
+                /* Reject literals whose text cannot be parsed as the column's type. */
+                if (!validate_literal(ac.default_text, cd)) {
+                    snprintf(out, cap,
+                             "  Error: DEFAULT value '%s' is not valid for column '%s' (%s)",
+                             ac.default_text.c_str(), ac.name.c_str(),
+                             ac.data_type.c_str());
+                    return MYDB_ERR;
+                }
                 cd.default_value = cast_literal(ac.default_text, cd);
             }
         }
@@ -216,7 +252,7 @@ int exec_create_table(EngineState *eng, const CreateTableStatement *s,
     /* every table must have exactly one primary key */
     if (pk_idx < 0) {
         snprintf(out, cap,
-                 "ERROR: table '%s' has no PRIMARY KEY — "
+                 "  Error: table '%s' has no PRIMARY KEY — "
                  "every table must declare a PRIMARY KEY column",
                  s->table_name.c_str());
         return MYDB_ERR;
@@ -243,7 +279,7 @@ int exec_create_table(EngineState *eng, const CreateTableStatement *s,
         if (!rel.columns[i].is_unique && !ac.is_indexed) continue;
         if (rel.num_secondary_indexes >= MAX_SECONDARY_IDX) {
             snprintf(out, cap,
-                     "ERROR: too many indexed columns (max %d secondary indexes)",
+                     "  Error: too many indexed columns (max %d secondary indexes)",
                      MAX_SECONDARY_IDX);
             return MYDB_ERR;
         }
@@ -255,10 +291,59 @@ int exec_create_table(EngineState *eng, const CreateTableStatement *s,
     for (const auto &fk : s->foreign_keys) {
         if (rel.num_foreign_keys >= MAX_FOREIGN_KEYS) {
             snprintf(out, cap,
-                     "ERROR: too many FOREIGN KEY constraints (max %d)",
+                     "  Error: too many FOREIGN KEY constraints (max %d)",
                      MAX_FOREIGN_KEYS);
             return MYDB_ERR;
         }
+
+        /* (1) FK column must exist in the table being created. */
+        int fk_col_idx = -1;
+        for (int i = 0; i < (int)rel.num_columns; i++) {
+            if (fk.column_name == rel.columns[i].name) {
+                fk_col_idx = i;
+                break;
+            }
+        }
+        if (fk_col_idx < 0) {
+            snprintf(out, cap,
+                     "  Error: FOREIGN KEY column '%s' does not exist in table '%s'",
+                     fk.column_name.c_str(), s->table_name.c_str());
+            return MYDB_ERR_NOT_FOUND;
+        }
+
+        /* (2) Referenced table must exist in the active schema. */
+        const RelationDef *ref_rel = engine_find_relation(eng, fk.ref_table.c_str());
+        if (!ref_rel) {
+            snprintf(out, cap,
+                     "  Error: FOREIGN KEY references unknown table '%s'",
+                     fk.ref_table.c_str());
+            return MYDB_ERR_NOT_FOUND;
+        }
+
+        /* (3) Referenced column must exist in the referenced table. */
+        int ref_col_idx = -1;
+        for (int i = 0; i < ref_rel->num_columns; i++) {
+            if (fk.ref_column == ref_rel->columns[i].name) {
+                ref_col_idx = i;
+                break;
+            }
+        }
+        if (ref_col_idx < 0) {
+            snprintf(out, cap,
+                     "  Error: FOREIGN KEY references unknown column '%s' in table '%s'",
+                     fk.ref_column.c_str(), fk.ref_table.c_str());
+            return MYDB_ERR_NOT_FOUND;
+        }
+
+        /* (4) Data types must be compatible (same base type). */
+        if (rel.columns[fk_col_idx].type != ref_rel->columns[ref_col_idx].type) {
+            snprintf(out, cap,
+                     "  Error: FOREIGN KEY type mismatch — '%s.%s' and '%s.%s' have different types",
+                     s->table_name.c_str(), fk.column_name.c_str(),
+                     fk.ref_table.c_str(),  fk.ref_column.c_str());
+            return MYDB_ERR;
+        }
+
         ForeignKey &rfk = rel.foreign_keys[rel.num_foreign_keys++];
         strncpy(rfk.constraint_name,   fk.constraint_name.c_str(), MAX_COLUMN_NAME - 1);
         strncpy(rfk.column_name,       fk.column_name.c_str(),     MAX_COLUMN_NAME - 1);
@@ -280,7 +365,7 @@ int exec_create_table(EngineState *eng, const CreateTableStatement *s,
         return rc;
     }
 
-    snprintf(out, cap, "Query OK, 0 rows affected");
+    snprintf(out, cap, "OK  Table '%s' created", s->table_name.c_str());
     return MYDB_OK;
 }
 
@@ -297,7 +382,7 @@ int exec_create_index(EngineState *eng, const CreateIndexStatement *s,
     /* Resolve the table */
     const RelationDef *rel = engine_find_relation(eng, s->table_name.c_str());
     if (!rel) {
-        snprintf(out, cap, "ERROR: table '%s' does not exist",
+        snprintf(out, cap, "  Error: table '%s' does not exist",
                  s->table_name.c_str());
         return MYDB_ERR_NOT_FOUND;
     }
@@ -311,7 +396,7 @@ int exec_create_index(EngineState *eng, const CreateIndexStatement *s,
         }
     }
     if (col_idx < 0) {
-        snprintf(out, cap, "ERROR: column '%s' not found in table '%s'",
+        snprintf(out, cap, "  Error: column '%s' not found in table '%s'",
                  s->column_name.c_str(), s->table_name.c_str());
         return MYDB_ERR_NOT_FOUND;
     }
@@ -319,7 +404,7 @@ int exec_create_index(EngineState *eng, const CreateIndexStatement *s,
     /* Cannot index the primary key column — it is already the clustered index */
     if (col_idx == rel->pk_col_idx) {
         snprintf(out, cap,
-                 "ERROR: column '%s' is the PRIMARY KEY — already indexed",
+                 "  Error: column '%s' is the PRIMARY KEY — already indexed",
                  s->column_name.c_str());
         return MYDB_ERR;
     }
@@ -328,18 +413,19 @@ int exec_create_index(EngineState *eng, const CreateIndexStatement *s,
     if (rc != MYDB_OK) {
         if (rc == MYDB_ERR_DUPLICATE)
             snprintf(out, cap,
-                     "ERROR: column '%s' already has a secondary index",
+                     "  Error: column '%s' already has a secondary index",
                      s->column_name.c_str());
         else if (rc == MYDB_ERR_FULL)
             snprintf(out, cap,
-                     "ERROR: too many indexes on table '%s' (max %d)",
+                     "  Error: too many indexes on table '%s' (max %d)",
                      s->table_name.c_str(), MAX_SECONDARY_IDX);
         else
             format_error(rc, out, cap, s->table_name.c_str());
         return rc;
     }
 
-    snprintf(out, cap, "Query OK, 0 rows affected");
+    snprintf(out, cap, "OK  Index created on '%s'('%s')",
+             s->table_name.c_str(), s->column_name.c_str());
     return MYDB_OK;
 }
 
@@ -355,7 +441,7 @@ int exec_drop_table(EngineState *eng, const DropTableStatement *s,
 
     const RelationDef *rel = engine_find_relation(eng, s->table_name.c_str());
     if (!rel) {
-        snprintf(out, cap, "ERROR: table '%s' does not exist",
+        snprintf(out, cap, "  Error: table '%s' does not exist",
                  s->table_name.c_str());
         return MYDB_ERR_NOT_FOUND;
     }
@@ -371,7 +457,7 @@ int exec_drop_table(EngineState *eng, const DropTableStatement *s,
         return rc;
     }
 
-    snprintf(out, cap, "Query OK, 0 rows affected");
+    snprintf(out, cap, "OK  Table '%s' dropped", s->table_name.c_str());
     return MYDB_OK;
 }
 
@@ -386,26 +472,19 @@ int exec_show_tables(EngineState *eng,
     REQUIRE_LOGIN(eng);
     REQUIRE_SCHEMA(eng);
 
-    ResultBuf rb(out, cap);
+    char hdr[64];
+    snprintf(hdr, sizeof(hdr), "Tables_in_%s", eng->current_schema_name);
 
-    /* header */
-    char header[64];
-    snprintf(header, sizeof(header),
-             "Tables_in_%s", eng->current_schema_name);
-    rb.append(header);
-    rb.append("\n");
+    ResultBuf    rb(out, cap);
+    TableBuilder tb;
+    tb.set_headers({hdr});
 
-    size_t nrows = 0;
-    int    limit = MAX_RELATIONS_PER_SCHEMA;
-
-    for (int i = 0; i < limit; i++) {
+    for (int i = 0; i < MAX_RELATIONS_PER_SCHEMA; i++) {
         if (!eng->active_schema.relations[i].is_valid) continue;
-        rb.append(eng->active_schema.relations[i].relation_name);
-        rb.append("\n");
-        nrows++;
+        tb.add_row({eng->active_schema.relations[i].relation_name});
     }
 
-    rb.finalize(nrows);
+    tb.render(rb);
     return MYDB_OK;
 }
 
@@ -420,20 +499,737 @@ int exec_show_databases(EngineState *eng,
     REQUIRE_LOGIN(eng);
     REQUIRE_PARTITION(eng);
 
-    ResultBuf rb(out, cap);
+    ResultBuf    rb(out, cap);
+    TableBuilder tb;
+    tb.set_headers({"Database"});
 
-    rb.append("Database\n");
-
-    size_t nrows = 0;
-    int    limit = MAX_SCHEMAS_PER_PARTITION;
-
-    for (int i = 0; i < limit; i++) {
+    for (int i = 0; i < MAX_SCHEMAS_PER_PARTITION; i++) {
         if (!eng->active_catalog.schemas[i].is_valid) continue;
-        rb.append(eng->active_catalog.schemas[i].schema_name);
-        rb.append("\n");
-        nrows++;
+        tb.add_row({eng->active_catalog.schemas[i].schema_name});
     }
 
-    rb.finalize(nrows);
+    tb.render(rb);
     return MYDB_OK;
+}
+
+/* ======================================================================
+ * ANALYZE TABLE
+ * ====================================================================== */
+
+int exec_analyze_table(EngineState *eng, const AnalyzeTableStatement *s,
+                       char *out, size_t cap)
+{
+    REQUIRE_LOGIN(eng);
+    REQUIRE_SCHEMA(eng);
+
+    const RelationDef *rel = engine_find_relation(eng, s->table_name.c_str());
+    if (!rel) {
+        snprintf(out, cap, "  Error: table '%s' does not exist",
+                 s->table_name.c_str());
+        return MYDB_ERR_NOT_FOUND;
+    }
+
+    int rc = storage_analyze_table((RelationDef *)rel);
+    if (rc != MYDB_OK) {
+        format_error(rc, out, cap, s->table_name.c_str());
+        return rc;
+    }
+
+    snprintf(out, cap, "OK  Statistics updated for '%s'",
+             s->table_name.c_str());
+    return MYDB_OK;
+}
+
+/* ======================================================================
+ * DESCRIBE [TABLE] t
+ * ====================================================================== */
+
+/* Format the data type of a column into buf (e.g. "VARCHAR(50)", "DECIMAL(10,2)"). */
+static void fmt_col_type(const ColumnDef *col, char *buf, size_t cap)
+{
+    switch (col->type) {
+    case TYPE_INT:
+        snprintf(buf, cap, "INT");
+        break;
+    case TYPE_DECIMAL:
+        snprintf(buf, cap, "DECIMAL(%u,%u)", col->max_len, col->scale);
+        break;
+    case TYPE_VARCHAR:
+        snprintf(buf, cap, "VARCHAR(%u)", col->max_len);
+        break;
+    case TYPE_BOOL:
+        snprintf(buf, cap, "BOOL");
+        break;
+    case TYPE_DATE:
+        snprintf(buf, cap, "DATE");
+        break;
+    case TYPE_DATETIME:
+        snprintf(buf, cap, "DATETIME");
+        break;
+    case TYPE_ENUM: {
+        int off = snprintf(buf, cap, "ENUM(");
+        for (int i = 0; i < col->num_enum_values && off < (int)cap - 2; i++) {
+            if (i) off += snprintf(buf + off, cap - (size_t)off, ",");
+            off += snprintf(buf + off, cap - (size_t)off, "%s", col->enum_values[i]);
+        }
+        snprintf(buf + off, cap - (size_t)off, ")");
+        break;
+    }
+    default:
+        snprintf(buf, cap, "UNKNOWN");
+    }
+}
+
+/* Format the default value of a column into buf.
+ * Returns "NULL" when no default is set. */
+static void fmt_default(const ColumnDef *col, char *buf, size_t cap)
+{
+    if (!col->has_default) {
+        snprintf(buf, cap, "NULL");
+        return;
+    }
+    const Value *v = &col->default_value;
+    switch (col->type) {
+    case TYPE_INT:
+        snprintf(buf, cap, "%d", v->v.int_val);
+        break;
+    case TYPE_DECIMAL: {
+        int64_t dv     = v->v.decimal_val;
+        int64_t factor = 1;
+        for (int i = 0; i < col->scale; i++) factor *= 10;
+        int64_t whole  =  dv / factor;
+        int64_t frac   = (dv % factor < 0) ? -(dv % factor) : (dv % factor);
+        snprintf(buf, cap, "%lld.%0*lld", (long long)whole, col->scale, (long long)frac);
+        break;
+    }
+    case TYPE_VARCHAR:
+        snprintf(buf, cap, "'%.*s'", (int)v->v.varchar_val.len, v->v.varchar_val.data);
+        break;
+    case TYPE_BOOL:
+        snprintf(buf, cap, "%s", v->v.bool_val ? "TRUE" : "FALSE");
+        break;
+    case TYPE_DATE:
+        snprintf(buf, cap, "%08d", v->v.date_val);
+        break;
+    case TYPE_DATETIME:
+        snprintf(buf, cap, "%lld", (long long)v->v.datetime_val);
+        break;
+    case TYPE_ENUM:
+        snprintf(buf, cap, "%s", col->enum_values[v->v.enum_val]);
+        break;
+    default:
+        snprintf(buf, cap, "NULL");
+    }
+}
+
+/* Format a YYYYMMDDHHmmSS timestamp (as stored in SchemaHeader / CatalogHeader)
+ * into "YYYY-MM-DD HH:MM:SS". Writes "N/A" for a zero value. */
+static void fmt_datetime_ts(uint64_t dt, char *buf, size_t cap)
+{
+    if (dt == 0) { snprintf(buf, cap, "N/A"); return; }
+    int sec  = (int)(dt % 100);  dt /= 100;
+    int min  = (int)(dt % 100);  dt /= 100;
+    int hour = (int)(dt % 100);  dt /= 100;
+    int day  = (int)(dt % 100);  dt /= 100;
+    int mon  = (int)(dt % 100);  dt /= 100;
+    int year = (int)dt;
+    snprintf(buf, cap, "%04d-%02d-%02d %02d:%02d:%02d",
+             year, mon, day, hour, min, sec);
+}
+
+/* Format a byte count into a human-readable string (B / KB / MB / GB). */
+static void fmt_bytes(uint64_t bytes, char *buf, size_t cap)
+{
+    if      (bytes >= 1024ULL * 1024ULL * 1024ULL)
+        snprintf(buf, cap, "%.2f GB", (double)bytes / (1024.0 * 1024.0 * 1024.0));
+    else if (bytes >= 1024ULL * 1024ULL)
+        snprintf(buf, cap, "%.2f MB", (double)bytes / (1024.0 * 1024.0));
+    else if (bytes >= 1024ULL)
+        snprintf(buf, cap, "%.2f KB", (double)bytes / 1024.0);
+    else
+        snprintf(buf, cap, "%llu B",  (unsigned long long)bytes);
+}
+
+/* Format a stats min/max numeric (int64 encoded) into a human-readable string.
+ * Encoding matches the planner's int64 convention:
+ *   INT      → widened int32
+ *   DECIMAL  → value * 10^scale
+ *   DATE     → YYYYMMDD
+ *   DATETIME → YYYYMMDDHHmmSS
+ *   BOOL/ENUM→ raw index
+ *   VARCHAR  → not applicable (writes "N/A") */
+static void fmt_stat_numeric(int64_t v, const ColumnDef *col, char *buf, size_t cap)
+{
+    switch (col->type) {
+    case TYPE_INT:
+        snprintf(buf, cap, "%d", (int32_t)v);
+        break;
+    case TYPE_DECIMAL: {
+        int64_t factor = 1;
+        for (int i = 0; i < col->scale; i++) factor *= 10;
+        int64_t whole = v / factor;
+        int64_t frac  = (v % factor < 0) ? -(v % factor) : (v % factor);
+        snprintf(buf, cap, "%lld.%0*lld", (long long)whole, col->scale, (long long)frac);
+        break;
+    }
+    case TYPE_DATE: {
+        int y = (int)(v / 10000);
+        int m = (int)((v / 100) % 100);
+        int d = (int)(v % 100);
+        snprintf(buf, cap, "%04d-%02d-%02d", y, m, d);
+        break;
+    }
+    case TYPE_DATETIME: {
+        int64_t dt = v;
+        int sec  = (int)(dt % 100); dt /= 100;
+        int min  = (int)(dt % 100); dt /= 100;
+        int hour = (int)(dt % 100); dt /= 100;
+        int day  = (int)(dt % 100); dt /= 100;
+        int mon  = (int)(dt % 100); dt /= 100;
+        int year = (int)dt;
+        snprintf(buf, cap, "%04d-%02d-%02d %02d:%02d:%02d",
+                 year, mon, day, hour, min, sec);
+        break;
+    }
+    case TYPE_BOOL:
+        snprintf(buf, cap, "%s", v ? "TRUE" : "FALSE");
+        break;
+    case TYPE_ENUM:
+        /* show the string label if in range, else raw index */
+        if (v >= 0 && v < col->num_enum_values)
+            snprintf(buf, cap, "%s", col->enum_values[(int)v]);
+        else
+            snprintf(buf, cap, "%lld", (long long)v);
+        break;
+    case TYPE_VARCHAR:
+    default:
+        snprintf(buf, cap, "N/A");
+        break;
+    }
+}
+
+int exec_describe_table(EngineState *eng,
+                        const DescribeTableStatement *s,
+                        char *out, size_t cap)
+{
+    REQUIRE_LOGIN(eng);
+    REQUIRE_SCHEMA(eng);
+
+    const RelationDef *rel = engine_find_relation(eng, s->table_name.c_str());
+    if (!rel) {
+        snprintf(out, cap, "  Error: Table '%s' not found in schema '%s'",
+                 s->table_name.c_str(), eng->current_schema_name);
+        return MYDB_ERR;
+    }
+
+    /*
+     * FULL mode — open __stats.mydb and load this relation's stats page.
+     * stats_open returns MYDB_ERR_NOT_FOUND when ANALYZE has never run;
+     * stats_load_relation returns the same if the relation has no stats yet.
+     * In either case we fall back gracefully: stats columns show "N/A".
+     *
+     * slot_idx: engine_find_relation returns &active_schema.defs[i], so
+     * pointer arithmetic gives us i directly (parallel arrays).
+     */
+    StatsFile sf;
+    bool      stats_ok = false;   /* true once the page is loaded */
+    int       slot_idx = -1;
+
+    if (s->full) {
+        /* Derive stats path from schema path: replace __schema.mydb */
+        char stats_path[512];
+        strncpy(stats_path, eng->active_schema.path, sizeof(stats_path) - 1);
+        stats_path[sizeof(stats_path) - 1] = '\0';
+        char *slash = strrchr(stats_path, '/');
+        if (slash)
+            strncpy(slash + 1, "__stats.mydb",
+                    sizeof(stats_path) - (size_t)(slash + 1 - stats_path));
+
+        if (stats_open(stats_path, &sf) == MYDB_OK) {
+            slot_idx = (int)(rel - eng->active_schema.defs);
+            if (slot_idx >= 0 && slot_idx < MAX_RELATIONS_PER_SCHEMA &&
+                stats_load_relation(&sf, slot_idx) == MYDB_OK) {
+                stats_ok = true;
+            } else {
+                stats_close(&sf);
+                slot_idx = -1;
+            }
+        }
+    }
+
+    ResultBuf    rb(out, cap);
+    TableBuilder tb;
+
+    /* Set column headers — 8 base columns. */
+    tb.set_headers({"Field", "Type", "Null", "Key",
+                    "Default", "Indexed", "References", "Extra"});
+
+    /* Per-column rows. */
+    for (int i = 0; i < (int)rel->num_columns; i++) {
+        const ColumnDef *col = &rel->columns[i];
+
+        char type_buf[128];
+        fmt_col_type(col, type_buf, sizeof(type_buf));
+
+        const char *nullable = (col->is_not_null || col->is_primary_key) ? "NO" : "YES";
+
+        const char *key = "";
+        if (col->is_primary_key) {
+            key = "PRI";
+        } else if (col->is_unique) {
+            key = "UNI";
+        } else {
+            for (int j = 0; j < rel->num_secondary_indexes; j++)
+                if (rel->secondary_col_idx[j] == (uint8_t)i) { key = "MUL"; break; }
+        }
+
+        char def_buf[128];
+        fmt_default(col, def_buf, sizeof(def_buf));
+
+        const char *indexed = "";
+        if (col->is_primary_key) {
+            indexed = "B-Tree";
+        } else {
+            for (int j = 0; j < rel->num_secondary_indexes; j++)
+                if (rel->secondary_col_idx[j] == (uint8_t)i) { indexed = "B-Tree"; break; }
+        }
+
+        char ref_buf[192] = "";
+        for (int j = 0; j < rel->num_foreign_keys; j++) {
+            if (strcmp(rel->foreign_keys[j].column_name, col->name) == 0) {
+                snprintf(ref_buf, sizeof(ref_buf), "%s(%s)",
+                         rel->foreign_keys[j].ref_relation_name,
+                         rel->foreign_keys[j].ref_column_name);
+                break;
+            }
+        }
+
+        const char *extra = col->is_auto_increment ? "AUTO_INCREMENT" : "";
+
+        tb.add_row({col->name, type_buf, nullable, key,
+                    def_buf, indexed, ref_buf, extra});
+    }
+
+    tb.render(rb);
+
+    /* FULL mode — second section: stats table. */
+    if (s->full) {
+        /* Build stats ANALYZE timestamp header. */
+        char stats_hdr[96] = "Statistics (run ANALYZE TABLE to populate)";
+        if (stats_ok) {
+            /* Use the schema's last_modified as a proxy (stats are refreshed then). */
+            char ts[32];
+            fmt_datetime_ts(eng->active_schema.header.last_modified, ts, sizeof(ts));
+            snprintf(stats_hdr, sizeof(stats_hdr), "Statistics (Analyzed: %s)", ts);
+        }
+
+        /* Emit blank line + stats section header. */
+        char sec_line[128];
+        snprintf(sec_line, sizeof(sec_line), "\n-- %s --\n", stats_hdr);
+        rb.append(sec_line);
+
+        TableBuilder stb;
+        stb.set_headers({"Field", "Stats", "Distinct", "Nulls", "Rows", "Min", "Max"});
+
+        for (int i = 0; i < (int)rel->num_columns; i++) {
+            const ColumnDef *col = &rel->columns[i];
+            const char *stype    = "N/A";
+            char distinct_buf[32] = "N/A";
+            char nulls_buf[32]    = "N/A";
+            char rows_buf[32]     = "N/A";
+            char min_buf[64]      = "N/A";
+            char max_buf[64]      = "N/A";
+
+            if (stats_ok) {
+                ColumnStats *cs = stats_get_column(&sf, slot_idx, i);
+                if (cs && cs->has_stats) {
+                    switch (cs->stats_type) {
+                    case STATS_TYPE_MCV:       stype = "MCV";       break;
+                    case STATS_TYPE_HISTOGRAM: stype = "Histogram"; break;
+                    default:                   stype = "None";      break;
+                    }
+                    snprintf(distinct_buf, sizeof(distinct_buf), "%u", cs->num_distinct);
+                    snprintf(nulls_buf,    sizeof(nulls_buf),    "%u", cs->num_nulls);
+                    snprintf(rows_buf,     sizeof(rows_buf),     "%u", cs->total_rows);
+                    fmt_stat_numeric(cs->min_numeric, col, min_buf, sizeof(min_buf));
+                    fmt_stat_numeric(cs->max_numeric, col, max_buf, sizeof(max_buf));
+                } else if (cs) {
+                    stype = "None";
+                }
+            }
+
+            stb.add_row({col->name, stype, distinct_buf, nulls_buf,
+                         rows_buf, min_buf, max_buf});
+        }
+
+        stb.render(rb);
+
+        if (stats_ok) stats_close(&sf);
+    }
+
+    return MYDB_OK;
+}
+
+/* ======================================================================
+ * DESCRIBE SCHEMA
+ *
+ * Describes the currently active schema (loaded by USE).
+ * Requires partition ownership — analysts are not allowed.
+ *
+ * Output (two sections, tab-separated):
+ *
+ *   Section 1 — header properties
+ *     Property      Value
+ *     Schema        myapp
+ *     Partition ID  3
+ *     Created       2026-05-01 12:00:00
+ *     Last Modified 2026-05-27 09:41:03
+ *     Tables        5
+ *
+ *   Section 2 — per-table summary (from RelationEntry slot directory)
+ *     Table    Columns  Rows    Pages  Height  Size
+ *     users    7        10240   84     3       1.31 MB
+ *     ...
+ * ====================================================================== */
+
+int exec_describe_schema(EngineState *eng,
+                         const DescribeSchemaStatement * /*s*/,
+                         char *out, size_t cap)
+{
+    REQUIRE_LOGIN(eng);
+    REQUIRE_PARTITION(eng);   /* analysts may not inspect schema metadata */
+    REQUIRE_SCHEMA(eng);
+
+    const SchemaFile   *sf  = &eng->active_schema;
+    const SchemaHeader *hdr = &sf->header;
+
+    ResultBuf rb(out, cap);
+
+    /* ---- Section 1: header properties ---- */
+    char ts1[32], ts2[32];
+    fmt_datetime_ts(hdr->created_at,    ts1, sizeof(ts1));
+    fmt_datetime_ts(hdr->last_modified, ts2, sizeof(ts2));
+
+    {
+        TableBuilder tb;
+        tb.set_headers({"Property", "Value"});
+
+        char pid[16], nrel[16];
+        snprintf(pid,  sizeof(pid),  "%u", hdr->partition_id);
+        snprintf(nrel, sizeof(nrel), "%u", hdr->num_relations);
+
+        tb.add_row({"Schema",        hdr->schema_name});
+        tb.add_row({"Partition ID",  pid});
+        tb.add_row({"Created",       ts1});
+        tb.add_row({"Last Modified", ts2});
+        tb.add_row({"Tables",        nrel});
+        tb.render(rb);
+    }
+
+    rb.append("\n");
+
+    /* ---- Section 2: per-table summary ---- */
+    {
+        TableBuilder tb;
+        tb.set_headers({"Table", "Columns", "Rows", "Pages", "Height", "Size"});
+
+        for (int i = 0; i < MAX_RELATIONS_PER_SCHEMA; i++) {
+            const RelationEntry *re = &sf->relations[i];
+            if (!re->is_valid) continue;
+
+            uint64_t size_bytes = (uint64_t)re->num_pages * PAGE_SIZE;
+            char size_buf[32];
+            fmt_bytes(size_bytes, size_buf, sizeof(size_buf));
+
+            char ncols[8], nrows[16], npages[16], height[8];
+            snprintf(ncols,  sizeof(ncols),  "%u", (unsigned)re->num_columns);
+            snprintf(nrows,  sizeof(nrows),  "%u", (unsigned)re->num_rows);
+            snprintf(npages, sizeof(npages), "%u", (unsigned)re->num_pages);
+            snprintf(height, sizeof(height), "%u", (unsigned)re->tree_height);
+
+            tb.add_row({re->relation_name, ncols, nrows, npages, height, size_buf});
+        }
+        tb.render(rb);
+    }
+
+    return MYDB_OK;
+}
+
+/* ======================================================================
+ * DESCRIBE PARTITION
+ *
+ * Describes the current user's partition: quota/usage, timestamps, and
+ * the list of schemas (databases) it contains.
+ * Requires partition ownership — analysts are not allowed.
+ * Does NOT require an active schema (can be called before USE).
+ *
+ * Output (two sections, tab-separated):
+ *
+ *   Section 1 — partition properties
+ *     Property       Value
+ *     Partition ID   3
+ *     Owner          alice
+ *     Path           /home/alice/.mydb/alice/
+ *     Quota          2.00 GB
+ *     Used           340.25 MB
+ *     Free           1.67 GB
+ *     Created        2026-05-01 12:00:00
+ *     Last Modified  2026-05-27 09:41:03
+ *     Databases      3
+ *
+ *   Section 2 — schema list (from SchemaEntry[] in __catalog.mydb)
+ *     Database       Tables
+ *     myapp          5
+ *     logs           2
+ *     staging        0
+ * ====================================================================== */
+
+int exec_describe_partition(EngineState *eng,
+                            const DescribePartitionStatement * /*s*/,
+                            char *out, size_t cap)
+{
+    REQUIRE_LOGIN(eng);
+    REQUIRE_PARTITION(eng);   /* analysts may not inspect partition metadata */
+
+    const Catalog       *cat = &eng->active_catalog;
+    const CatalogHeader *hdr = &cat->header;
+
+    ResultBuf rb(out, cap);
+
+    /* ---- Section 1: partition properties ---- */
+    char ts1[32], ts2[32];
+    fmt_datetime_ts(hdr->created_at,    ts1, sizeof(ts1));
+    fmt_datetime_ts(hdr->last_modified, ts2, sizeof(ts2));
+
+    uint64_t free_bytes = (hdr->quota_bytes > hdr->used_bytes)
+                          ? (hdr->quota_bytes - hdr->used_bytes) : 0;
+    char quota_buf[32], used_buf[32], free_buf[32];
+    fmt_bytes(hdr->quota_bytes, quota_buf, sizeof(quota_buf));
+    fmt_bytes(hdr->used_bytes,  used_buf,  sizeof(used_buf));
+    fmt_bytes(free_bytes,       free_buf,  sizeof(free_buf));
+
+    {
+        TableBuilder tb;
+        tb.set_headers({"Property", "Value"});
+
+        char pid[16], ndb[16];
+        snprintf(pid, sizeof(pid), "%u", hdr->partition_id);
+        snprintf(ndb, sizeof(ndb), "%u", (unsigned)hdr->num_schemas);
+
+        tb.add_row({"Partition ID",  pid});
+        tb.add_row({"Owner",         eng->current_username});
+        tb.add_row({"Path",          eng->current_partition_path});
+        tb.add_row({"Quota",         quota_buf});
+        tb.add_row({"Used",          used_buf});
+        tb.add_row({"Free",          free_buf});
+        tb.add_row({"Created",       ts1});
+        tb.add_row({"Last Modified", ts2});
+        tb.add_row({"Databases",     ndb});
+        tb.render(rb);
+    }
+
+    rb.append("\n");
+
+    /* ---- Section 2: schema list ---- */
+    {
+        TableBuilder tb;
+        tb.set_headers({"Database", "Tables"});
+
+        for (int i = 0; i < MAX_SCHEMAS_PER_PARTITION; i++) {
+            const SchemaEntry *se = &cat->schemas[i];
+            if (!se->is_valid) continue;
+            char nrel[8];
+            snprintf(nrel, sizeof(nrel), "%u", (unsigned)se->num_relations);
+            tb.add_row({se->schema_name, nrel});
+        }
+        tb.render(rb);
+    }
+
+    return MYDB_OK;
+}
+
+/* ======================================================================
+ * parse_quota_str — shared by CREATE USER and ALTER USER SET QUOTA
+ *
+ * Accepts "nM" or "nG" (case-insensitive, n must be a positive integer).
+ * An empty string maps to ENGINE_DEFAULT_QUOTA_BYTES.
+ * Returns MYDB_OK on success (writes *out_bytes), MYDB_ERR on bad format,
+ * range violation, or out-of-bounds quota.
+ * ====================================================================== */
+static int parse_quota_str(const std::string &s, uint64_t *out_bytes)
+{
+    if (s.empty()) {
+        *out_bytes = ENGINE_DEFAULT_QUOTA_BYTES;
+        return MYDB_OK;
+    }
+
+    if (s.size() < 2) return MYDB_ERR;   /* need at least "1M" */
+
+    char suffix = (char)std::toupper((unsigned char)s.back());
+    if (suffix != 'M' && suffix != 'G') return MYDB_ERR;
+
+    /* Parse the numeric prefix. */
+    std::string num_part = s.substr(0, s.size() - 1);
+    for (char c : num_part)
+        if (!std::isdigit((unsigned char)c)) return MYDB_ERR;
+
+    uint64_t n = (uint64_t)std::stoull(num_part);
+    if (n == 0) return MYDB_ERR;
+
+    uint64_t bytes = (suffix == 'G')
+                     ? n * 1024ULL * 1024ULL * 1024ULL
+                     : n * 1024ULL * 1024ULL;
+
+    if (bytes < ENGINE_MIN_QUOTA_BYTES || bytes > ENGINE_MAX_QUOTA_BYTES)
+        return MYDB_ERR;
+
+    *out_bytes = bytes;
+    return MYDB_OK;
+}
+
+/* ======================================================================
+ * CREATE USER
+ * ====================================================================== */
+
+int exec_create_user(EngineState *eng,
+                     const CreateUserStatement *s,
+                     char *out, size_t cap)
+{
+    REQUIRE_LOGIN(eng);
+
+    /* Parse quota (empty → default). */
+    uint64_t quota = 0;
+    if (!s->quota_str.empty()) {
+        if (parse_quota_str(s->quota_str, &quota) != MYDB_OK) {
+            snprintf(out, cap,
+                     "  Error: invalid quota '%s' — use format nM or nG "
+                     "(e.g. 500M, 2G), range 100M–5G",
+                     s->quota_str.c_str());
+            return MYDB_ERR;
+        }
+    }
+
+    const char *part_name = s->partition_name.empty()
+                            ? nullptr
+                            : s->partition_name.c_str();
+
+    int rc = engine_create_user(eng,
+                                s->username.c_str(),
+                                s->password.c_str(),
+                                part_name,
+                                quota);
+    if (rc == MYDB_ERR_PERM) {
+        snprintf(out, cap, "  Error: only root may create users");
+        return rc;
+    }
+    if (rc == MYDB_ERR_DUPLICATE) {
+        snprintf(out, cap,
+                 "  Error: user or partition name '%s' already exists",
+                 s->username.c_str());
+        return rc;
+    }
+    if (rc == MYDB_ERR_FULL) {
+        snprintf(out, cap, "  Error: partition limit reached");
+        return rc;
+    }
+    if (rc != MYDB_OK) {
+        format_error(rc, out, cap, s->username.c_str());
+        return rc;
+    }
+
+    snprintf(out, cap, "OK  User '%s' created", s->username.c_str());
+    return MYDB_OK;
+}
+
+/* ======================================================================
+ * DROP USER
+ * ====================================================================== */
+
+int exec_drop_user(EngineState *eng,
+                   const DropUserStatement *s,
+                   char *out, size_t cap)
+{
+    REQUIRE_LOGIN(eng);
+
+    int rc = engine_drop_user(eng, s->username.c_str());
+    if (rc == MYDB_ERR_PERM) {
+        snprintf(out, cap,
+                 "  Error: only root may drop users, and root cannot be dropped");
+        return rc;
+    }
+    if (rc == MYDB_ERR_NOT_FOUND) {
+        snprintf(out, cap, "  Error: user '%s' does not exist",
+                 s->username.c_str());
+        return rc;
+    }
+    if (rc != MYDB_OK) {
+        format_error(rc, out, cap, s->username.c_str());
+        return rc;
+    }
+
+    snprintf(out, cap, "OK  User '%s' dropped", s->username.c_str());
+    return MYDB_OK;
+}
+
+/* ======================================================================
+ * ALTER USER
+ * ====================================================================== */
+
+int exec_alter_user(EngineState *eng,
+                    const AlterUserStatement *s,
+                    char *out, size_t cap)
+{
+    REQUIRE_LOGIN(eng);
+
+    if (s->action == AlterUserStatement::Action::SET_PASSWORD) {
+
+        int rc = engine_alter_user_password(eng,
+                                            s->username.c_str(),
+                                            s->new_password.c_str());
+        if (rc == MYDB_ERR_PERM) {
+            snprintf(out, cap, "  Error: only root may change passwords");
+            return rc;
+        }
+        if (rc == MYDB_ERR_NOT_FOUND) {
+            snprintf(out, cap, "  Error: user '%s' does not exist",
+                     s->username.c_str());
+            return rc;
+        }
+        if (rc != MYDB_OK) { format_error(rc, out, cap, s->username.c_str()); return rc; }
+
+        snprintf(out, cap, "OK  Password updated for '%s'", s->username.c_str());
+        return MYDB_OK;
+
+    } else {  /* SET_QUOTA */
+
+        uint64_t quota = 0;
+        if (parse_quota_str(s->quota_str, &quota) != MYDB_OK) {
+            snprintf(out, cap,
+                     "  Error: invalid quota '%s' — use nM or nG, range 100M–5G",
+                     s->quota_str.c_str());
+            return MYDB_ERR;
+        }
+
+        int rc = engine_alter_user_quota(eng, s->username.c_str(), quota);
+        if (rc == MYDB_ERR_PERM) {
+            snprintf(out, cap, "  Error: only root may alter quotas");
+            return rc;
+        }
+        if (rc == MYDB_ERR_NOT_FOUND) {
+            snprintf(out, cap, "  Error: user '%s' does not exist",
+                     s->username.c_str());
+            return rc;
+        }
+        if (rc == MYDB_ERR_FULL) {
+            snprintf(out, cap,
+                     "  Error: new quota is below current usage for user '%s'",
+                     s->username.c_str());
+            return rc;
+        }
+        if (rc != MYDB_OK) { format_error(rc, out, cap, s->username.c_str()); return rc; }
+
+        snprintf(out, cap, "OK  Quota updated for user '%s' to %s",
+                 s->username.c_str(), s->quota_str.c_str());
+        return MYDB_OK;
+    }
 }

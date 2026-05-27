@@ -6,7 +6,7 @@
 #include "Lexer.hpp"
 
 // --- 1. ENUMS ---
-enum class StatementType { SELECT, CREATE_TABLE, INSERT, UPDATE, DELETE, TRANSACTION, DROP_TABLE, CREATE_DATABASE, DROP_DATABASE, USE, SHOW_TABLES, SHOW_DATABASES, CREATE_INDEX, UNKNOWN };
+enum class StatementType { SELECT, CREATE_TABLE, INSERT, UPDATE, DELETE, TRANSACTION, DROP_TABLE, CREATE_DATABASE, DROP_DATABASE, USE, SHOW_TABLES, SHOW_DATABASES, CREATE_INDEX, ANALYZE_TABLE, CREATE_USER, DROP_USER, ALTER_USER, DESCRIBE_TABLE, DESCRIBE_SCHEMA, DESCRIBE_PARTITION, UNKNOWN };
 enum class JoinType { INNER, LEFT, RIGHT, FULL };
 enum class TransactionCommand { BEGIN, COMMIT, ROLLBACK };
 
@@ -258,6 +258,33 @@ struct ShowDatabasesStatement : public ASTNode {
     void print() const override { std::cout << "\n[AST] Action: SHOW DATABASES\n"; }
 };
 
+// DESCRIBE PARTITION  (no argument — describes the current user's partition)
+struct DescribePartitionStatement : public ASTNode {
+    DescribePartitionStatement() { type = StatementType::DESCRIBE_PARTITION; }
+    void print() const override {
+        std::cout << "\n[AST] Action: DESCRIBE PARTITION\n";
+    }
+};
+
+// DESCRIBE SCHEMA  (no argument — describes the currently active schema)
+struct DescribeSchemaStatement : public ASTNode {
+    DescribeSchemaStatement() { type = StatementType::DESCRIBE_SCHEMA; }
+    void print() const override {
+        std::cout << "\n[AST] Action: DESCRIBE SCHEMA\n";
+    }
+};
+
+// DESCRIBE [TABLE] [FULL] t
+struct DescribeTableStatement : public ASTNode {
+    std::string table_name;
+    bool        full = false;   /* DESCRIBE TABLE FULL t — includes stats columns */
+    DescribeTableStatement() { type = StatementType::DESCRIBE_TABLE; }
+    void print() const override {
+        std::cout << "\n[AST] Action: DESCRIBE TABLE"
+                  << (full ? " FULL " : " ") << table_name << "\n";
+    }
+};
+
 // CREATE INDEX
 struct CreateIndexStatement : public ASTNode {
     std::string index_name;
@@ -271,6 +298,57 @@ struct CreateIndexStatement : public ASTNode {
         std::cout << "      Name  : " << index_name << "\n";
         std::cout << "      Table : " << table_name << "\n";
         std::cout << "      Col   : " << column_name << "\n";
+    }
+};
+
+// ANALYZE TABLE
+struct AnalyzeTableStatement : public ASTNode {
+    std::string table_name;
+    AnalyzeTableStatement() { type = StatementType::ANALYZE_TABLE; }
+    void print() const override {
+        std::cout << "\n[AST] Action: ANALYZE TABLE " << table_name << "\n";
+    }
+};
+
+// CREATE USER username IDENTIFIED BY 'password' [PARTITION name] [QUOTA nM|nG]
+struct CreateUserStatement : public ASTNode {
+    std::string username;
+    std::string password;
+    std::string partition_name;   // empty = default (same as username)
+    std::string quota_str;        // empty = default (1G), else e.g. "500M", "2G"
+    CreateUserStatement() { type = StatementType::CREATE_USER; }
+    void print() const override {
+        std::cout << "\n[AST] Action: CREATE USER " << username;
+        if (!partition_name.empty()) std::cout << " PARTITION " << partition_name;
+        if (!quota_str.empty())      std::cout << " QUOTA " << quota_str;
+        std::cout << "\n";
+    }
+};
+
+// DROP USER username
+struct DropUserStatement : public ASTNode {
+    std::string username;
+    DropUserStatement() { type = StatementType::DROP_USER; }
+    void print() const override {
+        std::cout << "\n[AST] Action: DROP USER " << username << "\n";
+    }
+};
+
+// ALTER USER username IDENTIFIED BY 'newpass'
+// ALTER USER username SET QUOTA nM|nG
+struct AlterUserStatement : public ASTNode {
+    enum class Action { SET_PASSWORD, SET_QUOTA };
+    Action      action;
+    std::string username;
+    std::string new_password;   // for SET_PASSWORD
+    std::string quota_str;      // for SET_QUOTA, e.g. "2G"
+    AlterUserStatement() { type = StatementType::ALTER_USER; }
+    void print() const override {
+        std::cout << "\n[AST] Action: ALTER USER " << username;
+        if (action == Action::SET_PASSWORD)
+            std::cout << " IDENTIFIED BY '***'\n";
+        else
+            std::cout << " SET QUOTA " << quota_str << "\n";
     }
 };
 

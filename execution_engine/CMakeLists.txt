@@ -46,6 +46,7 @@ target_include_directories(execution_engine PRIVATE
 target_link_libraries(execution_engine
     PUBLIC query_parser
     PUBLIC storage_engine
+    PUBLIC planner
 )
 
 target_compile_features(execution_engine PUBLIC cxx_std_17)

@@ -53,6 +53,18 @@ int exec_dispatch(EngineState *eng, const ASTNode *node,
         return exec_show_databases(eng,
                                    static_cast<const ShowDatabasesStatement *>(node),
                                    out, cap);
+    case StatementType::DESCRIBE_TABLE:
+        return exec_describe_table(eng,
+                                   static_cast<const DescribeTableStatement *>(node),
+                                   out, cap);
+    case StatementType::DESCRIBE_SCHEMA:
+        return exec_describe_schema(eng,
+                                    static_cast<const DescribeSchemaStatement *>(node),
+                                    out, cap);
+    case StatementType::DESCRIBE_PARTITION:
+        return exec_describe_partition(eng,
+                                       static_cast<const DescribePartitionStatement *>(node),
+                                       out, cap);
 
     /* DML */
     case StatementType::INSERT:
@@ -73,6 +85,26 @@ int exec_dispatch(EngineState *eng, const ASTNode *node,
         return exec_select(eng,
                            static_cast<const SelectStatement *>(node),
                            out, cap);
+
+    /* Utility */
+    case StatementType::ANALYZE_TABLE:
+        return exec_analyze_table(eng,
+                                  static_cast<const AnalyzeTableStatement *>(node),
+                                  out, cap);
+
+    /* User management */
+    case StatementType::CREATE_USER:
+        return exec_create_user(eng,
+                                static_cast<const CreateUserStatement *>(node),
+                                out, cap);
+    case StatementType::DROP_USER:
+        return exec_drop_user(eng,
+                              static_cast<const DropUserStatement *>(node),
+                              out, cap);
+    case StatementType::ALTER_USER:
+        return exec_alter_user(eng,
+                               static_cast<const AlterUserStatement *>(node),
+                               out, cap);
 
     default:
         std::snprintf(out, cap, "unsupported statement type");

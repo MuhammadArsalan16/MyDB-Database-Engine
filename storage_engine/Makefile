@@ -356,6 +356,30 @@ src/schema_file.c.s:
 	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f storage_engine/CMakeFiles/storage_engine.dir/build.make storage_engine/CMakeFiles/storage_engine.dir/src/schema_file.c.s
 .PHONY : src/schema_file.c.s
 
+src/stats.o: src/stats.c.o
+.PHONY : src/stats.o
+
+# target to build an object file
+src/stats.c.o:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f storage_engine/CMakeFiles/storage_engine.dir/build.make storage_engine/CMakeFiles/storage_engine.dir/src/stats.c.o
+.PHONY : src/stats.c.o
+
+src/stats.i: src/stats.c.i
+.PHONY : src/stats.i
+
+# target to preprocess a source file
+src/stats.c.i:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f storage_engine/CMakeFiles/storage_engine.dir/build.make storage_engine/CMakeFiles/storage_engine.dir/src/stats.c.i
+.PHONY : src/stats.c.i
+
+src/stats.s: src/stats.c.s
+.PHONY : src/stats.s
+
+# target to generate assembly for a file
+src/stats.c.s:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f storage_engine/CMakeFiles/storage_engine.dir/build.make storage_engine/CMakeFiles/storage_engine.dir/src/stats.c.s
+.PHONY : src/stats.c.s
+
 src/storage.o: src/storage.c.o
 .PHONY : src/storage.o
 
@@ -441,6 +465,9 @@ help:
 	@echo "... src/schema_file.o"
 	@echo "... src/schema_file.i"
 	@echo "... src/schema_file.s"
+	@echo "... src/stats.o"
+	@echo "... src/stats.i"
+	@echo "... src/stats.s"
 	@echo "... src/storage.o"
 	@echo "... src/storage.i"
 	@echo "... src/storage.s"

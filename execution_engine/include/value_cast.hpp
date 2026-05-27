@@ -28,3 +28,16 @@ extern "C" {
  * for the given type.
  */
 Value cast_literal(const std::string &token, const ColumnDef &col);
+
+/*
+ * Validate that a raw literal string is a legal value for a column's type.
+ *
+ * Returns true  — token is syntactically valid for col.type.
+ * Returns false — token cannot be parsed as col.type (e.g. "hello" for INT,
+ *                 "42" for BOOL, an unknown label for ENUM).
+ *
+ * "NULL" is always considered valid (any nullable column may default to NULL).
+ * Used by exec_create_table to catch type mismatches in DEFAULT clauses before
+ * the value is stored in the RelationDef.
+ */
+bool validate_literal(const std::string &token, const ColumnDef &col);

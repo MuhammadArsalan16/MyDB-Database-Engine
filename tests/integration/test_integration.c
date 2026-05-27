@@ -600,7 +600,8 @@ static void test_execute_sql_pipeline(void)
      * or "ERROR" (real engine, table missing — pipeline is live). */
     CHECK(strstr(result, "not implemented") != NULL ||
           strstr(result, "row")             != NULL ||
-          strstr(result, "ERROR")           != NULL,
+          strstr(result, "ERROR")           != NULL ||
+          strstr(result, "Error")           != NULL,
           "result contains scaffold or real output");
 
     /* Garbage → parser rejects, engine reports parse error. */

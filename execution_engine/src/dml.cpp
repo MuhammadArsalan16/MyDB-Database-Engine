@@ -79,7 +79,7 @@ int exec_insert(EngineState *eng, const InsertStatement *s,
     /* look up the table */
     const RelationDef *rel_c = engine_find_relation(eng, s->table_name.c_str());
     if (!rel_c) {
-        snprintf(out, cap, "ERROR: table '%s' does not exist",
+        snprintf(out, cap, "  Error: table '%s' does not exist",
                  s->table_name.c_str());
         return MYDB_ERR_NOT_FOUND;
     }
@@ -87,7 +87,7 @@ int exec_insert(EngineState *eng, const InsertStatement *s,
     RelationDef *rel = (RelationDef *)rel_c;
 
     if (s->rows.empty()) {
-        snprintf(out, cap, "ERROR: INSERT has no values");
+        snprintf(out, cap, "  Error: INSERT has no values");
         return MYDB_ERR;
     }
 
@@ -118,7 +118,7 @@ int exec_insert(EngineState *eng, const InsertStatement *s,
                             : (size_t)non_ai_cols;
         if (have != want) {
             snprintf(out, cap,
-                     "ERROR: row %zu has %zu value%s but %zu %s expected",
+                     "  Error: row %zu has %zu value%s but %zu %s expected",
                      ri + 1, have, have == 1 ? "" : "s", want,
                      named ? "columns listed"
                            : "non-AUTO_INCREMENT columns in table");
@@ -142,13 +142,13 @@ int exec_insert(EngineState *eng, const InsertStatement *s,
         for (int ci = 0; ci < (int)s->target_columns.size(); ci++) {
             int idx = resolve_col(rel, s->target_columns[(size_t)ci]);
             if (idx < 0) {
-                snprintf(out, cap, "ERROR: unknown column '%s'",
+                snprintf(out, cap, "  Error: unknown column '%s'",
                          s->target_columns[(size_t)ci].c_str());
                 return MYDB_ERR;
             }
             if (rel->columns[idx].is_auto_increment) {
                 snprintf(out, cap,
-                         "ERROR: column '%s' is AUTO_INCREMENT — "
+                         "  Error: column '%s' is AUTO_INCREMENT — "
                          "value must not be provided",
                          rel->columns[idx].name);
                 return MYDB_ERR;
@@ -215,7 +215,7 @@ int exec_insert(EngineState *eng, const InsertStatement *s,
                 rc = MYDB_ERR_NULL_VIOLATION;
                 AUTOCOMMIT_END(rc);
                 snprintf(out, cap,
-                         "ERROR: column '%s' cannot be NULL", col->name);
+                         "  Error: column '%s' cannot be NULL", col->name);
                 return rc;
             }
         }
@@ -232,7 +232,7 @@ int exec_insert(EngineState *eng, const InsertStatement *s,
     rc = MYDB_OK;
     AUTOCOMMIT_END(rc);
 
-    snprintf(out, cap, "Query OK, %zu row%s affected",
+    snprintf(out, cap, "OK  %zu row%s affected",
              ninserted, ninserted == 1 ? "" : "s");
     return MYDB_OK;
 }

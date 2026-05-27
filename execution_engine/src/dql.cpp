@@ -14,6 +14,7 @@
 #include "result_fmt.hpp"
 #include "value_cast.hpp"
 #include "expr_eval.hpp"
+#include "planner.h"    /* planner_choose_path, Sarg, PlanNode — extern "C" guards inside */
 
 #include <algorithm>
 #include <map>
@@ -167,39 +168,398 @@ static AccessPath pick_access_path(const WhereClause *w,
 }
 
 /* ======================================================================
- * process_row  (stream path)
+ * Sarg extraction — Step 6
  *
- * Apply WHERE filter, OFFSET skip, and LIMIT cap on one candidate row.
- * Emits the header the first time a row is actually output.
+ * Walk the WHERE expression tree and collect sargable predicates into a
+ * flat Sarg[] array that the planner can consume.
  *
- * Returns 1 → LIMIT reached, caller must stop the scan.
- *         0 → row skipped or emitted, continue.
+ * Rules:
+ *   AND nodes  — recurse into both children (conjunctive predicates are
+ *                individually safe to use as access predicates).
+ *   OR nodes   — skipped (disjunctive predicates require union costing;
+ *                the WHERE filter will handle them at scan time).
+ *   BinaryExpr — sargable when one side is a ColumnRef and the other is
+ *                a Literal, and the operator is =, !=, <, <=, >, >=.
+ *   BetweenExpr — sargable (not-negated) when v is ColumnRef, lo/hi Literal.
+ *   IsNullExpr  — always sargable on the child ColumnRef.
  * ====================================================================== */
 
-static int process_row(const WhereClause     *where,
-                       const RelationDef     *rel,
-                       const Row             *row,
-                       const SelectStatement *s,
-                       ResultBuf             *rb,
-                       bool                  *header_emitted,
-                       int64_t               *skipped,
-                       int64_t               *emitted)
+/* Encode a literal string as int64 using the same scheme as ColumnStats:
+ *   INT      → (int64_t)int_val
+ *   DECIMAL  → decimal_val (scaled int)
+ *   DATE     → (int64_t)date_val
+ *   DATETIME → datetime_val
+ *   BOOL     → (int64_t)bool_val
+ *   ENUM     → (int64_t)enum_val
+ *   VARCHAR  → 0  (not range-comparable; planner uses sarg op, not value)
+ */
+static int64_t literal_to_i64(const LiteralExpr *lit, const ColumnDef &cd)
 {
-    if (!where_matches(where, rel, row)) return 0;
+    Value v = cast_literal(lit->raw, cd);
+    if (v.is_null) return 0;
+    switch (cd.type) {
+    case TYPE_INT:      return (int64_t)v.v.int_val;
+    case TYPE_DECIMAL:  return v.v.decimal_val;
+    case TYPE_DATE:     return (int64_t)v.v.date_val;
+    case TYPE_DATETIME: return v.v.datetime_val;
+    case TYPE_BOOL:     return (int64_t)v.v.bool_val;
+    case TYPE_ENUM:     return (int64_t)v.v.enum_val;
+    default:            return 0;
+    }
+}
 
-    if (*skipped < s->offset) { (*skipped)++; return 0; }
+static void extract_sargs_from_expr(const Expr *e,
+                                     const RelationDef *rel,
+                                     Sarg *sargs, int *n, int cap)
+{
+    if (!e || *n >= cap) return;
 
-    if (s->limit >= 0 && *emitted >= s->limit) return 1;
+    switch (e->kind) {
 
-    if (!*header_emitted) {
-        emit_header(*rb, rel, s);
-        *header_emitted = true;
+    case Expr::Kind::Binary: {
+        const BinaryExpr *b  = static_cast<const BinaryExpr *>(e);
+        const char       *op = b->op.c_str();
+
+        /* AND: both branches can contribute sargs independently */
+        if (strcmp(op, "AND") == 0) {
+            extract_sargs_from_expr(b->lhs.get(), rel, sargs, n, cap);
+            extract_sargs_from_expr(b->rhs.get(), rel, sargs, n, cap);
+            return;
+        }
+
+        /* Accept only comparison operators */
+        if (strcmp(op,"=")  != 0 && strcmp(op,"!=") != 0 &&
+            strcmp(op,"<")  != 0 && strcmp(op,"<=") != 0 &&
+            strcmp(op,">")  != 0 && strcmp(op,">=") != 0) return;
+
+        /* Normalise to  col op lit  (flip asymmetric ops if literal is lhs) */
+        const Expr *col_e = nullptr, *lit_e = nullptr;
+        const char *eff_op = op;
+
+        if (b->lhs && b->lhs->kind == Expr::Kind::ColumnRef &&
+            b->rhs && b->rhs->kind == Expr::Kind::Literal) {
+            col_e = b->lhs.get();  lit_e = b->rhs.get();
+        } else if (b->rhs && b->rhs->kind == Expr::Kind::ColumnRef &&
+                   b->lhs && b->lhs->kind == Expr::Kind::Literal) {
+            col_e = b->rhs.get();  lit_e = b->lhs.get();
+            if      (strcmp(op,"<")  == 0) eff_op = ">";
+            else if (strcmp(op,"<=") == 0) eff_op = ">=";
+            else if (strcmp(op,">")  == 0) eff_op = "<";
+            else if (strcmp(op,">=") == 0) eff_op = "<=";
+        }
+        if (!col_e || !lit_e) return;
+
+        const ColumnRefExpr *cr  = static_cast<const ColumnRefExpr *>(col_e);
+        const LiteralExpr   *lit = static_cast<const LiteralExpr   *>(lit_e);
+        int ci = resolve_col(rel, cr->column);
+        if (ci < 0) return;
+
+        Sarg &s = sargs[(*n)++];
+        s.col_idx = ci;
+        strncpy(s.op, eff_op, sizeof(s.op) - 1);
+        s.op[sizeof(s.op) - 1] = '\0';
+        s.lo = literal_to_i64(lit, rel->columns[ci]);
+        s.hi = s.lo;
+        break;
     }
 
-    emit_row(*rb, rel, row, s);
-    (*emitted)++;
+    case Expr::Kind::Between: {
+        const BetweenExpr *bw = static_cast<const BetweenExpr *>(e);
+        if (bw->negated) return;   /* NOT BETWEEN: leave for WHERE filter */
+        if (!bw->v  || bw->v->kind  != Expr::Kind::ColumnRef) return;
+        if (!bw->lo || bw->lo->kind != Expr::Kind::Literal)   return;
+        if (!bw->hi || bw->hi->kind != Expr::Kind::Literal)   return;
 
-    return (s->limit >= 0 && *emitted >= s->limit) ? 1 : 0;
+        const ColumnRefExpr *cr = static_cast<const ColumnRefExpr *>(bw->v.get());
+        int ci = resolve_col(rel, cr->column);
+        if (ci < 0) return;
+
+        const ColumnDef   &cd  = rel->columns[ci];
+        const LiteralExpr *lo  = static_cast<const LiteralExpr *>(bw->lo.get());
+        const LiteralExpr *hi  = static_cast<const LiteralExpr *>(bw->hi.get());
+
+        Sarg &s = sargs[(*n)++];
+        s.col_idx = ci;
+        strncpy(s.op, "BETWEEN", sizeof(s.op) - 1);
+        s.op[sizeof(s.op) - 1] = '\0';
+        s.lo = literal_to_i64(lo, cd);
+        s.hi = literal_to_i64(hi, cd);
+        break;
+    }
+
+    case Expr::Kind::IsNull: {
+        const IsNullExpr *isn = static_cast<const IsNullExpr *>(e);
+        if (!isn->child || isn->child->kind != Expr::Kind::ColumnRef) return;
+        const ColumnRefExpr *cr = static_cast<const ColumnRefExpr *>(isn->child.get());
+        int ci = resolve_col(rel, cr->column);
+        if (ci < 0) return;
+
+        Sarg &s = sargs[(*n)++];
+        s.col_idx = ci;
+        strncpy(s.op, isn->negated ? "IS_NOT_NULL" : "IS_NULL", sizeof(s.op) - 1);
+        s.op[sizeof(s.op) - 1] = '\0';
+        s.lo = s.hi = 0;
+        break;
+    }
+
+    default:
+        break;
+    }
+}
+
+/* Collect all sargable predicates from a WhereClause into sargs[0..cap-1].
+ * Returns the number of sargs written. */
+static int extract_sargs(const WhereClause *w, const RelationDef *rel,
+                          Sarg *sargs, int cap)
+{
+    int n = 0;
+    if (w && w->root)
+        extract_sargs_from_expr(w->root.get(), rel, sargs, &n, cap);
+    return n;
+}
+
+/* ======================================================================
+ * Key extraction helpers — used by plan_to_ap to reconstruct storage
+ * Values from the WHERE tree after the planner has chosen a path type.
+ * ====================================================================== */
+
+/* Scan an AND-tree for the first (col_idx = literal) predicate.
+ * Returns true and writes *out on success. */
+static bool find_eq_value(const Expr *e, const RelationDef *rel,
+                           int col_idx, Value *out)
+{
+    if (!e) return false;
+
+    if (e->kind == Expr::Kind::Binary) {
+        const BinaryExpr *b = static_cast<const BinaryExpr *>(e);
+        if (strcmp(b->op.c_str(), "AND") == 0)
+            return find_eq_value(b->lhs.get(), rel, col_idx, out) ||
+                   find_eq_value(b->rhs.get(), rel, col_idx, out);
+
+        if (strcmp(b->op.c_str(), "=") != 0) return false;
+
+        const Expr *col_e = nullptr, *lit_e = nullptr;
+        if (b->lhs && b->lhs->kind == Expr::Kind::ColumnRef &&
+            b->rhs && b->rhs->kind == Expr::Kind::Literal) {
+            col_e = b->lhs.get();  lit_e = b->rhs.get();
+        } else if (b->rhs && b->rhs->kind == Expr::Kind::ColumnRef &&
+                   b->lhs && b->lhs->kind == Expr::Kind::Literal) {
+            col_e = b->rhs.get();  lit_e = b->lhs.get();
+        }
+        if (!col_e || !lit_e) return false;
+
+        const ColumnRefExpr *cr  = static_cast<const ColumnRefExpr *>(col_e);
+        const LiteralExpr   *lit = static_cast<const LiteralExpr   *>(lit_e);
+        if (resolve_col(rel, cr->column) != col_idx) return false;
+
+        *out = cast_literal(lit->raw, rel->columns[col_idx]);
+        return true;
+    }
+    return false;
+}
+
+/* Scan an AND-tree for the tightest lower bound on col_idx.
+ * Handles >=, >, and BETWEEN.lo.  When multiple lower bounds exist on
+ * the same column, the highest one wins (tightest range → fewest rows).
+ * Returns true if at least one lower-bound predicate was found. */
+static bool find_range_lo(const Expr *e, const RelationDef *rel,
+                           int col_idx, Value *out)
+{
+    if (!e) return false;
+
+    if (e->kind == Expr::Kind::Binary) {
+        const BinaryExpr *b  = static_cast<const BinaryExpr *>(e);
+        const char       *op = b->op.c_str();
+
+        if (strcmp(op, "AND") == 0) {
+            Value lo1, lo2;
+            memset(&lo1, 0, sizeof(lo1));
+            memset(&lo2, 0, sizeof(lo2));
+            bool g1 = find_range_lo(b->lhs.get(), rel, col_idx, &lo1);
+            bool g2 = find_range_lo(b->rhs.get(), rel, col_idx, &lo2);
+            if (g1 && g2) {
+                /* take the higher of the two lower bounds */
+                *out = (compare_values(&lo1, &lo2) >= 0) ? lo1 : lo2;
+                return true;
+            }
+            if (g1) { *out = lo1; return true; }
+            if (g2) { *out = lo2; return true; }
+            return false;
+        }
+
+        /* col >= lit  or  col > lit */
+        if ((strcmp(op, ">=") == 0 || strcmp(op, ">") == 0) &&
+            b->lhs && b->lhs->kind == Expr::Kind::ColumnRef &&
+            b->rhs && b->rhs->kind == Expr::Kind::Literal) {
+            const ColumnRefExpr *cr  = static_cast<const ColumnRefExpr *>(b->lhs.get());
+            const LiteralExpr   *lit = static_cast<const LiteralExpr   *>(b->rhs.get());
+            if (resolve_col(rel, cr->column) != col_idx) return false;
+            *out = cast_literal(lit->raw, rel->columns[col_idx]);
+            return true;
+        }
+
+        /* lit <= col  or  lit < col  (literal on the left) */
+        if ((strcmp(op, "<=") == 0 || strcmp(op, "<") == 0) &&
+            b->rhs && b->rhs->kind == Expr::Kind::ColumnRef &&
+            b->lhs && b->lhs->kind == Expr::Kind::Literal) {
+            const ColumnRefExpr *cr  = static_cast<const ColumnRefExpr *>(b->rhs.get());
+            const LiteralExpr   *lit = static_cast<const LiteralExpr   *>(b->lhs.get());
+            if (resolve_col(rel, cr->column) != col_idx) return false;
+            *out = cast_literal(lit->raw, rel->columns[col_idx]);
+            return true;
+        }
+
+        return false;
+    }
+
+    /* BETWEEN v AND lo AND hi → lo is the lower bound */
+    if (e->kind == Expr::Kind::Between) {
+        const BetweenExpr *bw = static_cast<const BetweenExpr *>(e);
+        if (!bw->v || bw->v->kind != Expr::Kind::ColumnRef) return false;
+        const ColumnRefExpr *cr = static_cast<const ColumnRefExpr *>(bw->v.get());
+        if (resolve_col(rel, cr->column) != col_idx) return false;
+        if (!bw->lo || bw->lo->kind != Expr::Kind::Literal) return false;
+        const LiteralExpr *lit = static_cast<const LiteralExpr *>(bw->lo.get());
+        *out = cast_literal(lit->raw, rel->columns[col_idx]);
+        return true;
+    }
+
+    return false;
+}
+
+/* ======================================================================
+ * plan_to_ap — Step 7 bridge
+ *
+ * Translate the planner's PlanNode (path type + cost metadata) into the
+ * concrete AccessPath struct the scan loops consume.
+ *
+ * Point lookups (PK_LOOKUP, INDEX_LOOKUP): key extracted by re-scanning
+ * the WHERE tree via find_eq_value — works for any column type including
+ * VARCHAR since cast_literal is called with the raw literal string.
+ *
+ * Range scan (PK_RANGE): lower bound extracted via find_range_lo; if
+ * only an upper-bound predicate exists, AP_SCAN is returned so the WHERE
+ * filter applies the bound at evaluation time.
+ *
+ * INDEX_RANGE → AP_SCAN: Phase 1 storage API has no secondary-index range
+ * cursor; the full scan + WHERE filter is the correct fallback.
+ * ====================================================================== */
+static AccessPath plan_to_ap(const PlanNode    &plan,
+                              const WhereClause *where,
+                              const RelationDef *rel)
+{
+    AccessPath ap;
+    memset(&ap, 0, sizeof(ap));
+    ap.kind = AP_SCAN;   /* default: full scan */
+
+    const Expr *root = (where) ? where->root.get() : nullptr;
+
+    switch (plan.path) {
+
+    case ACCESS_FULL_SCAN:
+        /* already AP_SCAN */
+        break;
+
+    case ACCESS_PK_LOOKUP: {
+        Value key;
+        memset(&key, 0, sizeof(key));
+        if (root && find_eq_value(root, rel, (int)rel->pk_col_idx, &key)) {
+            ap.kind = AP_GET_PK;
+            ap.key  = key;
+        }
+        break;
+    }
+
+    case ACCESS_PK_RANGE: {
+        /* Use scan_from(lo) when a lower bound exists.  An upper-bound-only
+         * predicate (e.g. WHERE pk < 100) falls back to AP_SCAN and the
+         * WHERE filter stops the scan when the bound is exceeded. */
+        Value lo_key;
+        memset(&lo_key, 0, sizeof(lo_key));
+        if (root && find_range_lo(root, rel, (int)rel->pk_col_idx, &lo_key)) {
+            ap.kind = AP_SCAN_FROM;
+            ap.key  = lo_key;
+        }
+        break;
+    }
+
+    case ACCESS_INDEX_LOOKUP: {
+        Value key;
+        memset(&key, 0, sizeof(key));
+        if (root && find_eq_value(root, rel, plan.index_col_idx, &key)) {
+            ap.kind    = AP_GET_INDEX;
+            ap.col_idx = plan.index_col_idx;
+            ap.key     = key;
+        }
+        break;
+    }
+
+    case ACCESS_INDEX_RANGE:
+        /* Phase 1: no secondary index range scan API.
+         * WHERE filter at full-scan time handles the predicate. */
+        ap.kind = AP_SCAN;
+        break;
+    }
+
+    return ap;
+}
+
+/* ======================================================================
+ * Design 3 row-building helpers
+ *
+ * These functions return std::vector<std::string> suitable for feeding
+ * into a TableBuilder.  They replace the old emit_header / emit_row /
+ * emit_agg_row / emit_group_row functions that wrote directly into a
+ * ResultBuf.
+ * ====================================================================== */
+
+/* Build column header labels for a SELECT statement. */
+static std::vector<std::string>
+make_select_header(const RelationDef *rel, const SelectStatement *s)
+{
+    std::vector<std::string> cols;
+    if (s->is_select_all) {
+        for (int i = 0; i < rel->num_columns; i++)
+            cols.push_back(rel->columns[i].name);
+    } else {
+        for (const auto &item : s->select_list) {
+            if (item.kind == SelectItem::Kind::Aggregate) {
+                if (!item.alias.empty()) {
+                    cols.push_back(item.alias);
+                } else {
+                    std::string lbl = item.agg_func + "(";
+                    if (item.agg_distinct) lbl += "DISTINCT ";
+                    lbl += item.column + ")";
+                    cols.push_back(lbl);
+                }
+            } else {
+                cols.push_back(item.alias.empty() ? item.column : item.alias);
+            }
+        }
+    }
+    return cols;
+}
+
+/* Build one plain result row from a storage Row. */
+static std::vector<std::string>
+make_select_row(const RelationDef *rel,
+                const Row *row,
+                const SelectStatement *s)
+{
+    std::vector<std::string> cells;
+    if (s->is_select_all) {
+        for (int i = 0; i < rel->num_columns; i++)
+            cells.push_back(value_to_str(row->cols[i], rel->columns[i]));
+    } else {
+        for (const auto &item : s->select_list) {
+            int idx = (item.kind == SelectItem::Kind::Column)
+                      ? resolve_col(rel, item.column) : -1;
+            cells.push_back(idx >= 0
+                            ? value_to_str(row->cols[idx], rel->columns[idx])
+                            : "NULL");
+        }
+    }
+    return cells;
 }
 
 /* ======================================================================
@@ -291,67 +651,128 @@ static void agg_accumulate(AggState *states, int n,
     }
 }
 
-/*
- * Emit the single aggregate result row into rb.
- * Called once after the scan finishes.
- */
-static void emit_agg_row(ResultBuf &rb, const RelationDef *rel,
-                         const SelectStatement *s,
-                         const AggState *states, int n)
+
+/* Build one aggregate result row from the AggState accumulators. */
+static std::vector<std::string>
+make_agg_row(const RelationDef *rel,
+             const SelectStatement *s,
+             const AggState *states, int n)
 {
+    std::vector<std::string> cells;
     char tmp[64];
-    bool first = true;
 
     for (int i = 0; i < n; i++) {
-        if (!first) rb.append(" | ");
-        first = false;
-
         const AggState    &st   = states[i];
-        const SelectItem  &item = s->select_list[(size_t)i];
-        const std::string &func = item.agg_func;
+        const std::string &func = s->select_list[(size_t)i].agg_func;
 
         if (func == "COUNT") {
             snprintf(tmp, sizeof(tmp), "%lld", (long long)st.count);
-            rb.append(tmp);
-
+            cells.push_back(tmp);
         } else if (func == "SUM") {
             if (!st.has_value) {
-                rb.append("NULL");
+                cells.push_back("NULL");
             } else if (st.col_idx >= 0 &&
                        rel->columns[st.col_idx].type == TYPE_INT) {
                 snprintf(tmp, sizeof(tmp), "%lld", (long long)(int64_t)st.sum);
-                rb.append(tmp);
+                cells.push_back(tmp);
             } else {
-                /* DECIMAL or other numeric */
                 int scale = (st.col_idx >= 0 && rel->columns[st.col_idx].scale > 0)
                             ? rel->columns[st.col_idx].scale : 2;
                 char fmt[16];
                 snprintf(fmt, sizeof(fmt), "%%.%df", scale);
                 snprintf(tmp, sizeof(tmp), fmt, st.sum);
-                rb.append(tmp);
+                cells.push_back(tmp);
             }
-
         } else if (func == "AVG") {
             if (st.count == 0) {
-                rb.append("NULL");
+                cells.push_back("NULL");
             } else {
                 snprintf(tmp, sizeof(tmp), "%.2f", st.sum / (double)st.count);
-                rb.append(tmp);
+                cells.push_back(tmp);
             }
-
         } else if (func == "MIN" || func == "MAX") {
             if (!st.has_value) {
-                rb.append("NULL");
+                cells.push_back("NULL");
             } else {
                 const Value &val = (func == "MIN") ? st.min_val : st.max_val;
-                if (st.col_idx >= 0)
-                    rb.append_value(val, rel->columns[st.col_idx]);
-                else
-                    rb.append("NULL");
+                cells.push_back(st.col_idx >= 0
+                                ? value_to_str(val, rel->columns[st.col_idx])
+                                : "NULL");
             }
+        } else {
+            cells.push_back("NULL");
         }
     }
-    rb.append("\n");
+    return cells;
+}
+
+/* Build one GROUP BY result row. */
+static std::vector<std::string>
+make_group_row(const RelationDef *rel,
+               const SelectStatement *s,
+               const Row &key_row,
+               const std::vector<AggState> &states)
+{
+    std::vector<std::string> cells;
+    char tmp[64];
+
+    for (size_t i = 0; i < s->select_list.size(); i++) {
+        const SelectItem &item = s->select_list[i];
+
+        if (item.kind == SelectItem::Kind::Column) {
+            int idx = resolve_col(rel, item.column);
+            cells.push_back(idx >= 0
+                            ? value_to_str(key_row.cols[idx], rel->columns[idx])
+                            : "NULL");
+        } else if (item.kind == SelectItem::Kind::Aggregate) {
+            const AggState    &st   = states[i];
+            const std::string &func = item.agg_func;
+
+            if (func == "COUNT") {
+                snprintf(tmp, sizeof(tmp), "%lld", (long long)st.count);
+                cells.push_back(tmp);
+            } else if (func == "SUM") {
+                if (!st.has_value) {
+                    cells.push_back("NULL");
+                } else if (st.col_idx >= 0 &&
+                           rel->columns[st.col_idx].type == TYPE_INT) {
+                    snprintf(tmp, sizeof(tmp), "%lld",
+                             (long long)(int64_t)st.sum);
+                    cells.push_back(tmp);
+                } else {
+                    int scale = (st.col_idx >= 0 &&
+                                 rel->columns[st.col_idx].scale > 0)
+                                ? rel->columns[st.col_idx].scale : 2;
+                    char fmt[16];
+                    snprintf(fmt, sizeof(fmt), "%%.%df", scale);
+                    snprintf(tmp, sizeof(tmp), fmt, st.sum);
+                    cells.push_back(tmp);
+                }
+            } else if (func == "AVG") {
+                if (st.count == 0)
+                    cells.push_back("NULL");
+                else {
+                    snprintf(tmp, sizeof(tmp), "%.2f",
+                             st.sum / (double)st.count);
+                    cells.push_back(tmp);
+                }
+            } else if (func == "MIN" || func == "MAX") {
+                if (!st.has_value)
+                    cells.push_back("NULL");
+                else {
+                    const Value &val = (func == "MIN") ? st.min_val : st.max_val;
+                    cells.push_back(st.col_idx >= 0
+                                    ? value_to_str(val, rel->columns[st.col_idx])
+                                    : "NULL");
+                }
+            } else {
+                cells.push_back("NULL");
+            }
+        } else {
+            cells.push_back("NULL");
+        }
+    }
+    return cells;
 }
 
 /* ======================================================================
@@ -440,80 +861,6 @@ static Row make_key_row(const GroupKey      &key,
     for (int i = 0; i < num_cols; i++) r.cols[i].is_null = 1;
     for (size_t i = 0; i < idxs.size(); i++) r.cols[idxs[i]] = key.vals[i];
     return r;
-}
-
-/*
- * Emit one GROUP BY result row.
- *
- * states[] is parallel to s->select_list:
- *   Column items   → value taken from key_row at the column's real index.
- *   Aggregate items → value computed from states[i].
- */
-static void emit_group_row(ResultBuf               &rb,
-                           const RelationDef       *rel,
-                           const SelectStatement   *s,
-                           const Row               &key_row,
-                           const std::vector<AggState> &states)
-{
-    char tmp[64];
-    bool first = true;
-
-    for (size_t i = 0; i < s->select_list.size(); i++) {
-        if (!first) rb.append(" | ");
-        first = false;
-
-        const SelectItem &item = s->select_list[i];
-
-        if (item.kind == SelectItem::Kind::Column) {
-            int idx = resolve_col(rel, item.column);
-            if (idx >= 0) rb.append_value(key_row.cols[idx], rel->columns[idx]);
-            else          rb.append("NULL");
-
-        } else if (item.kind == SelectItem::Kind::Aggregate) {
-            const AggState    &st   = states[i];
-            const std::string &func = item.agg_func;
-
-            if (func == "COUNT") {
-                snprintf(tmp, sizeof(tmp), "%lld", (long long)st.count);
-                rb.append(tmp);
-
-            } else if (func == "SUM") {
-                if (!st.has_value) {
-                    rb.append("NULL");
-                } else if (st.col_idx >= 0 &&
-                           rel->columns[st.col_idx].type == TYPE_INT) {
-                    snprintf(tmp, sizeof(tmp), "%lld", (long long)(int64_t)st.sum);
-                    rb.append(tmp);
-                } else {
-                    int scale = (st.col_idx >= 0 && rel->columns[st.col_idx].scale > 0)
-                                ? rel->columns[st.col_idx].scale : 2;
-                    char fmt[16];
-                    snprintf(fmt, sizeof(fmt), "%%.%df", scale);
-                    snprintf(tmp, sizeof(tmp), fmt, st.sum);
-                    rb.append(tmp);
-                }
-
-            } else if (func == "AVG") {
-                if (st.count == 0) rb.append("NULL");
-                else {
-                    snprintf(tmp, sizeof(tmp), "%.2f", st.sum / (double)st.count);
-                    rb.append(tmp);
-                }
-
-            } else if (func == "MIN" || func == "MAX") {
-                if (!st.has_value) rb.append("NULL");
-                else {
-                    const Value &val = (func == "MIN") ? st.min_val : st.max_val;
-                    if (st.col_idx >= 0)
-                        rb.append_value(val, rel->columns[st.col_idx]);
-                    else
-                        rb.append("NULL");
-                }
-            }
-        }
-        /* SelectItem::Kind::Star is blocked by the pre-check in exec_select */
-    }
-    rb.append("\n");
 }
 
 /*
@@ -625,14 +972,15 @@ static int exec_group_by(const SelectStatement *s,
      * for GROUP BY columns and NULL for everything else.  Ordering by a
      * non-GROUP-BY column will see NULLs and treat all groups as equal
      * for that column (consistent, no crash). */
+    /* Compute slice bounds (before any sort). */
+    size_t total = results.size();
+    size_t start = ((size_t)s->offset < total) ? (size_t)s->offset : total;
+    size_t end   = (s->limit >= 0)
+                   ? std::min(start + (size_t)s->limit, total)
+                   : total;
+
     if (!s->order_by.empty()) {
         RowLess row_cmp { rel, &s->order_by };
-
-        size_t total = results.size();
-        size_t start = ((size_t)s->offset < total) ? (size_t)s->offset : total;
-        size_t end   = (s->limit >= 0)
-                       ? std::min(start + (size_t)s->limit, total)
-                       : total;
 
         auto pair_cmp = [&row_cmp](const GResult &a, const GResult &b) {
             return row_cmp(a.first, b.first);
@@ -644,27 +992,14 @@ static int exec_group_by(const SelectStatement *s,
                               results.end(), pair_cmp);
         else if (total > 1)
             std::sort(results.begin(), results.end(), pair_cmp);
-
-        ResultBuf rb(out, cap);
-        emit_header(rb, rel, s);
-        for (size_t i = start; i < end; i++)
-            emit_group_row(rb, rel, s, results[i].first, results[i].second);
-        rb.finalize(end - start);
-        return MYDB_OK;
     }
 
-    /* No ORDER BY — insertion order, slice by LIMIT/OFFSET. */
-    size_t total = results.size();
-    size_t start = ((size_t)s->offset < total) ? (size_t)s->offset : total;
-    size_t end   = (s->limit >= 0)
-                   ? std::min(start + (size_t)s->limit, total)
-                   : total;
-
     ResultBuf rb(out, cap);
-    emit_header(rb, rel, s);
+    TableBuilder tb;
+    tb.set_headers(make_select_header(rel, s));
     for (size_t i = start; i < end; i++)
-        emit_group_row(rb, rel, s, results[i].first, results[i].second);
-    rb.finalize(end - start);
+        tb.add_row(make_group_row(rel, s, results[i].first, results[i].second));
+    tb.render(rb);
     return MYDB_OK;
 }
 
@@ -693,7 +1028,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
      * Defer unimplemented sub-phases gracefully.
      * ------------------------------------------------------------------ */
     if (s->join_clause) {
-        snprintf(out, cap, "not implemented: JOIN");
+        snprintf(out, cap, "  Error: JOIN is not yet implemented");
         return MYDB_ERR;
     }
 
@@ -702,7 +1037,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
      * With GROUP BY this mix is valid — non-agg cols must be in GROUP BY. */
     if (has_agg && has_col && s->group_by.empty()) {
         snprintf(out, cap,
-                 "ERROR: cannot mix aggregate and non-aggregate columns "
+                 "  Error: cannot mix aggregate and non-aggregate columns "
                  "without GROUP BY");
         return MYDB_ERR;
     }
@@ -711,7 +1046,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
      * With GROUP BY, ORDER BY applies to the grouped result — allowed. */
     if (has_agg && !s->order_by.empty() && s->group_by.empty()) {
         snprintf(out, cap,
-                 "ERROR: ORDER BY is not applicable to scalar aggregates");
+                 "  Error: ORDER BY is not applicable to scalar aggregates");
         return MYDB_ERR;
     }
 
@@ -726,7 +1061,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
 
     const RelationDef *rel = engine_find_relation(eng, s->table_name.c_str());
     if (!rel) {
-        snprintf(out, cap, "ERROR: table '%s' does not exist",
+        snprintf(out, cap, "  Error: table '%s' does not exist",
                  s->table_name.c_str());
         return MYDB_ERR_NOT_FOUND;
     }
@@ -740,7 +1075,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
             if (item.kind == SelectItem::Kind::Column) {
                 if (resolve_col(rel, item.column) < 0) {
                     snprintf(out, cap,
-                             "ERROR: column '%s' does not exist in table '%s'",
+                             "  Error: column '%s' does not exist in table '%s'",
                              item.column.c_str(), s->table_name.c_str());
                     return MYDB_ERR;
                 }
@@ -799,7 +1134,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
 
         /* SELECT * with GROUP BY is ambiguous — which columns form the key? */
         if (s->is_select_all) {
-            snprintf(out, cap, "ERROR: SELECT * is not allowed with GROUP BY");
+            snprintf(out, cap, "  Error: SELECT * is not allowed with GROUP BY");
             return MYDB_ERR;
         }
 
@@ -822,7 +1157,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
                 if (gc == item.column) { in_grp = true; break; }
             if (!in_grp) {
                 snprintf(out, cap,
-                         "ERROR: column '%s' must appear in GROUP BY or be "
+                         "  Error: column '%s' must appear in GROUP BY or be "
                          "used in an aggregate function",
                          item.column.c_str());
                 return MYDB_ERR;
@@ -854,31 +1189,32 @@ int exec_select(EngineState *eng, const SelectStatement *s,
      * slice [offset, offset+limit) and emit.
      * ------------------------------------------------------------------ */
     bool has_order  = !s->order_by.empty();
-    bool pk_stream  = false;
-
-    if (!has_agg && has_order) {
-        int first_idx = resolve_col(rel, s->order_by[0].column);
-        if (first_idx == (int)rel->pk_col_idx && !s->order_by[0].descending)
-            pk_stream = true;
-    }
 
     /* ------------------------------------------------------------------
-     * Step 5d: choose access path (pure AST inspection — zero I/O).
+     * Step 5d: choose access path via the cost-based planner.
+     *
+     * extract_sargs  — decode the WHERE tree into sargable predicates.
+     * planner_choose_path — short-circuit rules first, then CBO with
+     *                       __stats.mydb statistics when available.
+     * plan_to_ap     — translate the chosen PlanNode back into the
+     *                  AccessPath struct that the scan loops consume.
      * ------------------------------------------------------------------ */
-    AccessPath ap = pick_access_path(s->where_clause.get(), rel);
+    Sarg       sargs[32];
+    int        n_sargs = extract_sargs(s->where_clause.get(), rel, sargs, 32);
+    PlanNode   plan    = planner_choose_path(eng, rel, sargs, n_sargs);
+    AccessPath ap      = plan_to_ap(plan, s->where_clause.get(), rel);
 
     /* ==================================================================
      * AGGREGATE PATH — all SELECT items are aggregate functions.
      *
-     * Stream all rows that pass WHERE, accumulate into AggState array,
-     * then emit exactly one result row.
+     * Scan all rows that pass WHERE, accumulate into AggState array,
+     * then emit exactly one result row via TableBuilder.
      * ================================================================== */
     if (has_agg) {
         int       n = (int)s->select_list.size();
         AggState  states[MAX_COLUMNS];
         memset(states, 0, sizeof(states));
 
-        /* resolve column indices once */
         for (int i = 0; i < n; i++) {
             const SelectItem &item = s->select_list[(size_t)i];
             states[i].col_idx = (item.column == "*")
@@ -886,9 +1222,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
                                  : resolve_col(rel, item.column);
         }
 
-        /* scan — no early termination, need all rows */
         switch (ap.kind) {
-
         case AP_GET_PK: {
             Row *row = storage_get_by_pk(rel_rw, &ap.key);
             if (row && where_matches(s->where_clause.get(), rel, row))
@@ -905,194 +1239,108 @@ int exec_select(EngineState *eng, const SelectStatement *s,
             Cursor *cur = storage_scan_from(rel_rw, &ap.key);
             if (cur) {
                 Row *row;
-                while ((row = cursor_next(cur)) != NULL) {
+                while ((row = cursor_next(cur)) != NULL)
                     if (where_matches(s->where_clause.get(), rel, row))
                         agg_accumulate(states, n, s, rel, row);
-                }
                 cursor_close(cur);
             }
             break;
         }
-        case AP_SCAN:
         default: {
             Cursor *cur = storage_scan(rel_rw);
             if (cur) {
                 Row *row;
-                while ((row = cursor_next(cur)) != NULL) {
+                while ((row = cursor_next(cur)) != NULL)
                     if (where_matches(s->where_clause.get(), rel, row))
                         agg_accumulate(states, n, s, rel, row);
-                }
                 cursor_close(cur);
             }
             break;
         }
         }
 
-        /* emit single result row */
         ResultBuf rb(out, cap);
-        emit_header(rb, rel, s);
-        emit_agg_row(rb, rel, s, states, n);
-        rb.finalize(1);
+        TableBuilder tb;
+        tb.set_headers(make_select_header(rel, s));
+        tb.add_row(make_agg_row(rel, s, states, n));
+        tb.render(rb);
         return MYDB_OK;
     }
 
     /* ==================================================================
-     * STREAM PATH — no ORDER BY, or ORDER BY pk ASC (optimised).
-     * Rows arrive in B+ tree order (= PK ascending), which is already
-     * the correct order for the pk_stream case.
-     * ================================================================== */
-    if (!has_order || pk_stream) {
-
-        ResultBuf rb(out, cap);
-        bool      header_emitted = false;
-        int64_t   skipped        = 0;
-        int64_t   emitted        = 0;
-
-        switch (ap.kind) {
-
-        case AP_GET_PK: {
-            Row *row = storage_get_by_pk(rel_rw, &ap.key);
-            if (row)
-                process_row(s->where_clause.get(), rel, row, s,
-                            &rb, &header_emitted, &skipped, &emitted);
-            break;
-        }
-
-        case AP_GET_INDEX: {
-            Row *row = storage_get_by_index(rel_rw, ap.col_idx, &ap.key);
-            if (row)
-                process_row(s->where_clause.get(), rel, row, s,
-                            &rb, &header_emitted, &skipped, &emitted);
-            break;
-        }
-
-        case AP_SCAN_FROM: {
-            Cursor *cur = storage_scan_from(rel_rw, &ap.key);
-            if (cur) {
-                Row *row;
-                while ((row = cursor_next(cur)) != NULL) {
-                    if (process_row(s->where_clause.get(), rel, row, s,
-                                    &rb, &header_emitted, &skipped, &emitted))
-                        break;
-                }
-                cursor_close(cur);
-            }
-            break;
-        }
-
-        case AP_SCAN:
-        default: {
-            Cursor *cur = storage_scan(rel_rw);
-            if (cur) {
-                Row *row;
-                while ((row = cursor_next(cur)) != NULL) {
-                    if (process_row(s->where_clause.get(), rel, row, s,
-                                    &rb, &header_emitted, &skipped, &emitted))
-                        break;
-                }
-                cursor_close(cur);
-            }
-            break;
-        }
-        }
-
-        if (!header_emitted)
-            emit_header(rb, rel, s);
-
-        rb.finalize((size_t)emitted);
-        return MYDB_OK;
-    }
-
-    /* ==================================================================
-     * MATERIALISE PATH — ORDER BY on a non-PK column, or DESC on PK.
-     *
-     * 1. Collect every row that passes the WHERE filter.
-     * 2. Sort:
-     *      with LIMIT   → std::partial_sort (only sort as many as needed)
-     *      without LIMIT → std::sort
-     * 3. Slice [offset, offset+limit) from the sorted result.
-     * 4. Emit header + rows.
+     * COLLECT PATH (non-aggregate) — gather all matching rows, apply
+     * OFFSET/LIMIT, optionally sort (ORDER BY), then render with
+     * TableBuilder.  Design 3 requires knowing all cell widths before
+     * emitting, so we always collect first regardless of ORDER BY.
      * ================================================================== */
 
-    std::vector<Row> results;
+    std::vector<Row> all_rows;
 
-    /* Collect — no LIMIT applied here; we need all rows to sort correctly */
     switch (ap.kind) {
-
     case AP_GET_PK: {
         Row *row = storage_get_by_pk(rel_rw, &ap.key);
         if (row && where_matches(s->where_clause.get(), rel, row))
-            results.push_back(*row);
+            all_rows.push_back(*row);
         break;
     }
-
     case AP_GET_INDEX: {
         Row *row = storage_get_by_index(rel_rw, ap.col_idx, &ap.key);
         if (row && where_matches(s->where_clause.get(), rel, row))
-            results.push_back(*row);
+            all_rows.push_back(*row);
         break;
     }
-
     case AP_SCAN_FROM: {
         Cursor *cur = storage_scan_from(rel_rw, &ap.key);
         if (cur) {
             Row *row;
-            while ((row = cursor_next(cur)) != NULL) {
+            while ((row = cursor_next(cur)) != NULL)
                 if (where_matches(s->where_clause.get(), rel, row))
-                    results.push_back(*row);
-            }
+                    all_rows.push_back(*row);
             cursor_close(cur);
         }
         break;
     }
-
-    case AP_SCAN:
     default: {
         Cursor *cur = storage_scan(rel_rw);
         if (cur) {
             Row *row;
-            while ((row = cursor_next(cur)) != NULL) {
+            while ((row = cursor_next(cur)) != NULL)
                 if (where_matches(s->where_clause.get(), rel, row))
-                    results.push_back(*row);
-            }
+                    all_rows.push_back(*row);
             cursor_close(cur);
         }
         break;
     }
     }
 
-    /* Sort */
-    RowLess cmp { rel, &s->order_by };
+    /* Sort if ORDER BY requested. */
+    size_t total = all_rows.size();
 
-    size_t total = results.size();
-    size_t start = (s->offset > 0 && (size_t)s->offset < total)
-                   ? (size_t)s->offset : (total > 0 ? 0 : 0);
-    if ((size_t)s->offset >= total) start = total;   /* offset past end */
-
-    size_t end = (s->limit >= 0)
-                 ? std::min(start + (size_t)s->limit, total)
-                 : total;
-
-    /*
-     * partial_sort guarantees [begin, begin+end) is sorted — the tail is
-     * unordered.  This is cheaper than full sort when end << total.
-     * Use full sort when end == total (no LIMIT, or LIMIT >= row count).
-     */
-    if (end > 0 && end < total) {
-        std::partial_sort(results.begin(),
-                          results.begin() + (ptrdiff_t)end,
-                          results.end(), cmp);
-    } else if (total > 1) {
-        std::sort(results.begin(), results.end(), cmp);
+    if (has_order) {
+        RowLess cmp { rel, &s->order_by };
+        size_t sort_end = (s->limit >= 0)
+                          ? std::min((size_t)s->offset + (size_t)s->limit, total)
+                          : total;
+        if (sort_end > 0 && sort_end < total)
+            std::partial_sort(all_rows.begin(),
+                              all_rows.begin() + (ptrdiff_t)sort_end,
+                              all_rows.end(), cmp);
+        else if (total > 1)
+            std::sort(all_rows.begin(), all_rows.end(), cmp);
     }
 
-    /* Emit */
+    /* Slice [start, end). */
+    size_t start = ((size_t)s->offset < total) ? (size_t)s->offset : total;
+    size_t end   = (s->limit >= 0)
+                   ? std::min(start + (size_t)s->limit, total)
+                   : total;
+
+    /* Build and render table. */
     ResultBuf rb(out, cap);
-    emit_header(rb, rel, s);
-
+    TableBuilder tb;
+    tb.set_headers(make_select_header(rel, s));
     for (size_t i = start; i < end; i++)
-        emit_row(rb, rel, &results[i], s);
-
-    rb.finalize(end - start);
+        tb.add_row(make_select_row(rel, &all_rows[i], s));
+    tb.render(rb);
     return MYDB_OK;
 }

@@ -1,4 +1,5 @@
 #include "storage.h"
+#include "stats.h"
 #include "engine.h"
 #include "page.h"
 #include "buffer_pool.h"
@@ -466,6 +467,80 @@ int storage_create_schema(const char *name)
         return rc;
     }
     return MYDB_OK;
+}
+
+int storage_drop_schema(const char *name)
+{
+    if (!g.initialized || !name || name[0] == '\0') return MYDB_ERR;
+    if (!g.eng->partition_open) return MYDB_ERR_PERM;
+
+    /* Reject dropping the currently active schema — caller must USE
+     * another database (or none) before dropping this one. */
+    if (g.eng->schema_active &&
+        strncmp(g.eng->current_schema_name, name,
+                sizeof(g.eng->current_schema_name)) == 0)
+        return MYDB_ERR;   /* exec_drop_database checks and surfaces a message */
+
+    /* Schema must be registered in the partition catalog. */
+    if (cat_find_schema(&g.eng->active_catalog, name) == NULL)
+        return MYDB_ERR_NOT_FOUND;
+
+    /* Build schema directory path. */
+    char schema_dir[512], schema_file[512];
+    int n = snprintf(schema_dir, sizeof(schema_dir), "%s/%s",
+                     g.eng->current_partition_path, name);
+    if (n < 0 || (size_t)n >= sizeof(schema_dir)) return MYDB_ERR;
+
+    n = snprintf(schema_file, sizeof(schema_file), "%s/__schema.mydb", schema_dir);
+    if (n < 0 || (size_t)n >= sizeof(schema_file)) return MYDB_ERR;
+
+    /* Open the schema file to enumerate relation files. */
+    SchemaFile sf;
+    int rc = schema_open(schema_file, &sf);
+    if (rc != MYDB_OK) return rc;
+
+    /* Compute bytes used so we can credit them back to the quota. */
+    uint64_t freed_bytes = schema_compute_size_bytes(&sf);
+
+    /* Close any cached open-table handles for relations in this schema.
+     * Since we only have one active schema at a time and we rejected the
+     * active case above, no open tables should be from this schema — but
+     * close defensively anyway. */
+    for (int i = 0; i < MAX_RELATIONS_PER_SCHEMA; i++) {
+        if (!sf.relations[i].is_valid) continue;
+
+        /* Evict from open-table cache. */
+        OpenTable *ot = find_open(sf.relations[i].relation_name);
+        if (ot) close_table(ot);
+
+        /* Delete the relation data file. */
+        char rel_path[512];
+        n = snprintf(rel_path, sizeof(rel_path), "%s/%s.mydb",
+                     schema_dir, sf.relations[i].relation_name);
+        if (n > 0 && (size_t)n < sizeof(rel_path))
+            unlink(rel_path);   /* ignore errors — file may already be gone */
+    }
+
+    schema_close(&sf);
+
+    /* Delete optional stats file. */
+    char stats_path[512];
+    n = snprintf(stats_path, sizeof(stats_path), "%s/__stats.mydb", schema_dir);
+    if (n > 0 && (size_t)n < sizeof(stats_path))
+        unlink(stats_path);   /* idempotent — missing is fine */
+
+    /* Delete the schema metadata file. */
+    unlink(schema_file);
+
+    /* Remove the now-empty schema directory. */
+    rmdir(schema_dir);
+
+    /* Credit freed data pages back to the partition quota. */
+    if (freed_bytes > 0)
+        cat_track_alloc(&g.eng->active_catalog, -(int64_t)freed_bytes);
+
+    /* Remove the schema slot from __catalog.mydb. */
+    return cat_remove_schema(&g.eng->active_catalog, name);
 }
 
 int storage_create_table(RelationDef *rel)
@@ -1470,4 +1545,323 @@ void cursor_close(Cursor *cur)
     StorageScan *sc = (StorageScan *)cur;
     btree_cursor_close(&sc->btree_cur);
     free(sc);
+}
+
+/* ======================================================================
+ * storage_analyze_table
+ *
+ * Full table scan → compute per-column statistics → write __stats.mydb.
+ *
+ * For every column (including PK) we always collect:
+ *   total_rows, num_nulls, num_distinct, min_numeric, max_numeric.
+ *
+ * For non-VARCHAR columns we additionally decide between:
+ *   MCV       — num_distinct ≤ STATS_MAX_ENTRIES, or type is BOOL/ENUM.
+ *               Store all distinct values sorted by frequency (desc).
+ *   HISTOGRAM — num_distinct > STATS_MAX_ENTRIES AND type is numeric/date.
+ *               Build STATS_MAX_ENTRIES equi-height buckets.
+ *   (none)    — VARCHAR: only scalar stats stored; no MCV or histogram.
+ *
+ * The internal hash map tracks up to ANALYZE_HM_LIMIT = 256 distinct
+ * values.  Beyond that limit the map stops accepting new keys but
+ * existing counts keep growing.  For high-cardinality columns the
+ * histogram is built from the sampled 256 values; selectivity estimates
+ * will be approximate but not wrong in a dangerous direction.
+ * ====================================================================== */
+
+/* ------------------------------------------------------------------ */
+/*  Per-column scratch types (file-scope to avoid C99 VLA issues)     */
+/* ------------------------------------------------------------------ */
+
+#define ANALYZE_HM_CAP    512    /* open-addressing capacity (power-of-2)  */
+#define ANALYZE_HM_MASK  (ANALYZE_HM_CAP - 1)
+#define ANALYZE_HM_LIMIT  256    /* stop adding new keys beyond this many   */
+
+typedef struct {
+    int64_t  key;
+    uint32_t count;
+    uint8_t  used;
+    uint8_t  _pad[3];
+} AnalyzeSlot;   /* 16 B */
+
+typedef struct {
+    AnalyzeSlot slots[ANALYZE_HM_CAP];  /* 512 × 16 B = 8 KB */
+    int64_t  min_val;
+    int64_t  max_val;
+    uint32_t null_count;
+    uint32_t distinct_count;     /* unique values seen (capped at ANALYZE_HM_LIMIT) */
+    uint8_t  hm_full;            /* 1 once distinct_count hit the limit */
+    uint8_t  has_any;            /* 1 once we've seen at least one non-null value */
+    uint8_t  skip_blob;          /* 1 for VARCHAR (no MCV/histogram) */
+    uint8_t  _pad;
+} ColAnalysis;   /* ~8 KB per column */
+
+/* ------------------------------------------------------------------ */
+/*  (key, count) pair used during sort                                 */
+/* ------------------------------------------------------------------ */
+typedef struct { int64_t key; uint32_t count; } KVPair;
+
+static int kv_cmp_key (const void *a, const void *b)
+{
+    const KVPair *ka = a, *kb = b;
+    if (ka->key < kb->key) return -1;
+    if (ka->key > kb->key) return  1;
+    return 0;
+}
+static int kv_cmp_freq(const void *a, const void *b)
+{
+    const KVPair *ka = a, *kb = b;
+    /* descending frequency */
+    if (ka->count > kb->count) return -1;
+    if (ka->count < kb->count) return  1;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Encode a Value as int64 for the hash map / stats struct           */
+/* ------------------------------------------------------------------ */
+static int64_t val_to_i64(const Value *v)
+{
+    switch (v->type) {
+        case TYPE_INT:      return (int64_t)v->v.int_val;
+        case TYPE_DECIMAL:  return v->v.decimal_val;
+        case TYPE_DATE:     return (int64_t)v->v.date_val;
+        case TYPE_DATETIME: return v->v.datetime_val;
+        case TYPE_BOOL:     return (int64_t)v->v.bool_val;
+        case TYPE_ENUM:     return (int64_t)v->v.enum_val;
+        case TYPE_VARCHAR:  return 0;  /* not used */
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Hash map insert — FNV-1a-ish mixing on 64-bit key                 */
+/* ------------------------------------------------------------------ */
+static void hm_insert(ColAnalysis *ca, int64_t key)
+{
+    uint32_t h = (uint32_t)(((uint64_t)key ^ ((uint64_t)key >> 32))
+                             & ANALYZE_HM_MASK);
+    for (int t = 0; t < ANALYZE_HM_CAP; t++) {
+        AnalyzeSlot *s = &ca->slots[h];
+        if (!s->used) {
+            if (ca->hm_full) return;    /* limit reached, drop new key */
+            s->key   = key;
+            s->count = 1;
+            s->used  = 1;
+            ca->distinct_count++;
+            if (ca->distinct_count >= ANALYZE_HM_LIMIT)
+                ca->hm_full = 1;
+            return;
+        }
+        if (s->key == key) { s->count++; return; }
+        h = (h + 1) & ANALYZE_HM_MASK;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Extract live entries from a hash map into a flat KVPair array     */
+/*  Returns count of entries written.                                 */
+/* ------------------------------------------------------------------ */
+static int hm_extract(const ColAnalysis *ca, KVPair *out, int max_out)
+{
+    int n = 0;
+    for (int i = 0; i < ANALYZE_HM_CAP && n < max_out; i++) {
+        if (ca->slots[i].used) {
+            out[n].key   = ca->slots[i].key;
+            out[n].count = ca->slots[i].count;
+            n++;
+        }
+    }
+    return n;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Build __stats.mydb path in the active schema directory            */
+/* ------------------------------------------------------------------ */
+static int build_stats_path(char *out, size_t outlen)
+{
+    int n = snprintf(out, outlen, "%s/%s/__stats.mydb",
+                     g.eng->current_partition_path,
+                     g.eng->current_schema_name);
+    return (n < 0 || (size_t)n >= outlen) ? MYDB_ERR : MYDB_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/*  storage_analyze_table                                             */
+/* ------------------------------------------------------------------ */
+int storage_analyze_table(RelationDef *rel)
+{
+    if (!g.initialized)         return MYDB_ERR;
+    if (!g.eng->schema_active)  return MYDB_ERR;
+
+    /* Read-only operation — analyst access is sufficient. */
+    if (engine_check_access(g.eng, 0) != MYDB_OK) return MYDB_ERR_PERM;
+
+    /* Locate the relation's slot so we know which stats page to write. */
+    RelationEntry *ent = schema_find_relation_stat(&g.eng->active_schema,
+                                                    rel->relation_name);
+    if (!ent) return MYDB_ERR_NOT_FOUND;
+    int slot_idx = (int)(ent - g.eng->active_schema.relations);
+
+    /* Open or create __stats.mydb for the active schema. */
+    char stats_path[512];
+    if (build_stats_path(stats_path, sizeof(stats_path)) != MYDB_OK)
+        return MYDB_ERR;
+
+    StatsFile sf;
+    int rc = stats_open(stats_path, &sf);
+    if (rc == MYDB_ERR_NOT_FOUND)
+        rc = stats_create(stats_path, g.eng->current_schema_name, &sf);
+    if (rc != MYDB_OK) return rc;
+
+    /* Blank this relation's stats page in memory. */
+    stats_reset_relation(&sf, slot_idx);
+
+    /* ----------------------------------------------------------------
+     * Phase 1: full table scan.
+     *
+     * We allocate one ColAnalysis per column on the stack.  Each entry
+     * is ~8 KB; 32 columns = ~256 KB — well within Linux's 8 MB default.
+     * ---------------------------------------------------------------- */
+    ColAnalysis ca[MAX_COLUMNS];
+    memset(ca, 0, sizeof(ca));
+
+    /* Mark VARCHAR columns so the inner loop can skip hash-map work. */
+    for (int i = 0; i < rel->num_columns; i++)
+        if (rel->columns[i].type == TYPE_VARCHAR)
+            ca[i].skip_blob = 1;
+
+    uint32_t total_rows = 0;
+
+    Cursor *cur = storage_scan(rel);
+    if (cur) {
+        Row *row;
+        while ((row = cursor_next(cur)) != NULL) {
+            total_rows++;
+            for (int i = 0; i < rel->num_columns; i++) {
+                const Value *v = &row->cols[i];
+
+                if (v->is_null) {
+                    ca[i].null_count++;
+                    continue;
+                }
+
+                /* Update min / max. */
+                int64_t enc = val_to_i64(v);
+                if (!ca[i].has_any) {
+                    ca[i].min_val = enc;
+                    ca[i].max_val = enc;
+                    ca[i].has_any = 1;
+                } else {
+                    if (enc < ca[i].min_val) ca[i].min_val = enc;
+                    if (enc > ca[i].max_val) ca[i].max_val = enc;
+                }
+
+                if (!ca[i].skip_blob)
+                    hm_insert(&ca[i], enc);
+            }
+        }
+        cursor_close(cur);
+    }
+
+    /* ----------------------------------------------------------------
+     * Phase 2: write per-column stats.
+     * ---------------------------------------------------------------- */
+    for (int i = 0; i < rel->num_columns; i++) {
+        ColumnStats *cs = &sf.pages[slot_idx].cols[i];
+
+        cs->has_stats    = 1;
+        cs->total_rows   = total_rows;
+        cs->num_nulls    = ca[i].null_count;
+        cs->num_distinct = ca[i].distinct_count;
+        cs->min_numeric  = ca[i].min_val;
+        cs->max_numeric  = ca[i].max_val;
+
+        if (total_rows == 0 || ca[i].skip_blob) {
+            /* VARCHAR or empty table: scalar stats only. */
+            cs->stats_type = STATS_TYPE_NONE;
+            continue;
+        }
+
+        /* Decide: MCV or histogram?
+         *
+         * BOOL and ENUM always get MCV — their cardinality is tiny.
+         * For other types: MCV when we can store all distinct values
+         * exactly (num_distinct ≤ STATS_MAX_ENTRIES); histogram otherwise. */
+        DataType dtype = rel->columns[i].type;
+        int want_mcv = (dtype == TYPE_BOOL || dtype == TYPE_ENUM)
+                       || (ca[i].distinct_count <= STATS_MAX_ENTRIES);
+
+        /* Extract all live (key, count) pairs from the hash map. */
+        KVPair pairs[ANALYZE_HM_LIMIT];
+        int    npairs = hm_extract(&ca[i], pairs, ANALYZE_HM_LIMIT);
+
+        if (npairs == 0) {
+            cs->stats_type = STATS_TYPE_NONE;
+            continue;
+        }
+
+        if (want_mcv) {
+            /* Sort by frequency descending so the planner can short-circuit
+             * the MCV scan as soon as accumulated probability exceeds the
+             * predicate value. */
+            qsort(pairs, (size_t)npairs, sizeof(KVPair), kv_cmp_freq);
+
+            MCVEntry entries[STATS_MAX_ENTRIES];
+            int      nentries = (npairs < STATS_MAX_ENTRIES)
+                                 ? npairs : STATS_MAX_ENTRIES;
+            for (int j = 0; j < nentries; j++) {
+                entries[j].value     = pairs[j].key;
+                entries[j].frequency = pairs[j].count;
+                entries[j].pad       = 0;
+            }
+            /* Ignore MYDB_ERR_FULL — the page still gets saved with
+             * whatever columns fit. */
+            stats_write_mcv(&sf, slot_idx, i, entries, (uint16_t)nentries);
+
+        } else {
+            /* Equi-height histogram.
+             *
+             * Sort pairs by key (ascending) then divide into
+             * STATS_MAX_ENTRIES buckets of roughly equal cumulative count. */
+            qsort(pairs, (size_t)npairs, sizeof(KVPair), kv_cmp_key);
+
+            /* Sum of counts from sampled values (may be < total_rows if
+             * we hit ANALYZE_HM_LIMIT and stopped tracking new keys). */
+            uint64_t total_in_hm = 0;
+            for (int j = 0; j < npairs; j++)
+                total_in_hm += pairs[j].count;
+
+            int nbuckets = (npairs < STATS_MAX_ENTRIES)
+                            ? npairs : STATS_MAX_ENTRIES;
+            uint64_t target = (total_in_hm + (uint64_t)nbuckets - 1)
+                              / (uint64_t)nbuckets;  /* ceil */
+
+            HistBucket buckets[STATS_MAX_ENTRIES];
+            int        nb = 0;
+            uint64_t   accum = 0;
+
+            for (int j = 0; j < npairs && nb < STATS_MAX_ENTRIES; j++) {
+                accum += pairs[j].count;
+                /* Close the bucket on the last pair OR when accumulated
+                 * count meets the target. */
+                int is_last = (j == npairs - 1);
+                if (accum >= target || is_last) {
+                    buckets[nb].upper_bound = pairs[j].key;
+                    buckets[nb].row_count   = (uint32_t)(accum > UINT32_MAX
+                                                          ? UINT32_MAX : accum);
+                    buckets[nb].pad = 0;
+                    nb++;
+                    accum = 0;
+                }
+            }
+
+            stats_write_hist(&sf, slot_idx, i, buckets, (uint16_t)nb);
+        }
+    }
+
+    /* Persist the stats page to __stats.mydb. */
+    rc = stats_save_relation(&sf, slot_idx);
+    stats_close(&sf);
+    return rc;
 }

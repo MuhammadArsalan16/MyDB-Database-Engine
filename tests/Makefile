@@ -336,6 +336,34 @@ test_integration/fast:
 	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_integration.dir/build.make tests/CMakeFiles/test_integration.dir/build
 .PHONY : test_integration/fast
 
+# Convenience name for target.
+tests/CMakeFiles/test_parser.dir/rule:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 tests/CMakeFiles/test_parser.dir/rule
+.PHONY : tests/CMakeFiles/test_parser.dir/rule
+
+# Convenience name for target.
+test_parser: tests/CMakeFiles/test_parser.dir/rule
+.PHONY : test_parser
+
+# fast build rule for target.
+test_parser/fast:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_parser.dir/build.make tests/CMakeFiles/test_parser.dir/build
+.PHONY : test_parser/fast
+
+# Convenience name for target.
+tests/CMakeFiles/test_exec_engine.dir/rule:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 tests/CMakeFiles/test_exec_engine.dir/rule
+.PHONY : tests/CMakeFiles/test_exec_engine.dir/rule
+
+# Convenience name for target.
+test_exec_engine: tests/CMakeFiles/test_exec_engine.dir/rule
+.PHONY : test_exec_engine
+
+# fast build rule for target.
+test_exec_engine/fast:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_exec_engine.dir/build.make tests/CMakeFiles/test_exec_engine.dir/build
+.PHONY : test_exec_engine/fast
+
 engine/test_crypto.o: engine/test_crypto.c.o
 .PHONY : engine/test_crypto.o
 
@@ -432,6 +460,30 @@ engine/test_storage.c.s:
 	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_storage.dir/build.make tests/CMakeFiles/test_storage.dir/engine/test_storage.c.s
 .PHONY : engine/test_storage.c.s
 
+execution_engine/test_exec_engine.o: execution_engine/test_exec_engine.cpp.o
+.PHONY : execution_engine/test_exec_engine.o
+
+# target to build an object file
+execution_engine/test_exec_engine.cpp.o:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_exec_engine.dir/build.make tests/CMakeFiles/test_exec_engine.dir/execution_engine/test_exec_engine.cpp.o
+.PHONY : execution_engine/test_exec_engine.cpp.o
+
+execution_engine/test_exec_engine.i: execution_engine/test_exec_engine.cpp.i
+.PHONY : execution_engine/test_exec_engine.i
+
+# target to preprocess a source file
+execution_engine/test_exec_engine.cpp.i:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_exec_engine.dir/build.make tests/CMakeFiles/test_exec_engine.dir/execution_engine/test_exec_engine.cpp.i
+.PHONY : execution_engine/test_exec_engine.cpp.i
+
+execution_engine/test_exec_engine.s: execution_engine/test_exec_engine.cpp.s
+.PHONY : execution_engine/test_exec_engine.s
+
+# target to generate assembly for a file
+execution_engine/test_exec_engine.cpp.s:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_exec_engine.dir/build.make tests/CMakeFiles/test_exec_engine.dir/execution_engine/test_exec_engine.cpp.s
+.PHONY : execution_engine/test_exec_engine.cpp.s
+
 integration/test_integration.o: integration/test_integration.c.o
 .PHONY : integration/test_integration.o
 
@@ -455,6 +507,30 @@ integration/test_integration.s: integration/test_integration.c.s
 integration/test_integration.c.s:
 	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_integration.dir/build.make tests/CMakeFiles/test_integration.dir/integration/test_integration.c.s
 .PHONY : integration/test_integration.c.s
+
+query_parser/test_parser.o: query_parser/test_parser.cpp.o
+.PHONY : query_parser/test_parser.o
+
+# target to build an object file
+query_parser/test_parser.cpp.o:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_parser.dir/build.make tests/CMakeFiles/test_parser.dir/query_parser/test_parser.cpp.o
+.PHONY : query_parser/test_parser.cpp.o
+
+query_parser/test_parser.i: query_parser/test_parser.cpp.i
+.PHONY : query_parser/test_parser.i
+
+# target to preprocess a source file
+query_parser/test_parser.cpp.i:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_parser.dir/build.make tests/CMakeFiles/test_parser.dir/query_parser/test_parser.cpp.i
+.PHONY : query_parser/test_parser.cpp.i
+
+query_parser/test_parser.s: query_parser/test_parser.cpp.s
+.PHONY : query_parser/test_parser.s
+
+# target to generate assembly for a file
+query_parser/test_parser.cpp.s:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_parser.dir/build.make tests/CMakeFiles/test_parser.dir/query_parser/test_parser.cpp.s
+.PHONY : query_parser/test_parser.cpp.s
 
 storage_engine/test_btree.o: storage_engine/test_btree.c.o
 .PHONY : storage_engine/test_btree.o
@@ -711,9 +787,11 @@ help:
 	@echo "... test_database_file"
 	@echo "... test_disk_manager"
 	@echo "... test_engine"
+	@echo "... test_exec_engine"
 	@echo "... test_file_header"
 	@echo "... test_integration"
 	@echo "... test_page"
+	@echo "... test_parser"
 	@echo "... test_partition"
 	@echo "... test_relation_def"
 	@echo "... test_schema_file"
@@ -732,9 +810,15 @@ help:
 	@echo "... engine/test_storage.o"
 	@echo "... engine/test_storage.i"
 	@echo "... engine/test_storage.s"
+	@echo "... execution_engine/test_exec_engine.o"
+	@echo "... execution_engine/test_exec_engine.i"
+	@echo "... execution_engine/test_exec_engine.s"
 	@echo "... integration/test_integration.o"
 	@echo "... integration/test_integration.i"
 	@echo "... integration/test_integration.s"
+	@echo "... query_parser/test_parser.o"
+	@echo "... query_parser/test_parser.i"
+	@echo "... query_parser/test_parser.s"
 	@echo "... storage_engine/test_btree.o"
 	@echo "... storage_engine/test_btree.i"
 	@echo "... storage_engine/test_btree.s"

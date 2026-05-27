@@ -295,6 +295,9 @@ int engine_login(EngineState *eng,
 
     eng->current_user_id = u.user_id;
     eng->logged_in       = 1;
+    strncpy(eng->current_username, username,
+            sizeof(eng->current_username) - 1);
+    eng->current_username[sizeof(eng->current_username) - 1] = '\0';
     return MYDB_OK;
 }
 
@@ -416,6 +419,264 @@ const RelationDef *engine_find_relation(EngineState *eng,
 
 
 /* ====================================================================
+ *  User management helpers
+ * ==================================================================== */
+
+/*
+ * Delete every file inside a partition directory and the directory itself.
+ * Layout assumed:
+ *   <part_dir>/
+ *       __catalog.mydb
+ *       <schema>/
+ *           __schema.mydb
+ *           <rel>.mydb  (one per table)
+ *           __stats.mydb (optional)
+ *
+ * We enumerate schemas from the already-opened catalog `cat` rather than
+ * using readdir so we stay within the storage model.
+ */
+static void remove_partition_dir(const char *part_dir, Catalog *cat)
+{
+    char path[512];
+    int  n;
+
+    for (int s = 0; s < MAX_SCHEMAS_PER_PARTITION; s++) {
+        if (!cat->schemas[s].is_valid) continue;
+        const char *sname = cat->schemas[s].schema_name;
+
+        char schema_dir[512];
+        int n = snprintf(schema_dir, sizeof(schema_dir), "%s/%s", part_dir, sname);
+        if (n < 0 || (size_t)n >= sizeof(schema_dir)) continue;
+
+        char sf_path[512];
+        n = snprintf(sf_path, sizeof(sf_path), "%s/__schema.mydb", schema_dir);
+        if (n < 0 || (size_t)n >= sizeof(sf_path)) continue;
+
+        /* Open schema file to enumerate relation files. */
+        SchemaFile sf;
+        if (schema_open(sf_path, &sf) == MYDB_OK) {
+            for (int r = 0; r < MAX_RELATIONS_PER_SCHEMA; r++) {
+                if (!sf.relations[r].is_valid) continue;
+                n = snprintf(path, sizeof(path), "%s/%s.mydb",
+                             schema_dir, sf.relations[r].relation_name);
+                if (n > 0 && (size_t)n < sizeof(path))
+                    unlink(path);
+            }
+            schema_close(&sf);
+        }
+
+        /* Remove stats and schema metadata files. */
+        n = snprintf(path, sizeof(path), "%s/__stats.mydb", schema_dir);
+        if (n > 0 && (size_t)n < sizeof(path)) unlink(path);
+        unlink(sf_path);
+        rmdir(schema_dir);
+    }
+
+    /* Remove the catalog file then the partition directory itself. */
+    n = snprintf(path, sizeof(path), "%s/__catalog.mydb", part_dir);
+    if (n > 0 && (size_t)n < sizeof(path)) unlink(path);
+    rmdir(part_dir);
+}
+
+/* Check that a proposed partition path does not collide with any
+ * existing active partition. Returns 0 if unique, -1 if taken. */
+static int partition_path_unique(const DatabaseFile *db, const char *path)
+{
+    for (int i = 0; i < MAX_PARTITIONS; i++) {
+        if (!db->partitions[i].is_active) continue;
+        if (strcmp(db->partitions[i].path, path) == 0) return -1;
+    }
+    return 0;
+}
+
+int engine_create_user(EngineState *eng,
+                       const char  *username,
+                       const char  *password,
+                       const char  *partition_name,
+                       uint64_t     quota_bytes)
+{
+    if (!eng || !username || !password) return MYDB_ERR;
+    if (!eng->logged_in)               return MYDB_ERR_PERM;
+    /* Only root (user_id == 1) may create users. */
+    if (eng->current_user_id != 1)     return MYDB_ERR_PERM;
+
+    if (username[0] == '\0' || strlen(username) >= MAX_USERNAME) return MYDB_ERR;
+
+    /* Resolve quota. */
+    if (quota_bytes == 0)                        quota_bytes = ENGINE_DEFAULT_QUOTA_BYTES;
+    if (quota_bytes < ENGINE_MIN_QUOTA_BYTES)     return MYDB_ERR;
+    if (quota_bytes > ENGINE_MAX_QUOTA_BYTES)     return MYDB_ERR;
+
+    /* Resolve partition directory name — default to username. */
+    const char *part_name = (partition_name && partition_name[0] != '\0')
+                            ? partition_name : username;
+
+    /* Build the full partition path. */
+    char part_dir[256], cat_path[256];
+    if (join1(part_dir,  sizeof(part_dir),  eng->root_dir, part_name) < 0) return MYDB_ERR;
+    if (join1(cat_path,  sizeof(cat_path),  part_dir, "__catalog.mydb") < 0) return MYDB_ERR;
+
+    /* Reject duplicate username. */
+    UserSlot existing;
+    if (users_find_by_name(&eng->system_schema.users, username, &existing) == MYDB_OK)
+        return MYDB_ERR_DUPLICATE;
+
+    /* Reject duplicate partition path. */
+    if (partition_path_unique(&eng->database, part_dir) < 0)
+        return MYDB_ERR_DUPLICATE;
+
+    /* Insert user — gets a new user_id from the monotonic counter. */
+    UserSlot u;
+    memset(&u, 0, sizeof(u));
+    strncpy(u.username, username, MAX_USERNAME - 1);
+    u.is_active  = 1;
+    u.created_at = now_yyyymmddhhmmss();
+    u.last_login = 0;
+    crypto_hash_password(password, u.password_salt, u.password_hash);
+
+    uint32_t new_user_id;
+    int rc = users_insert(&eng->system_schema.users, &u, &new_user_id);
+    if (rc != MYDB_OK) return rc;
+
+    /* Create the partition directory. */
+    if (ensure_dir(part_dir) < 0) {
+        users_delete(&eng->system_schema.users, new_user_id);
+        return MYDB_ERR;
+    }
+
+    /* Register partition in __database.mydb. */
+    uint32_t new_part_id;
+    rc = db_add_partition(&eng->database, new_user_id, part_dir, &new_part_id);
+    if (rc != MYDB_OK) {
+        rmdir(part_dir);
+        users_delete(&eng->system_schema.users, new_user_id);
+        return rc;
+    }
+
+    /* Create the partition catalog. */
+    Catalog cat;
+    rc = cat_create(cat_path, new_part_id, new_user_id, quota_bytes, &cat);
+    if (rc != MYDB_OK) {
+        db_remove_partition(&eng->database, new_part_id);
+        rmdir(part_dir);
+        users_delete(&eng->system_schema.users, new_user_id);
+        return rc;
+    }
+    cat_close(&cat);
+    return MYDB_OK;
+}
+
+int engine_drop_user(EngineState *eng, const char *username)
+{
+    if (!eng || !username)     return MYDB_ERR;
+    if (!eng->logged_in)       return MYDB_ERR_PERM;
+    /* Only root may drop users. */
+    if (eng->current_user_id != 1) return MYDB_ERR_PERM;
+    /* Cannot drop root itself. */
+    if (strcmp(username, eng->current_username) == 0) return MYDB_ERR_PERM;
+
+    /* Look up the target user. */
+    UserSlot target;
+    int rc = users_find_by_name(&eng->system_schema.users, username, &target);
+    if (rc != MYDB_OK) return rc;   /* MYDB_ERR_NOT_FOUND on miss */
+
+    /* Extra guard: never allow dropping the root user (user_id == 1). */
+    if (target.user_id == 1) return MYDB_ERR_PERM;
+
+    /* Find and remove the user's partition. */
+    PartitionEntry *pe = db_find_by_owner(&eng->database, target.user_id);
+    if (pe) {
+        char part_dir[256];
+        strncpy(part_dir, pe->path, sizeof(part_dir) - 1);
+        part_dir[sizeof(part_dir) - 1] = '\0';
+        uint32_t part_id = pe->partition_id;
+
+        /* Open the catalog to enumerate schemas for cleanup. */
+        char cat_path[256];
+        if (join1(cat_path, sizeof(cat_path), part_dir, "__catalog.mydb") == 0) {
+            Catalog cat;
+            if (cat_open(cat_path, &cat) == MYDB_OK) {
+                remove_partition_dir(part_dir, &cat);
+                cat_close(&cat);
+            } else {
+                /* Catalog unreadable — best-effort: just rmdir. */
+                rmdir(part_dir);
+            }
+        }
+
+        /* Remove partition entry from __database.mydb. */
+        db_remove_partition(&eng->database, part_id);
+    }
+
+    /* Remove user from users.mydb. */
+    return users_delete(&eng->system_schema.users, target.user_id);
+}
+
+int engine_alter_user_password(EngineState *eng,
+                               const char  *username,
+                               const char  *new_password)
+{
+    if (!eng || !username || !new_password) return MYDB_ERR;
+    if (!eng->logged_in)                    return MYDB_ERR_PERM;
+    /* Phase 1: only root may alter any user's password. */
+    if (eng->current_user_id != 1)          return MYDB_ERR_PERM;
+
+    UserSlot u;
+    int rc = users_find_by_name(&eng->system_schema.users, username, &u);
+    if (rc != MYDB_OK) return rc;
+
+    crypto_hash_password(new_password, u.password_salt, u.password_hash);
+    return users_update(&eng->system_schema.users, &u);
+}
+
+int engine_alter_user_quota(EngineState *eng,
+                            const char  *username,
+                            uint64_t     new_quota_bytes)
+{
+    if (!eng || !username) return MYDB_ERR;
+    if (!eng->logged_in)   return MYDB_ERR_PERM;
+    /* Phase 1: only root may alter quotas. */
+    if (eng->current_user_id != 1) return MYDB_ERR_PERM;
+
+    if (new_quota_bytes < ENGINE_MIN_QUOTA_BYTES) return MYDB_ERR;
+    if (new_quota_bytes > ENGINE_MAX_QUOTA_BYTES) return MYDB_ERR;
+
+    UserSlot u;
+    int rc = users_find_by_name(&eng->system_schema.users, username, &u);
+    if (rc != MYDB_OK) return rc;
+
+    /* Find the user's partition catalog. */
+    PartitionEntry *pe = db_find_by_owner(&eng->database, u.user_id);
+    if (!pe) return MYDB_ERR_NOT_FOUND;   /* user has no partition */
+
+    char cat_path[256];
+    if (join1(cat_path, sizeof(cat_path), pe->path, "__catalog.mydb") < 0)
+        return MYDB_ERR;
+
+    Catalog cat;
+    rc = cat_open(cat_path, &cat);
+    if (rc != MYDB_OK) return rc;
+
+    /* Reject if the new quota is below what the user has already used. */
+    if (new_quota_bytes < cat.header.used_bytes) {
+        cat_close(&cat);
+        return MYDB_ERR_FULL;
+    }
+
+    cat.header.quota_bytes = new_quota_bytes;
+    rc = cat_save(&cat);
+    cat_close(&cat);
+
+    /* If this is the currently logged-in user's own catalog, keep the
+     * in-memory copy consistent. */
+    if (u.user_id == eng->current_user_id && eng->partition_open)
+        eng->active_catalog.header.quota_bytes = new_quota_bytes;
+
+    return rc;
+}
+
+
+/* ====================================================================
  *  SQL execution
  *
  *  Engine is the single front door for raw SQL coming from bin/REPL.
@@ -440,14 +701,28 @@ int engine_execute_sql(EngineState *eng, const char *sql,
 
     int rc = parser_parse(sql, &ast, err_buf, sizeof(err_buf));
     if (rc != PARSER_OK) {
-        snprintf(result_out, result_cap, "parse error: %s",
-                 err_buf[0] ? err_buf : "unknown");
-        /* PARSER_ERR is -1, same as MYDB_ERR — translate explicitly
-         * in case the values diverge in the future. */
+        snprintf(result_out, result_cap, "  Error: %s",
+                 err_buf[0] ? err_buf : "parse error");
         return MYDB_ERR;
     }
 
+    /* --- Time the execution pipeline --- */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
     rc = exec_engine_execute(eng, ast, result_out, result_cap);
     parser_free_ast(ast);
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+
+    /* Append "  (Xs)" to the last character of a successful result. */
+    if (rc == MYDB_OK) {
+        double elapsed = (double)(t1.tv_sec  - t0.tv_sec)
+                       + (double)(t1.tv_nsec - t0.tv_nsec) * 1e-9;
+        size_t len = strlen(result_out);
+        snprintf(result_out + len, result_cap - len,
+                 "  (%.2fs)", elapsed);
+    }
+
     return rc;
 }

@@ -64,6 +64,12 @@ int exec_show_tables    (EngineState *eng, const ShowTablesStatement     *s,
                          char *out, size_t cap);
 int exec_show_databases (EngineState *eng, const ShowDatabasesStatement  *s,
                          char *out, size_t cap);
+int exec_describe_table     (EngineState *eng, const DescribeTableStatement     *s,
+                             char *out, size_t cap);
+int exec_describe_schema    (EngineState *eng, const DescribeSchemaStatement    *s,
+                             char *out, size_t cap);
+int exec_describe_partition (EngineState *eng, const DescribePartitionStatement *s,
+                             char *out, size_t cap);
 
 /* ------------------------------------------------------------------
  * DML  (src/dml.cpp)
@@ -80,3 +86,19 @@ int exec_delete(EngineState *eng, const DeleteStatement *s,
  * ------------------------------------------------------------------ */
 int exec_select(EngineState *eng, const SelectStatement *s,
                 char *out, size_t cap);
+
+/* ------------------------------------------------------------------
+ * Utility  (src/ddl.cpp)
+ * ------------------------------------------------------------------ */
+int exec_analyze_table(EngineState *eng, const AnalyzeTableStatement *s,
+                       char *out, size_t cap);
+
+/* ------------------------------------------------------------------
+ * User management  (src/ddl.cpp)
+ * ------------------------------------------------------------------ */
+int exec_create_user(EngineState *eng, const CreateUserStatement *s,
+                     char *out, size_t cap);
+int exec_drop_user  (EngineState *eng, const DropUserStatement   *s,
+                     char *out, size_t cap);
+int exec_alter_user (EngineState *eng, const AlterUserStatement  *s,
+                     char *out, size_t cap);

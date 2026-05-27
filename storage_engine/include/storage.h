@@ -73,11 +73,25 @@ int storage_flush_all_dirty(void);
  *   3. mkdir <partition>/<name>/, write its __schema.mydb, register in
  *      __catalog.mydb.
  *
- * Returns MYDB_ERR_PERM    if the caller does not own a partition.
+ * Returns MYDB_ERR_PERM      if the caller does not own a partition.
  *         MYDB_ERR_DUPLICATE if a schema with that name already exists.
- *         MYDB_ERR_FULL    if the catalog has no free schema slots.
+ *         MYDB_ERR_FULL      if the catalog has no free schema slots.
  */
 int storage_create_schema(const char *name);
+
+/*
+ * Drop a schema from the current partition.
+ *   1. Rejects if name is the currently active schema (USE another first).
+ *   2. Opens __schema.mydb to enumerate all relation files.
+ *   3. unlinks each <relation>.mydb and __stats.mydb (if present).
+ *   4. unlinks __schema.mydb, then rmdir the schema directory.
+ *   5. Credits freed bytes back via cat_track_alloc (quota update).
+ *   6. Removes the slot from __catalog.mydb via cat_remove_schema.
+ *
+ * Returns MYDB_ERR_NOT_FOUND if no such schema exists.
+ *         MYDB_ERR           if the schema is currently active.
+ */
+int storage_drop_schema(const char *name);
 
 /*
  * Create a new relation in the active schema. `rel` is mutated:
@@ -195,6 +209,30 @@ void cursor_close(Cursor *cursor);
 int storage_begin(void);
 int storage_commit(void);
 int storage_rollback(void);
+
+/* ------------------------------------------------------------------ */
+/*  Statistics collection (for the cost-based planner)                */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Scan the entire clustered B+ tree and recompute per-column statistics
+ * for the CBO.  Writes the results to __stats.mydb in the active schema
+ * directory (creates the file if it does not exist yet).
+ *
+ * Called by the execution engine when the user issues:
+ *   ANALYZE TABLE <table_name>;
+ *
+ * Column statistics collected:
+ *   - total_rows, num_nulls, num_distinct (NDV), min, max
+ *   - MCV (Most Common Values) when num_distinct ≤ STATS_MAX_ENTRIES,
+ *     or when the column is BOOL/ENUM regardless of cardinality.
+ *   - Equi-height histogram (STATS_MAX_ENTRIES buckets) otherwise.
+ *   - VARCHAR columns get only scalar stats (no MCV/histogram).
+ *
+ * Returns MYDB_OK on success.  Returns MYDB_ERR_PERM if the caller
+ * does not have read access to the active schema.
+ */
+int storage_analyze_table(RelationDef *rel);
 
 #ifdef __cplusplus
 }

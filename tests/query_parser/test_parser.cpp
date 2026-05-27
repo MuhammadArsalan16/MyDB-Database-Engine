@@ -44,6 +44,34 @@ std::vector<TestCase> cases = {
     {"DDL_EXTRA", "USE mydb;", true},
     {"DDL_EXTRA", "SHOW TABLES;", true},
     {"DDL_EXTRA", "SHOW DATABASES;", true},
+    /* CREATE INDEX */
+    {"DDL_EXTRA", "CREATE INDEX ON users(email);", true},
+    {"DDL_EXTRA", "CREATE INDEX ON users(email", false},
+    /* ANALYZE TABLE */
+    {"DDL_EXTRA", "ANALYZE TABLE users;", true},
+    {"DDL_EXTRA", "ANALYZE TABLE;", false},
+    /* DESCRIBE TABLE */
+    {"DDL_EXTRA", "DESCRIBE TABLE users;", true},
+    {"DDL_EXTRA", "DESCRIBE users;", true},
+    {"DDL_EXTRA", "DESCRIBE TABLE FULL users;", true},
+    {"DDL_EXTRA", "DESCRIBE TABLE;", false},
+    /* DESCRIBE SCHEMA / PARTITION */
+    {"DDL_EXTRA", "DESCRIBE SCHEMA;", true},
+    {"DDL_EXTRA", "DESCRIBE PARTITION;", true},
+    /* CREATE USER */
+    {"DDL_EXTRA", "CREATE USER alice IDENTIFIED BY 'secret';", true},
+    {"DDL_EXTRA", "CREATE USER alice IDENTIFIED BY 'secret' PARTITION p1;", true},
+    {"DDL_EXTRA", "CREATE USER alice IDENTIFIED BY 'secret' QUOTA 500M;", true},
+    {"DDL_EXTRA", "CREATE USER alice IDENTIFIED BY 'secret' PARTITION p1 QUOTA 2G;", true},
+    {"DDL_EXTRA", "CREATE USER alice;", false},
+    {"DDL_EXTRA", "CREATE USER IDENTIFIED BY 'secret';", false},
+    /* DROP USER */
+    {"DDL_EXTRA", "DROP USER alice;", true},
+    {"DDL_EXTRA", "DROP USER;", false},
+    /* ALTER USER */
+    {"DDL_EXTRA", "ALTER USER alice IDENTIFIED BY 'newpass';", true},
+    {"DDL_EXTRA", "ALTER USER alice SET QUOTA 1G;", true},
+    {"DDL_EXTRA", "ALTER USER IDENTIFIED BY 'x';", false},
     {"TCL", "BEGIN;", true},
     {"TCL", "COMMIT;", true},
     {"TCL", "ROLLBACK;", true},

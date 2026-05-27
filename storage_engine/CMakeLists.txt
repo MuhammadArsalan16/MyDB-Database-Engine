@@ -10,6 +10,7 @@ add_library(storage_engine STATIC
     src/checksum.c
     src/partition.c
     src/schema_file.c
+    src/stats.c
 )
 
 target_include_directories(storage_engine PUBLIC

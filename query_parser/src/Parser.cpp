@@ -62,19 +62,27 @@ std::unique_ptr<ASTNode> Parser::parse() {
         if (peek().value == "TABLE")                             return parse_create_table();
         if (peek().value == "DATABASE" || peek().value == "SCHEMA") return parse_create_database();
         if (peek().value == "INDEX")                             return parse_create_index();
-        throw_error("Expected TABLE, DATABASE, or INDEX after CREATE");
+        if (peek().value == "USER")                              return parse_create_user();
+        throw_error("Expected TABLE, DATABASE, INDEX, or USER after CREATE");
     }
     if (match(TokenType::KEYWORD, "DROP")) {
-        if (peek().value == "TABLE") return parse_drop_table();
+        if (peek().value == "TABLE")    return parse_drop_table();
         if (peek().value == "DATABASE" || peek().value == "SCHEMA") return parse_drop_database();
-        throw_error("Expected TABLE or DATABASE after DROP");
+        if (peek().value == "USER")     return parse_drop_user();
+        throw_error("Expected TABLE, DATABASE, or USER after DROP");
+    }
+    if (match(TokenType::KEYWORD, "ALTER")) {
+        if (peek().value == "USER")     return parse_alter_user();
+        throw_error("Expected USER after ALTER");
     }
     if (match(TokenType::KEYWORD, "INSERT")) return parse_insert();
     if (match(TokenType::KEYWORD, "UPDATE")) return parse_update();
     if (match(TokenType::KEYWORD, "DELETE")) return parse_delete();
-    if (match(TokenType::KEYWORD, "USE")) return parse_use();
-    if (match(TokenType::KEYWORD, "SHOW")) return parse_show();
-    
+    if (match(TokenType::KEYWORD, "USE"))     return parse_use();
+    if (match(TokenType::KEYWORD, "SHOW"))    return parse_show();
+    if (match(TokenType::KEYWORD, "ANALYZE"))  return parse_analyze();
+    if (match(TokenType::KEYWORD, "DESCRIBE")) return parse_describe();
+
     // NEW TCL DISPATCHERS
     if (match(TokenType::KEYWORD, "BEGIN")) return parse_transaction("BEGIN");
     if (match(TokenType::KEYWORD, "COMMIT")) return parse_transaction("COMMIT");
@@ -788,15 +796,30 @@ std::unique_ptr<ASTNode> Parser::parse_show() {
 }
 
 // CREATE INDEX index_name ON table_name(column_name);
+std::unique_ptr<AnalyzeTableStatement> Parser::parse_analyze() {
+    /* ANALYZE TABLE <table_name> ; */
+    consume(TokenType::KEYWORD, "TABLE", "Expected TABLE after ANALYZE");
+    auto stmt = std::make_unique<AnalyzeTableStatement>();
+    Token t = advance();
+    if (t.type != TokenType::IDENTIFIER)
+        throw_error("Expected table name after ANALYZE TABLE");
+    stmt->table_name = t.value;
+    consume(TokenType::SYMBOL, ";", "Expected ; after ANALYZE TABLE");
+    return stmt;
+}
+
 std::unique_ptr<CreateIndexStatement> Parser::parse_create_index() {
     auto stmt = std::make_unique<CreateIndexStatement>();
 
     consume(TokenType::KEYWORD, "INDEX", "Expected INDEX");
 
-    Token name_tok = advance();
-    if (name_tok.type != TokenType::IDENTIFIER)
-        throw_error("Expected index name after CREATE INDEX");
-    stmt->index_name = name_tok.value;
+    /* Index name is optional: if the next token is the keyword ON, skip name. */
+    if (!(peek().type == TokenType::KEYWORD && peek().value == "ON")) {
+        Token name_tok = advance();
+        if (name_tok.type != TokenType::IDENTIFIER)
+            throw_error("Expected index name or ON after CREATE INDEX");
+        stmt->index_name = name_tok.value;
+    }
 
     consume(TokenType::KEYWORD, "ON", "Expected ON after index name");
 
@@ -810,5 +833,153 @@ std::unique_ptr<CreateIndexStatement> Parser::parse_create_index() {
     consume(TokenType::SYMBOL, ")", "Expected ) after column name");
     consume(TokenType::SYMBOL, ";", "Expected ;");
 
+    return stmt;
+}
+// ---------------------------------------------------------------------------
+// CREATE USER username IDENTIFIED BY 'password' [PARTITION name] [QUOTA nM|nG]
+// ---------------------------------------------------------------------------
+std::unique_ptr<CreateUserStatement> Parser::parse_create_user()
+{
+    consume(TokenType::KEYWORD, "USER", "Expected USER after CREATE");
+
+    auto stmt = std::make_unique<CreateUserStatement>();
+
+    Token user_tok = advance();
+    if (user_tok.type != TokenType::IDENTIFIER)
+        throw_error("Expected username after CREATE USER");
+    stmt->username = user_tok.value;
+
+    consume(TokenType::KEYWORD, "IDENTIFIED", "Expected IDENTIFIED after username");
+    consume(TokenType::KEYWORD, "BY",         "Expected BY after IDENTIFIED");
+
+    Token pass_tok = advance();
+    if (pass_tok.type != TokenType::STRING && pass_tok.type != TokenType::IDENTIFIER)
+        throw_error("Expected password after BY");
+    stmt->password = pass_tok.value;
+
+    /* Optional: PARTITION name */
+    if (match(TokenType::KEYWORD, "PARTITION")) {
+        Token part_tok = advance();
+        if (part_tok.type != TokenType::IDENTIFIER)
+            throw_error("Expected partition name after PARTITION");
+        stmt->partition_name = part_tok.value;
+    }
+
+    /* Optional: QUOTA nM|nG
+     * The lexer may split "500M" into NUMBER "500" + IDENTIFIER "M", so we
+     * consume the number then peek for a unit suffix (M or G) and join them. */
+    if (match(TokenType::KEYWORD, "QUOTA")) {
+        Token q_tok = advance();
+        if (q_tok.type != TokenType::IDENTIFIER && q_tok.type != TokenType::NUMBER)
+            throw_error("Expected quota value (e.g. 500M, 2G) after QUOTA");
+        stmt->quota_str = q_tok.value;
+        /* Consume unit suffix if it's a separate token */
+        if (peek().type == TokenType::IDENTIFIER &&
+            (peek().value == "M" || peek().value == "G"))
+            stmt->quota_str += advance().value;
+    }
+
+    consume(TokenType::SYMBOL, ";", "Expected ; at end of CREATE USER");
+    return stmt;
+}
+
+// ---------------------------------------------------------------------------
+// DROP USER username
+// ---------------------------------------------------------------------------
+std::unique_ptr<DropUserStatement> Parser::parse_drop_user()
+{
+    consume(TokenType::KEYWORD, "USER", "Expected USER after DROP");
+
+    auto stmt = std::make_unique<DropUserStatement>();
+
+    Token user_tok = advance();
+    if (user_tok.type != TokenType::IDENTIFIER)
+        throw_error("Expected username after DROP USER");
+    stmt->username = user_tok.value;
+
+    consume(TokenType::SYMBOL, ";", "Expected ; at end of DROP USER");
+    return stmt;
+}
+
+// ---------------------------------------------------------------------------
+// ALTER USER username IDENTIFIED BY 'newpass'
+// ALTER USER username SET QUOTA nM|nG
+// ---------------------------------------------------------------------------
+std::unique_ptr<AlterUserStatement> Parser::parse_alter_user()
+{
+    consume(TokenType::KEYWORD, "USER", "Expected USER after ALTER");
+
+    auto stmt = std::make_unique<AlterUserStatement>();
+
+    Token user_tok = advance();
+    if (user_tok.type != TokenType::IDENTIFIER)
+        throw_error("Expected username after ALTER USER");
+    stmt->username = user_tok.value;
+
+    if (match(TokenType::KEYWORD, "IDENTIFIED")) {
+        consume(TokenType::KEYWORD, "BY", "Expected BY after IDENTIFIED");
+        Token pass_tok = advance();
+        if (pass_tok.type != TokenType::STRING && pass_tok.type != TokenType::IDENTIFIER)
+            throw_error("Expected new password after BY");
+        stmt->action       = AlterUserStatement::Action::SET_PASSWORD;
+        stmt->new_password = pass_tok.value;
+    } else if (match(TokenType::KEYWORD, "SET")) {
+        consume(TokenType::KEYWORD, "QUOTA", "Expected QUOTA after SET");
+        Token q_tok = advance();
+        if (q_tok.type != TokenType::IDENTIFIER && q_tok.type != TokenType::NUMBER)
+            throw_error("Expected quota value (e.g. 500M, 2G) after QUOTA");
+        stmt->action    = AlterUserStatement::Action::SET_QUOTA;
+        stmt->quota_str = q_tok.value;
+        /* Consume unit suffix if it's a separate token */
+        if (peek().type == TokenType::IDENTIFIER &&
+            (peek().value == "M" || peek().value == "G"))
+            stmt->quota_str += advance().value;
+    } else {
+        throw_error("Expected IDENTIFIED BY or SET QUOTA after ALTER USER <username>");
+    }
+
+    consume(TokenType::SYMBOL, ";", "Expected ; at end of ALTER USER");
+    return stmt;
+}
+
+// ---------------------------------------------------------------------------
+// DESCRIBE [TABLE] table_name ;
+// ---------------------------------------------------------------------------
+std::unique_ptr<ASTNode> Parser::parse_describe()
+{
+    /* "DESCRIBE" already consumed by the dispatcher. */
+
+    /* DESCRIBE PARTITION — describes the current user's partition, no argument */
+    if (peek().type == TokenType::KEYWORD && peek().value == "PARTITION") {
+        advance();   /* consume PARTITION */
+        consume(TokenType::SYMBOL, ";", "Expected ; after DESCRIBE PARTITION");
+        return std::make_unique<DescribePartitionStatement>();
+    }
+
+    /* DESCRIBE SCHEMA — describes the active schema, no argument */
+    if (peek().type == TokenType::KEYWORD && peek().value == "SCHEMA") {
+        advance();   /* consume SCHEMA */
+        consume(TokenType::SYMBOL, ";", "Expected ; after DESCRIBE SCHEMA");
+        return std::make_unique<DescribeSchemaStatement>();
+    }
+
+    /* DESCRIBE [TABLE] [FULL] table_name — TABLE keyword is optional */
+    if (peek().type == TokenType::KEYWORD && peek().value == "TABLE")
+        advance();
+
+    auto stmt = std::make_unique<DescribeTableStatement>();
+
+    /* FULL modifier — includes statistics columns in the output */
+    if (peek().type == TokenType::KEYWORD && peek().value == "FULL") {
+        advance();
+        stmt->full = true;
+    }
+
+    Token t = advance();
+    if (t.type != TokenType::IDENTIFIER && t.type != TokenType::KEYWORD)
+        throw_error("Expected table name after DESCRIBE");
+
+    stmt->table_name = t.value;
+    consume(TokenType::SYMBOL, ";", "Expected ; after DESCRIBE table_name");
     return stmt;
 }

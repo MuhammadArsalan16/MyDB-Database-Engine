@@ -166,6 +166,19 @@ query_parser/fast:
 .PHONY : query_parser/fast
 
 #=============================================================================
+# Target rules for targets named planner
+
+# Build rule for target.
+planner: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 planner
+.PHONY : planner
+
+# fast build rule for target.
+planner/fast:
+	$(MAKE) $(MAKESILENT) -f planner/CMakeFiles/planner.dir/build.make planner/CMakeFiles/planner.dir/build
+.PHONY : planner/fast
+
+#=============================================================================
 # Target rules for targets named execution_engine
 
 # Build rule for target.
@@ -399,6 +412,32 @@ test_integration/fast:
 	$(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_integration.dir/build.make tests/CMakeFiles/test_integration.dir/build
 .PHONY : test_integration/fast
 
+#=============================================================================
+# Target rules for targets named test_parser
+
+# Build rule for target.
+test_parser: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 test_parser
+.PHONY : test_parser
+
+# fast build rule for target.
+test_parser/fast:
+	$(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_parser.dir/build.make tests/CMakeFiles/test_parser.dir/build
+.PHONY : test_parser/fast
+
+#=============================================================================
+# Target rules for targets named test_exec_engine
+
+# Build rule for target.
+test_exec_engine: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 test_exec_engine
+.PHONY : test_exec_engine
+
+# fast build rule for target.
+test_exec_engine/fast:
+	$(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_exec_engine.dir/build.make tests/CMakeFiles/test_exec_engine.dir/build
+.PHONY : test_exec_engine/fast
+
 # Help Target
 help:
 	@echo "The following are some of the valid targets for this Makefile:"
@@ -411,6 +450,7 @@ help:
 	@echo "... engine"
 	@echo "... execution_engine"
 	@echo "... mydb"
+	@echo "... planner"
 	@echo "... query_parser"
 	@echo "... storage_engine"
 	@echo "... system_schema"
@@ -420,9 +460,11 @@ help:
 	@echo "... test_database_file"
 	@echo "... test_disk_manager"
 	@echo "... test_engine"
+	@echo "... test_exec_engine"
 	@echo "... test_file_header"
 	@echo "... test_integration"
 	@echo "... test_page"
+	@echo "... test_parser"
 	@echo "... test_partition"
 	@echo "... test_relation_def"
 	@echo "... test_schema_file"
