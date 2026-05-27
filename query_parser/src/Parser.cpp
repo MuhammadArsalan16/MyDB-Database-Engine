@@ -472,23 +472,35 @@ std::unique_ptr<InsertStatement> Parser::parse_insert() {
     }
 
     consume(TokenType::KEYWORD, "VALUES", "Expected 'VALUES' keyword.");
-    consume(TokenType::SYMBOL, "(", "Expected '(' before values.");
 
-    // Parse values loop
-    std::vector<std::string> row;
+    /* Parse one or more value tuples: (v1, v2, ...) [, (v1, v2, ...) ...] */
     do {
-        Token val_token = advance();
-        if (val_token.type != TokenType::NUMBER && val_token.type != TokenType::STRING && val_token.type != TokenType::KEYWORD) {
-            throw_error("Invalid literal in INSERT.");
-        }
-        if (val_token.type == TokenType::KEYWORD && val_token.value != "TRUE" && val_token.value != "FALSE" && val_token.value != "NULL") {
-            throw_error("Invalid literal in INSERT.");
-        }
-        row.push_back(val_token.value);
-    } while (match(TokenType::SYMBOL, ","));
-    stmt->rows.push_back(row);
+        consume(TokenType::SYMBOL, "(", "Expected '(' before values.");
 
-    consume(TokenType::SYMBOL, ")", "Expected ')' after values.");
+        std::vector<std::string> row;
+        do {
+            Token val_token = advance();
+            if (val_token.type != TokenType::NUMBER && val_token.type != TokenType::STRING && val_token.type != TokenType::KEYWORD) {
+                throw_error("Invalid literal in INSERT.");
+            }
+            if (val_token.type == TokenType::KEYWORD && val_token.value != "TRUE" && val_token.value != "FALSE" && val_token.value != "NULL") {
+                throw_error("Invalid literal in INSERT.");
+            }
+            row.push_back(val_token.value);
+        } while (match(TokenType::SYMBOL, ","));
+
+        consume(TokenType::SYMBOL, ")", "Expected ')' after values.");
+        stmt->rows.push_back(row);
+
+    } while (match(TokenType::SYMBOL, ","));
+
+    /* Multi-row INSERT requires explicit column names — positional mapping
+     * is ambiguous when values span multiple tuples. */
+    if (stmt->rows.size() > 1 && stmt->target_columns.empty()) {
+        throw_error("Multi-row INSERT requires an explicit column list: "
+                    "INSERT INTO t (col1, col2) VALUES (...), (...)");
+    }
+
     consume(TokenType::SYMBOL, ";", "Expected ';' at the end of the statement.");
 
     return stmt;
