@@ -65,6 +65,10 @@ int exec_dispatch(EngineState *eng, const ASTNode *node,
         return exec_describe_partition(eng,
                                        static_cast<const DescribePartitionStatement *>(node),
                                        out, cap);
+    case StatementType::DISCONNECT:
+        return exec_disconnect(eng,
+                               static_cast<const DisconnectStatement *>(node),
+                               out, cap);
 
     /* DML */
     case StatementType::INSERT:

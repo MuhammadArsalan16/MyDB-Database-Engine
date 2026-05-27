@@ -100,6 +100,42 @@ int exec_drop_database(EngineState *eng,
 }
 
 /* ======================================================================
+ * DISCONNECT
+ * ====================================================================== */
+
+int exec_disconnect(EngineState *eng,
+                    const DisconnectStatement * /*s*/,
+                    char *out, size_t cap)
+{
+    REQUIRE_LOGIN(eng);
+
+    if (!eng->schema_active) {
+        snprintf(out, cap, "  Error: no active database — nothing to disconnect from");
+        return MYDB_ERR;
+    }
+
+    /* Commit any open transaction before closing the schema (mirrors USE). */
+    if (g_in_explicit_txn) {
+        storage_commit();
+        g_in_explicit_txn = false;
+    }
+
+    char prev[64];
+    strncpy(prev, eng->current_schema_name, sizeof(prev) - 1);
+    prev[sizeof(prev) - 1] = '\0';
+
+    int rc = engine_deactivate_schema(eng);
+    if (rc != MYDB_OK) {
+        snprintf(out, cap, "  Error: failed to disconnect from '%s'", prev);
+        return rc;
+    }
+
+    snprintf(out, cap,
+             "OK  Disconnected from '%s'  (no active database)", prev);
+    return MYDB_OK;
+}
+
+/* ======================================================================
  * USE
  * ====================================================================== */
 

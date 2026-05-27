@@ -611,6 +611,16 @@ int storage_create_table(RelationDef *rel)
      * (partition_alloc_page already bumped used_bytes). */
     schema_bump_relation_pages(&g.eng->active_schema, rel->relation_name,
                                (int32_t)need_pages);
+
+    /* Keep the partition catalog's SchemaEntry.num_relations in sync so
+     * DESCRIBE PARTITION shows the correct table count. */
+    SchemaEntry *se = cat_find_schema(&g.eng->active_catalog,
+                                      g.eng->current_schema_name);
+    if (se) {
+        se->num_relations++;
+        cat_save(&g.eng->active_catalog);
+    }
+
     return MYDB_OK;
 }
 
@@ -635,7 +645,18 @@ int storage_drop_table(RelationDef *rel)
         return MYDB_ERR;
     disk_destroy(path);
 
-    return schema_remove_relation(&g.eng->active_schema, rel->relation_name);
+    int rc = schema_remove_relation(&g.eng->active_schema, rel->relation_name);
+    if (rc != MYDB_OK) return rc;
+
+    /* Keep the partition catalog's SchemaEntry.num_relations in sync. */
+    SchemaEntry *se = cat_find_schema(&g.eng->active_catalog,
+                                      g.eng->current_schema_name);
+    if (se && se->num_relations > 0) {
+        se->num_relations--;
+        cat_save(&g.eng->active_catalog);
+    }
+
+    return MYDB_OK;
 }
 
 int storage_add_index(RelationDef *rel, int col_idx)

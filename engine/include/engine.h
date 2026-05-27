@@ -143,6 +143,13 @@ int engine_login(EngineState *eng,
  *   3. Open <partition>/<schema>/__schema.mydb into eng->active_schema. */
 int engine_use_schema(EngineState *eng, const char *schema_name);
 
+/* Deactivate the currently active schema without switching to another.
+ * Flushes dirty pages, closes the schema file, and clears schema_active /
+ * current_schema_name.  Partition state (logged_in, partition_open, etc.)
+ * is preserved — the user remains logged in.
+ * Returns MYDB_OK immediately if no schema is active. */
+int engine_deactivate_schema(EngineState *eng);
+
 
 /* ------------------------------------------------------------------ */
 /*  Authorization                                                      */

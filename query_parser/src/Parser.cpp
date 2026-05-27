@@ -80,8 +80,12 @@ std::unique_ptr<ASTNode> Parser::parse() {
     if (match(TokenType::KEYWORD, "DELETE")) return parse_delete();
     if (match(TokenType::KEYWORD, "USE"))     return parse_use();
     if (match(TokenType::KEYWORD, "SHOW"))    return parse_show();
-    if (match(TokenType::KEYWORD, "ANALYZE"))  return parse_analyze();
-    if (match(TokenType::KEYWORD, "DESCRIBE")) return parse_describe();
+    if (match(TokenType::KEYWORD, "ANALYZE"))    return parse_analyze();
+    if (match(TokenType::KEYWORD, "DESCRIBE"))   return parse_describe();
+    if (match(TokenType::KEYWORD, "DISCONNECT")) {
+        consume(TokenType::SYMBOL, ";", "Expected ';' after DISCONNECT");
+        return std::make_unique<DisconnectStatement>();
+    }
 
     // NEW TCL DISPATCHERS
     if (match(TokenType::KEYWORD, "BEGIN")) return parse_transaction("BEGIN");

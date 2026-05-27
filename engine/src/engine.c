@@ -303,6 +303,31 @@ int engine_login(EngineState *eng,
 
 
 /* ====================================================================
+ *  Deactivate the currently active schema without switching to another.
+ *
+ *  Flushes dirty pages, closes the schema file, and clears the
+ *  schema_active flag.  Partition state (logged_in, partition_open,
+ *  current_partition_path, etc.) is left intact — the user stays
+ *  logged in and can still run USE, CREATE DATABASE, etc.
+ *
+ *  Called by DROP DATABASE when the user drops their active database.
+ * ==================================================================== */
+
+int engine_deactivate_schema(EngineState *eng)
+{
+    if (!eng || !eng->schema_active) return MYDB_OK;   /* nothing to do */
+
+    storage_flush_all_dirty();
+    if (schema_close(&eng->active_schema) != MYDB_OK) return MYDB_ERR;
+
+    eng->schema_active = 0;
+    eng->current_schema_name[0] = '\0';
+    /* current_partition_id / partition_open left intact — still logged in */
+
+    return MYDB_OK;
+}
+
+/* ====================================================================
  *  USE schema_name
  * ==================================================================== */
 

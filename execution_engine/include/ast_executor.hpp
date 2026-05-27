@@ -70,6 +70,8 @@ int exec_describe_schema    (EngineState *eng, const DescribeSchemaStatement    
                              char *out, size_t cap);
 int exec_describe_partition (EngineState *eng, const DescribePartitionStatement *s,
                              char *out, size_t cap);
+int exec_disconnect         (EngineState *eng, const DisconnectStatement        *s,
+                             char *out, size_t cap);
 
 /* ------------------------------------------------------------------
  * DML  (src/dml.cpp)

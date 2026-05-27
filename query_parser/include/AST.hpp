@@ -6,7 +6,7 @@
 #include "Lexer.hpp"
 
 // --- 1. ENUMS ---
-enum class StatementType { SELECT, CREATE_TABLE, INSERT, UPDATE, DELETE, TRANSACTION, DROP_TABLE, CREATE_DATABASE, DROP_DATABASE, USE, SHOW_TABLES, SHOW_DATABASES, CREATE_INDEX, ANALYZE_TABLE, CREATE_USER, DROP_USER, ALTER_USER, DESCRIBE_TABLE, DESCRIBE_SCHEMA, DESCRIBE_PARTITION, UNKNOWN };
+enum class StatementType { SELECT, CREATE_TABLE, INSERT, UPDATE, DELETE, TRANSACTION, DROP_TABLE, CREATE_DATABASE, DROP_DATABASE, USE, SHOW_TABLES, SHOW_DATABASES, CREATE_INDEX, ANALYZE_TABLE, CREATE_USER, DROP_USER, ALTER_USER, DESCRIBE_TABLE, DESCRIBE_SCHEMA, DESCRIBE_PARTITION, DISCONNECT, UNKNOWN };
 enum class JoinType { INNER, LEFT, RIGHT, FULL };
 enum class TransactionCommand { BEGIN, COMMIT, ROLLBACK };
 
@@ -263,6 +263,14 @@ struct DescribePartitionStatement : public ASTNode {
     DescribePartitionStatement() { type = StatementType::DESCRIBE_PARTITION; }
     void print() const override {
         std::cout << "\n[AST] Action: DESCRIBE PARTITION\n";
+    }
+};
+
+// DISCONNECT  (no argument — deactivates the active schema without logging out)
+struct DisconnectStatement : public ASTNode {
+    DisconnectStatement() { type = StatementType::DISCONNECT; }
+    void print() const override {
+        std::cout << "\n[AST] Action: DISCONNECT\n";
     }
 };
 
