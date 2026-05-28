@@ -1554,7 +1554,7 @@ static void test_user_ddl(void)
 }
 
 /* ======================================================================
- * UPDATE / DELETE — currently stubs; verify they return an error message
+ * UPDATE / DELETE — both implemented
  * ====================================================================== */
 
 static void test_dml_stubs(void)
@@ -1566,16 +1566,17 @@ static void test_dml_stubs(void)
     sql("USE shop;");
     sql("CREATE TABLE items (id INT PRIMARY KEY, val INT);");
     sql("INSERT INTO items (id, val) VALUES (1, 10);");
+    sql("INSERT INTO items (id, val) VALUES (2, 20);");
 
     int rc;
 
-    /* UPDATE is a stub — returns non-OK */
+    /* UPDATE is implemented — must succeed */
     rc = sql("UPDATE items SET val = 99 WHERE id = 1;");
-    CHECK(rc != MYDB_OK,                   "UPDATE (stub) → non-OK");
+    CHECK(rc == MYDB_OK,                   "UPDATE → MYDB_OK");
 
-    /* DELETE is a stub — returns non-OK */
-    rc = sql("DELETE FROM items WHERE id = 1;");
-    CHECK(rc != MYDB_OK,                   "DELETE (stub) → non-OK");
+    /* DELETE is implemented — must succeed */
+    rc = sql("DELETE FROM items WHERE id = 2;");
+    CHECK(rc == MYDB_OK,                   "DELETE → MYDB_OK");
 
     engine_teardown();
 }

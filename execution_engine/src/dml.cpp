@@ -10,6 +10,8 @@
 #include "result_fmt.hpp"
 #include "value_cast.hpp"
 #include "expr_eval.hpp"
+#include "exec_access_path.hpp"   /* AccessPath, extract_sargs, plan_to_ap */
+#include "planner.h"              /* Sarg, PlanNode, planner_choose_path   */
 
 #include <cstring>
 #include <cstdio>
@@ -254,43 +256,300 @@ int exec_insert(EngineState *eng, const InsertStatement *s,
 }
 
 /* ======================================================================
- * UPDATE  (Phase 6)
+ * UPDATE
  * ====================================================================== */
 
-int exec_update(EngineState * /*eng*/,
-                const UpdateStatement * /*s*/,
+int exec_update(EngineState *eng,
+                const UpdateStatement *s,
                 char *out, size_t cap)
 {
-    /*
-     * Phase 6 implementation:
-     *
-     *   AUTOCOMMIT_BEGIN();
-     *   // scan + filter + for each matching row: storage_update(rel, rid, &new_row)
-     *   rc = ...;
-     *   AUTOCOMMIT_END(rc);
-     *   return rc;
-     */
-    snprintf(out, cap, "not implemented: UPDATE");
-    return MYDB_ERR;
+    REQUIRE_LOGIN(eng);
+    REQUIRE_SCHEMA(eng);
+
+    /* write access check */
+    int rc = engine_check_access(eng, 1);
+    if (rc != MYDB_OK) {
+        format_error(rc, out, cap, s->table_name.c_str());
+        return rc;
+    }
+
+    /* find the table */
+    const RelationDef *rel_c = engine_find_relation(eng, s->table_name.c_str());
+    if (!rel_c) {
+        snprintf(out, cap, "  Error: table '%s' does not exist",
+                 s->table_name.c_str());
+        return MYDB_ERR_NOT_FOUND;
+    }
+    RelationDef *rel = (RelationDef *)rel_c;
+
+    /* validate every SET column before touching any data */
+    for (const auto &assign : s->assignments) {
+        int ci = resolve_col(rel, assign.first);
+        if (ci < 0) {
+            snprintf(out, cap, "  Error: unknown column '%s'",
+                     assign.first.c_str());
+            return MYDB_ERR;
+        }
+        if (rel->columns[ci].is_auto_increment) {
+            snprintf(out, cap,
+                     "  Error: column '%s' is AUTO_INCREMENT and cannot be updated",
+                     rel->columns[ci].name);
+            return MYDB_ERR;
+        }
+        if (!validate_literal(assign.second, rel->columns[ci])) {
+            snprintf(out, cap,
+                     "  Error: value '%s' is not valid for column '%s'",
+                     assign.second.c_str(), rel->columns[ci].name);
+            return MYDB_ERR;
+        }
+    }
+
+    /* validate WHERE column references */
+    if (s->where_clause) {
+        const char *bad = validate_expr_cols(s->where_clause->root.get(), rel);
+        if (bad) {
+            snprintf(out, cap,
+                     "  Error: column '%s' does not exist in table '%s'",
+                     bad, s->table_name.c_str());
+            return MYDB_ERR;
+        }
+    }
+
+    /* choose the cheapest access path via the planner */
+    Sarg       sargs[32];
+    int        n_sargs = extract_sargs(s->where_clause.get(), rel, sargs, 32);
+    PlanNode   plan    = planner_choose_path(eng, rel, sargs, n_sargs);
+    AccessPath ap      = plan_to_ap(plan, s->where_clause.get(), rel);
+
+    AUTOCOMMIT_BEGIN();
+
+    size_t naffected = 0;
+    rc = MYDB_OK;
+
+    /* apply SET values to one matching row and call storage_update */
+    auto update_row = [&](Row *row) -> bool {
+        if (!row) return true;
+        if (!where_matches(s->where_clause.get(), rel, row)) return true;
+
+        RID rid     = row->rid;   /* save before any storage call overwrites it */
+        Row new_row = *row;       /* copy all current column values */
+
+        /* overwrite only the columns named in the SET clause */
+        for (const auto &assign : s->assignments) {
+            int ci = resolve_col(rel, assign.first);
+            new_row.cols[ci] = cast_literal(assign.second, rel->columns[ci]);
+        }
+
+        /* NOT NULL check on the new values */
+        for (int i = 0; i < rel->num_columns; i++) {
+            if (rel->columns[i].is_not_null && new_row.cols[i].is_null) {
+                snprintf(out, cap, "  Error: column '%s' cannot be NULL",
+                         rel->columns[i].name);
+                rc = MYDB_ERR_NULL_VIOLATION;
+                return false;   /* stop the scan */
+            }
+        }
+
+        rc = storage_update(rel, rid, &new_row);
+        if (rc != MYDB_OK) {
+            format_error(rc, out, cap, s->table_name.c_str());
+            return false;   /* stop the scan */
+        }
+
+        naffected++;
+        return true;   /* continue scanning */
+    };
+
+    /* execute the chosen access path */
+    switch (ap.kind) {
+
+    case AP_GET_PK: {
+        Row *row = storage_get_by_pk(rel, &ap.key);
+        update_row(row);
+        break;
+    }
+    case AP_GET_INDEX: {
+        Row *row = storage_get_by_index(rel, ap.col_idx, &ap.key);
+        update_row(row);
+        break;
+    }
+    case AP_SCAN_FROM: {
+        Cursor *cur = storage_scan_from(rel, &ap.key);
+        if (cur) {
+            Row *row;
+            while ((row = cursor_next(cur)) != NULL)
+                if (!update_row(row)) break;
+            cursor_close(cur);
+        }
+        break;
+    }
+    case AP_SCAN_BY_INDEX: {
+        Cursor *cur = storage_scan_by_index(rel, ap.col_idx, &ap.key);
+        if (cur) {
+            Row *row;
+            while ((row = cursor_next(cur)) != NULL)
+                if (!update_row(row)) break;
+            cursor_close(cur);
+        }
+        break;
+    }
+    default: {
+        Cursor *cur = storage_scan(rel);
+        if (cur) {
+            Row *row;
+            while ((row = cursor_next(cur)) != NULL)
+                if (!update_row(row)) break;
+            cursor_close(cur);
+        }
+        break;
+    }
+    }
+
+    AUTOCOMMIT_END(rc);
+
+    if (rc != MYDB_OK) return rc;
+
+    snprintf(out, cap, "OK  %zu row%s affected",
+             naffected, naffected == 1 ? "" : "s");
+    return MYDB_OK;
 }
 
 /* ======================================================================
- * DELETE  (Phase 6)
+ * DELETE
  * ====================================================================== */
 
-int exec_delete(EngineState * /*eng*/,
-                const DeleteStatement * /*s*/,
+int exec_delete(EngineState *eng,
+                const DeleteStatement *s,
                 char *out, size_t cap)
 {
-    /*
-     * Phase 6 implementation:
-     *
-     *   AUTOCOMMIT_BEGIN();
-     *   // scan + filter + for each matching row: storage_delete(rel, row->rid)
-     *   rc = ...;
-     *   AUTOCOMMIT_END(rc);
-     *   return rc;
-     */
-    snprintf(out, cap, "not implemented: DELETE");
-    return MYDB_ERR;
+    REQUIRE_LOGIN(eng);
+    REQUIRE_SCHEMA(eng);
+
+    /* write access check */
+    int rc = engine_check_access(eng, 1);
+    if (rc != MYDB_OK) {
+        format_error(rc, out, cap, s->table_name.c_str());
+        return rc;
+    }
+
+    /* find the table */
+    const RelationDef *rel_c = engine_find_relation(eng, s->table_name.c_str());
+    if (!rel_c) {
+        snprintf(out, cap, "  Error: table '%s' does not exist",
+                 s->table_name.c_str());
+        return MYDB_ERR_NOT_FOUND;
+    }
+    RelationDef *rel = (RelationDef *)rel_c;
+
+    /* validate WHERE column references */
+    if (s->where_clause) {
+        const char *bad = validate_expr_cols(s->where_clause->root.get(), rel);
+        if (bad) {
+            snprintf(out, cap,
+                     "  Error: column '%s' does not exist in table '%s'",
+                     bad, s->table_name.c_str());
+            return MYDB_ERR;
+        }
+    }
+
+    /* choose the cheapest access path via the planner */
+    Sarg       sargs[32];
+    int        n_sargs = extract_sargs(s->where_clause.get(), rel, sargs, 32);
+    PlanNode   plan    = planner_choose_path(eng, rel, sargs, n_sargs);
+    AccessPath ap      = plan_to_ap(plan, s->where_clause.get(), rel);
+
+    AUTOCOMMIT_BEGIN();
+
+    size_t naffected = 0;
+    rc = MYDB_OK;
+
+    switch (ap.kind) {
+
+    case AP_GET_PK: {
+        Row *row = storage_get_by_pk(rel, &ap.key);
+        if (row && where_matches(s->where_clause.get(), rel, row)) {
+            RID rid = row->rid;
+            rc = storage_delete(rel, rid);
+            if (rc == MYDB_OK) naffected++;
+            else format_error(rc, out, cap, s->table_name.c_str());
+        }
+        break;
+    }
+
+    case AP_GET_INDEX: {
+        Row *row = storage_get_by_index(rel, ap.col_idx, &ap.key);
+        if (row && where_matches(s->where_clause.get(), rel, row)) {
+            RID rid = row->rid;
+            rc = storage_delete(rel, rid);
+            if (rc == MYDB_OK) naffected++;
+            else format_error(rc, out, cap, s->table_name.c_str());
+        }
+        break;
+    }
+
+    case AP_SCAN_FROM: {
+        Cursor *cur = storage_scan_from(rel, &ap.key);
+        if (cur) {
+            Row *row;
+            while ((row = cursor_next(cur)) != NULL) {
+                if (!where_matches(s->where_clause.get(), rel, row)) continue;
+                RID rid = row->rid;
+                rc = storage_delete(rel, rid);
+                if (rc != MYDB_OK) {
+                    format_error(rc, out, cap, s->table_name.c_str());
+                    break;
+                }
+                naffected++;
+            }
+            cursor_close(cur);
+        }
+        break;
+    }
+
+    case AP_SCAN_BY_INDEX: {
+        Cursor *cur = storage_scan_by_index(rel, ap.col_idx, &ap.key);
+        if (cur) {
+            Row *row;
+            while ((row = cursor_next(cur)) != NULL) {
+                if (!where_matches(s->where_clause.get(), rel, row)) continue;
+                RID rid = row->rid;
+                rc = storage_delete(rel, rid);
+                if (rc != MYDB_OK) {
+                    format_error(rc, out, cap, s->table_name.c_str());
+                    break;
+                }
+                naffected++;
+            }
+            cursor_close(cur);
+        }
+        break;
+    }
+
+    default: {
+        Cursor *cur = storage_scan(rel);
+        if (cur) {
+            Row *row;
+            while ((row = cursor_next(cur)) != NULL) {
+                if (!where_matches(s->where_clause.get(), rel, row)) continue;
+                RID rid = row->rid;
+                rc = storage_delete(rel, rid);
+                if (rc != MYDB_OK) {
+                    format_error(rc, out, cap, s->table_name.c_str());
+                    break;
+                }
+                naffected++;
+            }
+            cursor_close(cur);
+        }
+        break;
+    }
+    }
+
+    AUTOCOMMIT_END(rc);
+
+    if (rc != MYDB_OK) return rc;
+
+    snprintf(out, cap, "OK  %zu row%s affected",
+             naffected, naffected == 1 ? "" : "s");
+    return MYDB_OK;
 }
