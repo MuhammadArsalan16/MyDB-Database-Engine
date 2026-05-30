@@ -53,6 +53,18 @@ int exec_dispatch(EngineState *eng, const ASTNode *node,
         return exec_show_databases(eng,
                                    static_cast<const ShowDatabasesStatement *>(node),
                                    out, cap);
+    case StatementType::SHOW_CURRENT_DB:
+        return exec_database(eng,
+                             static_cast<const DatabaseStatement *>(node),
+                             out, cap);
+    case StatementType::SHOW_USERS:
+        return exec_show_users(eng,
+                               static_cast<const ShowUsersStatement *>(node),
+                               out, cap);
+    case StatementType::SHOW_GRANTS:
+        return exec_show_grants(eng,
+                                static_cast<const ShowGrantsStatement *>(node),
+                                out, cap);
     case StatementType::DESCRIBE_TABLE:
         return exec_describe_table(eng,
                                    static_cast<const DescribeTableStatement *>(node),

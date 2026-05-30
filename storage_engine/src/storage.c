@@ -51,6 +51,7 @@ typedef struct {
     int                 num_open;
     int                 next_table_id;   /* monotonic counter for table IDs */
     int                 initialized;
+    DiskManager        *last_written_dm; /* set by DML; fsync'd at commit */
 } StorageState;
 
 /*
@@ -757,7 +758,18 @@ int storage_add_index(RelationDef *rel, int col_idx)
 /* ------------------------------------------------------------------ */
 
 int storage_begin(void)    { return trx_begin(&g.trx); }
-int storage_commit(void)   { return trx_commit(&g.trx); }
+int storage_commit(void)
+{
+    int rc = trx_commit(&g.trx);
+    if (rc == MYDB_OK) {
+        if (g.last_written_dm)
+            fsync(g.last_written_dm->fd);
+        if (g.eng && g.eng->active_schema.fd >= 0)
+            fsync(g.eng->active_schema.fd);
+        g.last_written_dm = NULL;
+    }
+    return rc;
+}
 int storage_rollback(void) { return trx_rollback(&g.trx); }
 
 /* ------------------------------------------------------------------ */
@@ -1086,9 +1098,10 @@ int storage_insert(RelationDef *rel, Row *row)
     reconcile_growth(ot, rel->relation_name, pages_before);
     schema_bump_relation_rows(&g.eng->active_schema, rel->relation_name, 1);
 
-    if (r->columns[pk].is_auto_increment) {
+    if (r->columns[pk].is_auto_increment)
         schema_flush_relation(&g.eng->active_schema, rel->relation_name);
-    }
+
+    g.last_written_dm = &ot->dm;
 
     if (auto_txn) trx_commit(&g.trx);
     return MYDB_OK;

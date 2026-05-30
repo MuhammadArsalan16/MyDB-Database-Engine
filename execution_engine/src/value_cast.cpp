@@ -109,9 +109,10 @@ Value cast_literal(const std::string &token, const ColumnDef &col)
     /* ------------------------------------------------------------------ */
     case TYPE_INT: {
         errno = 0;
-        long val = strtol(s, NULL, 10);
-        if (errno == ERANGE || val < INT32_MIN || val > INT32_MAX)
-            v.is_null = 1;   /* out-of-range — validate_literal should have caught this */
+        char *end = nullptr;
+        long val = strtol(s, &end, 10);
+        if (end == s || *end != '\0' || errno == ERANGE || val < INT32_MIN || val > INT32_MAX)
+            v.is_null = 1;
         else
             v.v.int_val = (int32_t)val;
         break;

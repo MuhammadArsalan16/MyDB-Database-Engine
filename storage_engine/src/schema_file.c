@@ -563,7 +563,6 @@ int schema_save_page0(SchemaFile *sf)
     pack_page0(sf, buf);
 
     if (write_page(sf->fd, 0, buf) != MYDB_OK) return MYDB_ERR;
-    if (fsync(sf->fd) < 0) return MYDB_ERR;
     return MYDB_OK;
 }
 
@@ -652,7 +651,6 @@ int schema_flush_relation(SchemaFile *sf, const char *relation_name)
         return MYDB_ERR;
     if (write_page(sf->fd, sf->relations[slot].page_no, page) != MYDB_OK)
         return MYDB_ERR;
-    if (fsync(sf->fd) < 0) return MYDB_ERR;
     return MYDB_OK;
 }
 

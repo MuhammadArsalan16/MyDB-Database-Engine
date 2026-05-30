@@ -561,6 +561,130 @@ int exec_show_databases(EngineState *eng,
     return MYDB_OK;
 }
 
+static void fmt_datetime_ts(uint64_t dt, char *buf, size_t cap);
+
+/* ======================================================================
+ * DATABASE
+ * ====================================================================== */
+
+int exec_database(EngineState *eng,
+                  const DatabaseStatement * /*s*/,
+                  char *out, size_t cap)
+{
+    REQUIRE_LOGIN(eng);
+
+    if (!eng->schema_active)
+        snprintf(out, cap, "No database selected");
+    else
+        snprintf(out, cap, "%s", eng->current_schema_name);
+
+    return MYDB_OK;
+}
+
+/* ======================================================================
+ * SHOW USERS  (root only)
+ * ====================================================================== */
+
+int exec_show_users(EngineState *eng,
+                    const ShowUsersStatement * /*s*/,
+                    char *out, size_t cap)
+{
+    REQUIRE_LOGIN(eng);
+
+    if (eng->current_user_id != 1) {
+        snprintf(out, cap, "  Error: SHOW USERS requires root privileges");
+        return MYDB_ERR_PERM;
+    }
+
+    ResultBuf    rb(out, cap);
+    TableBuilder tb;
+    tb.set_headers({"user_id", "username", "is_active", "created_at", "last_login"});
+
+    const UsersFile *uf = &eng->system_schema.users;
+    for (int i = 0; i < USERS_MAX_SLOTS; i++) {
+        const UserSlot *u = &uf->slots[i];
+        if (!u->is_valid) continue;
+
+        char created[24], last_login[24];
+        fmt_datetime_ts(u->created_at, created,    sizeof(created));
+        fmt_datetime_ts(u->last_login, last_login, sizeof(last_login));
+
+        tb.add_row({
+            std::to_string(u->user_id),
+            u->username,
+            u->is_active ? "active" : "inactive",
+            created,
+            last_login
+        });
+    }
+
+    tb.render(rb);
+    return MYDB_OK;
+}
+
+/* ======================================================================
+ * SHOW GRANTS [user_id]
+ * ====================================================================== */
+
+int exec_show_grants(EngineState *eng,
+                     const ShowGrantsStatement *s,
+                     char *out, size_t cap)
+{
+    REQUIRE_LOGIN(eng);
+
+    uint32_t target_id = (s->user_id == 0) ? eng->current_user_id : s->user_id;
+
+    if (target_id != eng->current_user_id && eng->current_user_id != 1) {
+        snprintf(out, cap,
+                 "  Error: SHOW GRANTS for another user requires root privileges");
+        return MYDB_ERR_PERM;
+    }
+
+    /* Resolve target username for display */
+    UserSlot target_slot;
+    if (users_find_by_id(&eng->system_schema.users, target_id, &target_slot)
+            != MYDB_OK) {
+        snprintf(out, cap, "  Error: user_id %u does not exist", target_id);
+        return MYDB_ERR_NOT_FOUND;
+    }
+
+    ResultBuf    rb(out, cap);
+    TableBuilder tb;
+    tb.set_headers({"privilege_id", "grantee", "schema_name",
+                    "partition_id", "granted_by", "granted_at"});
+
+    const PrivilegesFile *pf = &eng->system_schema.privileges;
+    for (int i = 0; i < PRIVILEGES_MAX_SLOTS; i++) {
+        const PrivilegeSlot *p = &pf->slots[i];
+        if (!p->is_valid) continue;
+        if (p->grantee_id != target_id) continue;
+
+        /* Resolve granter username */
+        UserSlot granter;
+        char granter_name[MAX_USERNAME + 16];
+        if (users_find_by_id(&eng->system_schema.users,
+                              p->granted_by, &granter) == MYDB_OK)
+            snprintf(granter_name, sizeof(granter_name), "%s", granter.username);
+        else
+            snprintf(granter_name, sizeof(granter_name), "#%u", p->granted_by);
+
+        char granted_at[24];
+        fmt_datetime_ts(p->granted_at, granted_at, sizeof(granted_at));
+
+        tb.add_row({
+            std::to_string(p->privilege_id),
+            target_slot.username,
+            p->schema_name,
+            std::to_string(p->partition_id),
+            granter_name,
+            granted_at
+        });
+    }
+
+    tb.render(rb);
+    return MYDB_OK;
+}
+
 /* ======================================================================
  * ANALYZE TABLE
  * ====================================================================== */

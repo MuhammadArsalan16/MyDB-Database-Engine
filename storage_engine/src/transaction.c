@@ -1,5 +1,6 @@
 #include "transaction.h"
 #include <string.h>
+#include <unistd.h>
 
 void trx_init(TransactionManager *tm, BufferPool *bp)
 {

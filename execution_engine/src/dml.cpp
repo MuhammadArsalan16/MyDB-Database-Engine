@@ -169,6 +169,8 @@ int exec_insert(EngineState *eng, const InsertStatement *s,
     /* ------------------------------------------------------------------
      * Insert all rows inside one transaction (all-or-nothing).
      * ------------------------------------------------------------------ */
+    struct timespec _ins_t_start, _ins_t_commit, _ins_t_end;
+    clock_gettime(CLOCK_MONOTONIC, &_ins_t_start);
     AUTOCOMMIT_BEGIN();
 
     size_t ninserted = 0;
@@ -246,7 +248,21 @@ int exec_insert(EngineState *eng, const InsertStatement *s,
     }
 
     rc = MYDB_OK;
+    clock_gettime(CLOCK_MONOTONIC, &_ins_t_commit);
     AUTOCOMMIT_END(rc);
+    clock_gettime(CLOCK_MONOTONIC, &_ins_t_end);
+
+    {
+        double _total   = (_ins_t_end.tv_sec    - _ins_t_start.tv_sec)  * 1e3
+                        + (_ins_t_end.tv_nsec   - _ins_t_start.tv_nsec) * 1e-6;
+        double _commit  = (_ins_t_end.tv_sec    - _ins_t_commit.tv_sec) * 1e3
+                        + (_ins_t_end.tv_nsec   - _ins_t_commit.tv_nsec) * 1e-6;
+        fprintf(stderr,
+                "[INSERT_TIMING] %zu row%s: total=%.3fms  "
+                "commit(bp_flush)=%.3fms  avg_per_row=%.3fms\n",
+                ninserted, ninserted == 1 ? "" : "s",
+                _total, _commit, ninserted ? _total / (double)ninserted : 0.0);
+    }
 
     snprintf(out, cap, "OK  %zu row%s affected",
              ninserted, ninserted == 1 ? "" : "s");

@@ -64,6 +64,12 @@ int exec_show_tables    (EngineState *eng, const ShowTablesStatement     *s,
                          char *out, size_t cap);
 int exec_show_databases (EngineState *eng, const ShowDatabasesStatement  *s,
                          char *out, size_t cap);
+int exec_show_users     (EngineState *eng, const ShowUsersStatement      *s,
+                         char *out, size_t cap);
+int exec_database       (EngineState *eng, const DatabaseStatement       *s,
+                         char *out, size_t cap);
+int exec_show_grants    (EngineState *eng, const ShowGrantsStatement     *s,
+                         char *out, size_t cap);
 int exec_describe_table     (EngineState *eng, const DescribeTableStatement     *s,
                              char *out, size_t cap);
 int exec_describe_schema    (EngineState *eng, const DescribeSchemaStatement    *s,

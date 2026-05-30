@@ -49,6 +49,15 @@ bool where_matches(const WhereClause *w, const RelationDef *rel, const Row *r);
 const char *where_validate_likes(const WhereClause *w, const RelationDef *rel);
 
 /*
+ * Literal type compatibility check — call once before any scan.
+ * Walks the WHERE tree and returns a static error string if any literal
+ * value (in =, !=, <, >, <=, >=, BETWEEN, IN) is not compatible with
+ * the type of the column it is compared against, nullptr if clean.
+ * VARCHAR columns accept any string and are not checked.
+ */
+const char *where_validate_literal_types(const WhereClause *w, const RelationDef *rel);
+
+/*
  * Type-aware comparison of two Values.
  * Returns: negative → a < b,  zero → a == b,  positive → a > b.
  *

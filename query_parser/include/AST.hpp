@@ -6,7 +6,7 @@
 #include "Lexer.hpp"
 
 // --- 1. ENUMS ---
-enum class StatementType { SELECT, CREATE_TABLE, INSERT, UPDATE, DELETE, TRANSACTION, DROP_TABLE, CREATE_DATABASE, DROP_DATABASE, USE, SHOW_TABLES, SHOW_DATABASES, CREATE_INDEX, ANALYZE_TABLE, CREATE_USER, DROP_USER, ALTER_USER, DESCRIBE_TABLE, DESCRIBE_SCHEMA, DESCRIBE_PARTITION, DISCONNECT, UNKNOWN };
+enum class StatementType { SELECT, CREATE_TABLE, INSERT, UPDATE, DELETE, TRANSACTION, DROP_TABLE, CREATE_DATABASE, DROP_DATABASE, USE, SHOW_TABLES, SHOW_DATABASES, SHOW_USERS, SHOW_GRANTS, SHOW_CURRENT_DB, CREATE_INDEX, ANALYZE_TABLE, CREATE_USER, DROP_USER, ALTER_USER, DESCRIBE_TABLE, DESCRIBE_SCHEMA, DESCRIBE_PARTITION, DISCONNECT, UNKNOWN };
 enum class JoinType { INNER, LEFT, RIGHT, FULL };
 enum class TransactionCommand { BEGIN, COMMIT, ROLLBACK };
 
@@ -256,6 +256,22 @@ struct ShowTablesStatement : public ASTNode {
 struct ShowDatabasesStatement : public ASTNode {
     ShowDatabasesStatement() { type = StatementType::SHOW_DATABASES; }
     void print() const override { std::cout << "\n[AST] Action: SHOW DATABASES\n"; }
+};
+
+struct DatabaseStatement : public ASTNode {
+    DatabaseStatement() { type = StatementType::SHOW_CURRENT_DB; }
+    void print() const override { std::cout << "\n[AST] Action: DATABASE\n"; }
+};
+
+struct ShowUsersStatement : public ASTNode {
+    ShowUsersStatement() { type = StatementType::SHOW_USERS; }
+    void print() const override { std::cout << "\n[AST] Action: SHOW USERS\n"; }
+};
+
+struct ShowGrantsStatement : public ASTNode {
+    uint32_t user_id = 0;   /* 0 = current user */
+    ShowGrantsStatement() { type = StatementType::SHOW_GRANTS; }
+    void print() const override { std::cout << "\n[AST] Action: SHOW GRANTS\n"; }
 };
 
 // DESCRIBE PARTITION  (no argument — describes the current user's partition)

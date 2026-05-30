@@ -46,6 +46,27 @@ static const char *validate_expr_cols(const Expr *e, const RelationDef *rel)
 
     case Expr::Kind::Binary: {
         const BinaryExpr *b = static_cast<const BinaryExpr *>(e);
+        const char *op = b->op.c_str();
+
+        if (strcmp(op, "AND") == 0 || strcmp(op, "OR") == 0) {
+            const char *bad = validate_expr_cols(b->lhs.get(), rel);
+            if (bad) return bad;
+            return validate_expr_cols(b->rhs.get(), rel);
+        }
+
+        /* Comparison: if either side is a known column the other side is
+         * in value position — skip column check, value validation handles it. */
+        bool lhs_known = b->lhs && b->lhs->kind == Expr::Kind::ColumnRef
+                      && resolve_col(rel,
+                             static_cast<const ColumnRefExpr *>(
+                                 b->lhs.get())->column) >= 0;
+        bool rhs_known = b->rhs && b->rhs->kind == Expr::Kind::ColumnRef
+                      && resolve_col(rel,
+                             static_cast<const ColumnRefExpr *>(
+                                 b->rhs.get())->column) >= 0;
+
+        if (lhs_known || rhs_known) return NULL;
+
         const char *bad = validate_expr_cols(b->lhs.get(), rel);
         if (bad) return bad;
         return validate_expr_cols(b->rhs.get(), rel);
@@ -1128,7 +1149,9 @@ int exec_select(EngineState *eng, const SelectStatement *s,
             validate_expr_cols(s->where_clause->root.get(), rel);
         if (bad) {
             snprintf(out, cap,
-                     "ERROR: column '%s' does not exist in table '%s'",
+                     "  Error: '%s' is not a column in '%s'"
+                     " (if this is a value, quote it or check spelling"
+                     " — keywords like TRUE/FALSE/NULL are case-sensitive)",
                      bad, s->table_name.c_str());
             return MYDB_ERR;
         }
@@ -1147,13 +1170,28 @@ int exec_select(EngineState *eng, const SelectStatement *s,
     }
 
     /* ------------------------------------------------------------------
+     * Step 3c: literal type compatibility — reject values that cannot be
+     * cast to the target column type (e.g. 'user10' vs INT column).
+     * Without this, strtol("user10") silently produces 0 and the query
+     * returns wrong rows instead of an error.
+     * ------------------------------------------------------------------ */
+    {
+        const char *type_err =
+            where_validate_literal_types(s->where_clause.get(), rel);
+        if (type_err) {
+            snprintf(out, cap, "  Error: %s", type_err);
+            return MYDB_ERR;
+        }
+    }
+
+    /* ------------------------------------------------------------------
      * Step 4: validate ORDER BY columns (non-aggregate queries only).
      * ------------------------------------------------------------------ */
     if (!has_agg) {
         for (const auto &item : s->order_by) {
             if (resolve_col(rel, item.column) < 0) {
                 snprintf(out, cap,
-                         "ERROR: column '%s' does not exist in table '%s'",
+                         "  Error: column '%s' does not exist in table '%s'",
                          item.column.c_str(), s->table_name.c_str());
                 return MYDB_ERR;
             }
@@ -1169,7 +1207,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
             if (item.column == "*") continue;   /* COUNT(*) — no column */
             if (resolve_col(rel, item.column) < 0) {
                 snprintf(out, cap,
-                         "ERROR: column '%s' does not exist in table '%s'",
+                         "  Error: column '%s' does not exist in table '%s'",
                          item.column.c_str(), s->table_name.c_str());
                 return MYDB_ERR;
             }
@@ -1191,7 +1229,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
         for (const auto &col_name : s->group_by) {
             if (resolve_col(rel, col_name) < 0) {
                 snprintf(out, cap,
-                         "ERROR: column '%s' does not exist in table '%s'",
+                         "  Error: column '%s' does not exist in table '%s'",
                          col_name.c_str(), s->table_name.c_str());
                 return MYDB_ERR;
             }
@@ -1218,7 +1256,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
             const char *bad = validate_expr_cols(s->having.get(), rel);
             if (bad) {
                 snprintf(out, cap,
-                         "ERROR: column '%s' does not exist in table '%s'",
+                         "  Error: column '%s' does not exist in table '%s'",
                          bad, s->table_name.c_str());
                 return MYDB_ERR;
             }

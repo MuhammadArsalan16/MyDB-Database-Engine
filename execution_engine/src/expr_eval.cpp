@@ -479,3 +479,180 @@ const char *where_validate_likes(const WhereClause *w, const RelationDef *rel)
     if (!w) return nullptr;
     return validate_like_expr(w->root.get(), rel);
 }
+
+/* ======================================================================
+ * Literal type compatibility validator
+ * ====================================================================== */
+
+static const char *type_name(DataType t)
+{
+    switch (t) {
+    case TYPE_INT:      return "INT";
+    case TYPE_DECIMAL:  return "DECIMAL";
+    case TYPE_BOOL:     return "BOOL";
+    case TYPE_ENUM:     return "ENUM";
+    case TYPE_DATE:     return "DATE";
+    case TYPE_DATETIME: return "DATETIME";
+    case TYPE_VARCHAR:  return "VARCHAR";
+    default:            return "unknown";
+    }
+}
+
+static const char *check_literal_type(const LiteralExpr *lit,
+                                      const ColumnDef    *col)
+{
+    /* NULL is always valid; VARCHAR accepts any string */
+    if (lit->raw == "NULL" || col->type == TYPE_VARCHAR) return nullptr;
+
+    if (!validate_literal(lit->raw, *col)) {
+        static char ebuf[256];
+        snprintf(ebuf, sizeof(ebuf),
+                 "value '%s' is not valid for %s column '%s'",
+                 lit->raw.c_str(), type_name(col->type), col->name);
+        return ebuf;
+    }
+    return nullptr;
+}
+
+static const char *validate_types_expr(const Expr *e, const RelationDef *rel)
+{
+    if (!e) return nullptr;
+
+    switch (e->kind) {
+
+    case Expr::Kind::Binary: {
+        const BinaryExpr *bin = static_cast<const BinaryExpr *>(e);
+        const char *op = bin->op.c_str();
+
+        if (strcmp(op, "AND") == 0 || strcmp(op, "OR") == 0) {
+            const char *err = validate_types_expr(bin->lhs.get(), rel);
+            if (err) return err;
+            return validate_types_expr(bin->rhs.get(), rel);
+        }
+
+        /* Comparison: derive the column type hint and check the literal */
+        const ColumnDef  *col = nullptr;
+        const LiteralExpr *lit = nullptr;
+
+        if (bin->lhs && bin->lhs->kind == Expr::Kind::ColumnRef &&
+            bin->rhs && bin->rhs->kind == Expr::Kind::Literal) {
+            const ColumnRefExpr *cr =
+                static_cast<const ColumnRefExpr *>(bin->lhs.get());
+            int idx = col_idx_by_name(rel, cr->column.c_str());
+            if (idx >= 0) {
+                col = &rel->columns[idx];
+                lit = static_cast<const LiteralExpr *>(bin->rhs.get());
+            }
+        } else if (bin->rhs && bin->rhs->kind == Expr::Kind::ColumnRef &&
+                   bin->lhs && bin->lhs->kind == Expr::Kind::Literal) {
+            const ColumnRefExpr *cr =
+                static_cast<const ColumnRefExpr *>(bin->rhs.get());
+            int idx = col_idx_by_name(rel, cr->column.c_str());
+            if (idx >= 0) {
+                col = &rel->columns[idx];
+                lit = static_cast<const LiteralExpr *>(bin->lhs.get());
+            }
+        }
+
+        if (col && lit) return check_literal_type(lit, col);
+
+        /* Unknown identifier in value position against BOOL or ENUM column.
+         * Both sides are ColumnRefs but only one resolves — the unresolved
+         * one is a mistyped keyword or enum label. */
+        if (bin->lhs && bin->lhs->kind == Expr::Kind::ColumnRef &&
+            bin->rhs && bin->rhs->kind == Expr::Kind::ColumnRef) {
+            const ColumnRefExpr *lcr =
+                static_cast<const ColumnRefExpr *>(bin->lhs.get());
+            const ColumnRefExpr *rcr =
+                static_cast<const ColumnRefExpr *>(bin->rhs.get());
+            int lidx = col_idx_by_name(rel, lcr->column.c_str());
+            int ridx = col_idx_by_name(rel, rcr->column.c_str());
+
+            const ColumnDef   *ecol = nullptr;
+            const std::string *eval = nullptr;
+            if      (lidx >= 0 && ridx < 0) { ecol = &rel->columns[lidx]; eval = &rcr->column; }
+            else if (ridx >= 0 && lidx < 0) { ecol = &rel->columns[ridx]; eval = &lcr->column; }
+
+            if (ecol && eval
+                    && (ecol->type == TYPE_BOOL || ecol->type == TYPE_ENUM)
+                    && !validate_literal(*eval, *ecol)) {
+                static char ebuf[256];
+                if (ecol->type == TYPE_BOOL) {
+                    snprintf(ebuf, sizeof(ebuf),
+                             "invalid value '%s' for BOOL column '%s'"
+                             " — use TRUE or FALSE",
+                             eval->c_str(), ecol->name);
+                } else {
+                    int n = snprintf(ebuf, sizeof(ebuf),
+                                     "invalid value '%s' for ENUM column '%s'"
+                                     " — valid values: ",
+                                     eval->c_str(), ecol->name);
+                    for (int i = 0; i < ecol->num_enum_values
+                                 && n < (int)sizeof(ebuf) - 2; i++) {
+                        if (i > 0) n += snprintf(ebuf + n,
+                                                  sizeof(ebuf) - (size_t)n, ", ");
+                        n += snprintf(ebuf + n,
+                                      sizeof(ebuf) - (size_t)n,
+                                      "%s", ecol->enum_values[i]);
+                    }
+                }
+                return ebuf;
+            }
+        }
+        return nullptr;
+    }
+
+    case Expr::Kind::Unary: {
+        const UnaryExpr *un = static_cast<const UnaryExpr *>(e);
+        return validate_types_expr(un->child.get(), rel);
+    }
+
+    case Expr::Kind::Between: {
+        const BetweenExpr *bw = static_cast<const BetweenExpr *>(e);
+        if (!bw->v || bw->v->kind != Expr::Kind::ColumnRef) return nullptr;
+        const ColumnRefExpr *cr =
+            static_cast<const ColumnRefExpr *>(bw->v.get());
+        int idx = col_idx_by_name(rel, cr->column.c_str());
+        if (idx < 0) return nullptr;
+        const ColumnDef *col = &rel->columns[idx];
+
+        if (bw->lo && bw->lo->kind == Expr::Kind::Literal) {
+            const char *err = check_literal_type(
+                static_cast<const LiteralExpr *>(bw->lo.get()), col);
+            if (err) return err;
+        }
+        if (bw->hi && bw->hi->kind == Expr::Kind::Literal) {
+            const char *err = check_literal_type(
+                static_cast<const LiteralExpr *>(bw->hi.get()), col);
+            if (err) return err;
+        }
+        return nullptr;
+    }
+
+    case Expr::Kind::In: {
+        const InExpr *in = static_cast<const InExpr *>(e);
+        if (!in->v || in->v->kind != Expr::Kind::ColumnRef) return nullptr;
+        const ColumnRefExpr *cr =
+            static_cast<const ColumnRefExpr *>(in->v.get());
+        int idx = col_idx_by_name(rel, cr->column.c_str());
+        if (idx < 0) return nullptr;
+        const ColumnDef *col = &rel->columns[idx];
+
+        for (const auto &lit : in->list) {
+            const char *err = check_literal_type(lit.get(), col);
+            if (err) return err;
+        }
+        return nullptr;
+    }
+
+    default:
+        return nullptr;
+    }
+}
+
+const char *where_validate_literal_types(const WhereClause *w,
+                                         const RelationDef  *rel)
+{
+    if (!w) return nullptr;
+    return validate_types_expr(w->root.get(), rel);
+}

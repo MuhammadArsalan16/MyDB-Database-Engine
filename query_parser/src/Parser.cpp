@@ -86,6 +86,10 @@ std::unique_ptr<ASTNode> Parser::parse() {
         consume(TokenType::SYMBOL, ";", "Expected ';' after DISCONNECT");
         return std::make_unique<DisconnectStatement>();
     }
+    if (match(TokenType::KEYWORD, "DATABASE")) {
+        consume(TokenType::SYMBOL, ";", "Expected ';' after DATABASE");
+        return std::make_unique<DatabaseStatement>();
+    }
 
     // NEW TCL DISPATCHERS
     if (match(TokenType::KEYWORD, "BEGIN")) return parse_transaction("BEGIN");
@@ -813,14 +817,25 @@ std::unique_ptr<UseStatement> Parser::parse_use() {
 
 std::unique_ptr<ASTNode> Parser::parse_show() {
     Token t = advance();
-    if (t.type != TokenType::KEYWORD) throw_error("Expected TABLES or DATABASES after SHOW");
+    if (t.type != TokenType::KEYWORD) throw_error("Expected TABLES, DATABASES, USERS, or GRANTS after SHOW");
     std::unique_ptr<ASTNode> stmt;
     if (t.value == "TABLES") {
         stmt = std::make_unique<ShowTablesStatement>();
     } else if (t.value == "DATABASES") {
         stmt = std::make_unique<ShowDatabasesStatement>();
+    } else if (t.value == "USERS") {
+        stmt = std::make_unique<ShowUsersStatement>();
+    } else if (t.value == "GRANTS") {
+        auto s = std::make_unique<ShowGrantsStatement>();
+        /* optional user_id — if next token is a number, consume it */
+        if (current_token_idx < (int)tokens.size()
+                && tokens[current_token_idx].type == TokenType::NUMBER) {
+            s->user_id = (uint32_t)std::stoul(tokens[current_token_idx].value);
+            current_token_idx++;
+        }
+        stmt = std::move(s);
     } else {
-        throw_error("Expected TABLES or DATABASES after SHOW");
+        throw_error("Expected TABLES, DATABASES, USERS, or GRANTS after SHOW");
     }
     consume(TokenType::SYMBOL, ";", "Expected ;");
     return stmt;
