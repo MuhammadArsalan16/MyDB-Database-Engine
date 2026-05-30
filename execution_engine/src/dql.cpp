@@ -15,6 +15,7 @@
 #include "value_cast.hpp"
 #include "expr_eval.hpp"
 #include "planner.h"    /* planner_choose_path, Sarg, PlanNode — extern "C" guards inside */
+#include "exec_access_path.hpp" /* AccessPath, AP_*, extract_sargs, plan_to_ap — shared with dml.cpp */
 
 #include <algorithm>
 #include <map>
@@ -22,87 +23,8 @@
 #include <cstring>
 #include <cstdio>
 
-/* ======================================================================
- * validate_expr_cols
- *
- * Walk an Expr tree and verify every ColumnRef names a real column in rel.
- * Returns NULL on success, or a pointer to the offending column name string.
- * The pointer is stable for the lifetime of the AST (c_str() of a
- * std::string owned by the Expr node).
- * ====================================================================== */
-
-static const char *validate_expr_cols(const Expr *e, const RelationDef *rel)
-{
-    if (!e) return NULL;
-
-    switch (e->kind) {
-
-    case Expr::Kind::ColumnRef: {
-        const ColumnRefExpr *cr = static_cast<const ColumnRefExpr *>(e);
-        if (resolve_col(rel, cr->column) < 0)
-            return cr->column.c_str();
-        return NULL;
-    }
-
-    case Expr::Kind::Binary: {
-        const BinaryExpr *b = static_cast<const BinaryExpr *>(e);
-        const char *op = b->op.c_str();
-
-        if (strcmp(op, "AND") == 0 || strcmp(op, "OR") == 0) {
-            const char *bad = validate_expr_cols(b->lhs.get(), rel);
-            if (bad) return bad;
-            return validate_expr_cols(b->rhs.get(), rel);
-        }
-
-        /* Comparison: if either side is a known column the other side is
-         * in value position — skip column check, value validation handles it. */
-        bool lhs_known = b->lhs && b->lhs->kind == Expr::Kind::ColumnRef
-                      && resolve_col(rel,
-                             static_cast<const ColumnRefExpr *>(
-                                 b->lhs.get())->column) >= 0;
-        bool rhs_known = b->rhs && b->rhs->kind == Expr::Kind::ColumnRef
-                      && resolve_col(rel,
-                             static_cast<const ColumnRefExpr *>(
-                                 b->rhs.get())->column) >= 0;
-
-        if (lhs_known || rhs_known) return NULL;
-
-        const char *bad = validate_expr_cols(b->lhs.get(), rel);
-        if (bad) return bad;
-        return validate_expr_cols(b->rhs.get(), rel);
-    }
-
-    case Expr::Kind::Unary: {
-        const UnaryExpr *u = static_cast<const UnaryExpr *>(e);
-        return validate_expr_cols(u->child.get(), rel);
-    }
-
-    case Expr::Kind::IsNull: {
-        const IsNullExpr *isn = static_cast<const IsNullExpr *>(e);
-        return validate_expr_cols(isn->child.get(), rel);
-    }
-
-    case Expr::Kind::Between: {
-        const BetweenExpr *bw = static_cast<const BetweenExpr *>(e);
-        const char *bad = validate_expr_cols(bw->v.get(),  rel); if (bad) return bad;
-                    bad = validate_expr_cols(bw->lo.get(), rel); if (bad) return bad;
-        return validate_expr_cols(bw->hi.get(), rel);
-    }
-
-    case Expr::Kind::In: {
-        const InExpr *in = static_cast<const InExpr *>(e);
-        return validate_expr_cols(in->v.get(), rel);
-    }
-
-    case Expr::Kind::Like: {
-        const LikeExpr *lk = static_cast<const LikeExpr *>(e);
-        return validate_expr_cols(lk->v.get(), rel);
-    }
-
-    default:
-        return NULL;
-    }
-}
+/* validate_expr_cols
+ * → moved to exec_access_path.hpp (shared with dml.cpp) */
 
 /* ======================================================================
  * Access-path selection
@@ -114,17 +36,6 @@ static const char *validate_expr_cols(const Expr *e, const RelationDef *rel)
  *   anything else                 → AP_SCAN (full scan + filter)
  * ====================================================================== */
 
-#define AP_SCAN           0
-#define AP_SCAN_FROM      1
-#define AP_GET_PK         2
-#define AP_GET_INDEX      3
-#define AP_SCAN_BY_INDEX  4   /* storage_scan_by_index — secondary range scan */
-
-struct AccessPath {
-    int   kind;
-    Value key;
-    int   col_idx;
-};
 
 static AccessPath pick_access_path(const WhereClause *w,
                                    const RelationDef  *rel)
@@ -189,352 +100,11 @@ static AccessPath pick_access_path(const WhereClause *w,
     return ap;
 }
 
-/* ======================================================================
- * Sarg extraction — Step 6
- *
- * Walk the WHERE expression tree and collect sargable predicates into a
- * flat Sarg[] array that the planner can consume.
- *
- * Rules:
- *   AND nodes  — recurse into both children (conjunctive predicates are
- *                individually safe to use as access predicates).
- *   OR nodes   — skipped (disjunctive predicates require union costing;
- *                the WHERE filter will handle them at scan time).
- *   BinaryExpr — sargable when one side is a ColumnRef and the other is
- *                a Literal, and the operator is =, !=, <, <=, >, >=.
- *   BetweenExpr — sargable (not-negated) when v is ColumnRef, lo/hi Literal.
- *   IsNullExpr  — always sargable on the child ColumnRef.
- * ====================================================================== */
+/* extract_sargs, literal_to_i64, extract_sargs_from_expr
+ * → moved to exec_access_path.hpp (shared with dml.cpp) */
 
-/* Encode a literal string as int64 using the same scheme as ColumnStats:
- *   INT      → (int64_t)int_val
- *   DECIMAL  → decimal_val (scaled int)
- *   DATE     → (int64_t)date_val
- *   DATETIME → datetime_val
- *   BOOL     → (int64_t)bool_val
- *   ENUM     → (int64_t)enum_val
- *   VARCHAR  → 0  (not range-comparable; planner uses sarg op, not value)
- */
-static int64_t literal_to_i64(const LiteralExpr *lit, const ColumnDef &cd)
-{
-    Value v = cast_literal(lit->raw, cd);
-    if (v.is_null) return 0;
-    switch (cd.type) {
-    case TYPE_INT:      return (int64_t)v.v.int_val;
-    case TYPE_DECIMAL:  return v.v.decimal_val;
-    case TYPE_DATE:     return (int64_t)v.v.date_val;
-    case TYPE_DATETIME: return v.v.datetime_val;
-    case TYPE_BOOL:     return (int64_t)v.v.bool_val;
-    case TYPE_ENUM:     return (int64_t)v.v.enum_val;
-    default:            return 0;
-    }
-}
-
-static void extract_sargs_from_expr(const Expr *e,
-                                     const RelationDef *rel,
-                                     Sarg *sargs, int *n, int cap)
-{
-    if (!e || *n >= cap) return;
-
-    switch (e->kind) {
-
-    case Expr::Kind::Binary: {
-        const BinaryExpr *b  = static_cast<const BinaryExpr *>(e);
-        const char       *op = b->op.c_str();
-
-        /* AND: both branches can contribute sargs independently */
-        if (strcmp(op, "AND") == 0) {
-            extract_sargs_from_expr(b->lhs.get(), rel, sargs, n, cap);
-            extract_sargs_from_expr(b->rhs.get(), rel, sargs, n, cap);
-            return;
-        }
-
-        /* Accept only comparison operators */
-        if (strcmp(op,"=")  != 0 && strcmp(op,"!=") != 0 &&
-            strcmp(op,"<")  != 0 && strcmp(op,"<=") != 0 &&
-            strcmp(op,">")  != 0 && strcmp(op,">=") != 0) return;
-
-        /* Normalise to  col op lit  (flip asymmetric ops if literal is lhs) */
-        const Expr *col_e = nullptr, *lit_e = nullptr;
-        const char *eff_op = op;
-
-        if (b->lhs && b->lhs->kind == Expr::Kind::ColumnRef &&
-            b->rhs && b->rhs->kind == Expr::Kind::Literal) {
-            col_e = b->lhs.get();  lit_e = b->rhs.get();
-        } else if (b->rhs && b->rhs->kind == Expr::Kind::ColumnRef &&
-                   b->lhs && b->lhs->kind == Expr::Kind::Literal) {
-            col_e = b->rhs.get();  lit_e = b->lhs.get();
-            if      (strcmp(op,"<")  == 0) eff_op = ">";
-            else if (strcmp(op,"<=") == 0) eff_op = ">=";
-            else if (strcmp(op,">")  == 0) eff_op = "<";
-            else if (strcmp(op,">=") == 0) eff_op = "<=";
-        }
-        if (!col_e || !lit_e) return;
-
-        const ColumnRefExpr *cr  = static_cast<const ColumnRefExpr *>(col_e);
-        const LiteralExpr   *lit = static_cast<const LiteralExpr   *>(lit_e);
-        int ci = resolve_col(rel, cr->column);
-        if (ci < 0) return;
-
-        Sarg &s = sargs[(*n)++];
-        s.col_idx = ci;
-        strncpy(s.op, eff_op, sizeof(s.op) - 1);
-        s.op[sizeof(s.op) - 1] = '\0';
-        s.lo = literal_to_i64(lit, rel->columns[ci]);
-        s.hi = s.lo;
-        break;
-    }
-
-    case Expr::Kind::Between: {
-        const BetweenExpr *bw = static_cast<const BetweenExpr *>(e);
-        if (bw->negated) return;   /* NOT BETWEEN: leave for WHERE filter */
-        if (!bw->v  || bw->v->kind  != Expr::Kind::ColumnRef) return;
-        if (!bw->lo || bw->lo->kind != Expr::Kind::Literal)   return;
-        if (!bw->hi || bw->hi->kind != Expr::Kind::Literal)   return;
-
-        const ColumnRefExpr *cr = static_cast<const ColumnRefExpr *>(bw->v.get());
-        int ci = resolve_col(rel, cr->column);
-        if (ci < 0) return;
-
-        const ColumnDef   &cd  = rel->columns[ci];
-        const LiteralExpr *lo  = static_cast<const LiteralExpr *>(bw->lo.get());
-        const LiteralExpr *hi  = static_cast<const LiteralExpr *>(bw->hi.get());
-
-        Sarg &s = sargs[(*n)++];
-        s.col_idx = ci;
-        strncpy(s.op, "BETWEEN", sizeof(s.op) - 1);
-        s.op[sizeof(s.op) - 1] = '\0';
-        s.lo = literal_to_i64(lo, cd);
-        s.hi = literal_to_i64(hi, cd);
-        break;
-    }
-
-    case Expr::Kind::IsNull: {
-        const IsNullExpr *isn = static_cast<const IsNullExpr *>(e);
-        if (!isn->child || isn->child->kind != Expr::Kind::ColumnRef) return;
-        const ColumnRefExpr *cr = static_cast<const ColumnRefExpr *>(isn->child.get());
-        int ci = resolve_col(rel, cr->column);
-        if (ci < 0) return;
-
-        Sarg &s = sargs[(*n)++];
-        s.col_idx = ci;
-        strncpy(s.op, isn->negated ? "IS_NOT_NULL" : "IS_NULL", sizeof(s.op) - 1);
-        s.op[sizeof(s.op) - 1] = '\0';
-        s.lo = s.hi = 0;
-        break;
-    }
-
-    default:
-        break;
-    }
-}
-
-/* Collect all sargable predicates from a WhereClause into sargs[0..cap-1].
- * Returns the number of sargs written. */
-static int extract_sargs(const WhereClause *w, const RelationDef *rel,
-                          Sarg *sargs, int cap)
-{
-    int n = 0;
-    if (w && w->root)
-        extract_sargs_from_expr(w->root.get(), rel, sargs, &n, cap);
-    return n;
-}
-
-/* ======================================================================
- * Key extraction helpers — used by plan_to_ap to reconstruct storage
- * Values from the WHERE tree after the planner has chosen a path type.
- * ====================================================================== */
-
-/* Scan an AND-tree for the first (col_idx = literal) predicate.
- * Returns true and writes *out on success. */
-static bool find_eq_value(const Expr *e, const RelationDef *rel,
-                           int col_idx, Value *out)
-{
-    if (!e) return false;
-
-    if (e->kind == Expr::Kind::Binary) {
-        const BinaryExpr *b = static_cast<const BinaryExpr *>(e);
-        if (strcmp(b->op.c_str(), "AND") == 0)
-            return find_eq_value(b->lhs.get(), rel, col_idx, out) ||
-                   find_eq_value(b->rhs.get(), rel, col_idx, out);
-
-        if (strcmp(b->op.c_str(), "=") != 0) return false;
-
-        const Expr *col_e = nullptr, *lit_e = nullptr;
-        if (b->lhs && b->lhs->kind == Expr::Kind::ColumnRef &&
-            b->rhs && b->rhs->kind == Expr::Kind::Literal) {
-            col_e = b->lhs.get();  lit_e = b->rhs.get();
-        } else if (b->rhs && b->rhs->kind == Expr::Kind::ColumnRef &&
-                   b->lhs && b->lhs->kind == Expr::Kind::Literal) {
-            col_e = b->rhs.get();  lit_e = b->lhs.get();
-        }
-        if (!col_e || !lit_e) return false;
-
-        const ColumnRefExpr *cr  = static_cast<const ColumnRefExpr *>(col_e);
-        const LiteralExpr   *lit = static_cast<const LiteralExpr   *>(lit_e);
-        if (resolve_col(rel, cr->column) != col_idx) return false;
-
-        *out = cast_literal(lit->raw, rel->columns[col_idx]);
-        return true;
-    }
-    return false;
-}
-
-/* Scan an AND-tree for the tightest lower bound on col_idx.
- * Handles >=, >, and BETWEEN.lo.  When multiple lower bounds exist on
- * the same column, the highest one wins (tightest range → fewest rows).
- * Returns true if at least one lower-bound predicate was found. */
-static bool find_range_lo(const Expr *e, const RelationDef *rel,
-                           int col_idx, Value *out)
-{
-    if (!e) return false;
-
-    if (e->kind == Expr::Kind::Binary) {
-        const BinaryExpr *b  = static_cast<const BinaryExpr *>(e);
-        const char       *op = b->op.c_str();
-
-        if (strcmp(op, "AND") == 0) {
-            Value lo1, lo2;
-            memset(&lo1, 0, sizeof(lo1));
-            memset(&lo2, 0, sizeof(lo2));
-            bool g1 = find_range_lo(b->lhs.get(), rel, col_idx, &lo1);
-            bool g2 = find_range_lo(b->rhs.get(), rel, col_idx, &lo2);
-            if (g1 && g2) {
-                /* take the higher of the two lower bounds */
-                *out = (compare_values(&lo1, &lo2) >= 0) ? lo1 : lo2;
-                return true;
-            }
-            if (g1) { *out = lo1; return true; }
-            if (g2) { *out = lo2; return true; }
-            return false;
-        }
-
-        /* col >= lit  or  col > lit */
-        if ((strcmp(op, ">=") == 0 || strcmp(op, ">") == 0) &&
-            b->lhs && b->lhs->kind == Expr::Kind::ColumnRef &&
-            b->rhs && b->rhs->kind == Expr::Kind::Literal) {
-            const ColumnRefExpr *cr  = static_cast<const ColumnRefExpr *>(b->lhs.get());
-            const LiteralExpr   *lit = static_cast<const LiteralExpr   *>(b->rhs.get());
-            if (resolve_col(rel, cr->column) != col_idx) return false;
-            *out = cast_literal(lit->raw, rel->columns[col_idx]);
-            return true;
-        }
-
-        /* lit <= col  or  lit < col  (literal on the left) */
-        if ((strcmp(op, "<=") == 0 || strcmp(op, "<") == 0) &&
-            b->rhs && b->rhs->kind == Expr::Kind::ColumnRef &&
-            b->lhs && b->lhs->kind == Expr::Kind::Literal) {
-            const ColumnRefExpr *cr  = static_cast<const ColumnRefExpr *>(b->rhs.get());
-            const LiteralExpr   *lit = static_cast<const LiteralExpr   *>(b->lhs.get());
-            if (resolve_col(rel, cr->column) != col_idx) return false;
-            *out = cast_literal(lit->raw, rel->columns[col_idx]);
-            return true;
-        }
-
-        return false;
-    }
-
-    /* BETWEEN v AND lo AND hi → lo is the lower bound */
-    if (e->kind == Expr::Kind::Between) {
-        const BetweenExpr *bw = static_cast<const BetweenExpr *>(e);
-        if (!bw->v || bw->v->kind != Expr::Kind::ColumnRef) return false;
-        const ColumnRefExpr *cr = static_cast<const ColumnRefExpr *>(bw->v.get());
-        if (resolve_col(rel, cr->column) != col_idx) return false;
-        if (!bw->lo || bw->lo->kind != Expr::Kind::Literal) return false;
-        const LiteralExpr *lit = static_cast<const LiteralExpr *>(bw->lo.get());
-        *out = cast_literal(lit->raw, rel->columns[col_idx]);
-        return true;
-    }
-
-    return false;
-}
-
-/* ======================================================================
- * plan_to_ap — Step 7 bridge
- *
- * Translate the planner's PlanNode (path type + cost metadata) into the
- * concrete AccessPath struct the scan loops consume.
- *
- * Point lookups (PK_LOOKUP, INDEX_LOOKUP): key extracted by re-scanning
- * the WHERE tree via find_eq_value — works for any column type including
- * VARCHAR since cast_literal is called with the raw literal string.
- *
- * Range scan (PK_RANGE): lower bound extracted via find_range_lo; if
- * only an upper-bound predicate exists, AP_SCAN is returned so the WHERE
- * filter applies the bound at evaluation time.
- *
- * INDEX_RANGE → AP_SCAN: Phase 1 storage API has no secondary-index range
- * cursor; the full scan + WHERE filter is the correct fallback.
- * ====================================================================== */
-static AccessPath plan_to_ap(const PlanNode    &plan,
-                              const WhereClause *where,
-                              const RelationDef *rel)
-{
-    AccessPath ap;
-    memset(&ap, 0, sizeof(ap));
-    ap.kind = AP_SCAN;   /* default: full scan */
-
-    const Expr *root = (where) ? where->root.get() : nullptr;
-
-    switch (plan.path) {
-
-    case ACCESS_FULL_SCAN:
-        /* already AP_SCAN */
-        break;
-
-    case ACCESS_PK_LOOKUP: {
-        Value key;
-        memset(&key, 0, sizeof(key));
-        if (root && find_eq_value(root, rel, (int)rel->pk_col_idx, &key)) {
-            ap.kind = AP_GET_PK;
-            ap.key  = key;
-        }
-        break;
-    }
-
-    case ACCESS_PK_RANGE: {
-        /* Use scan_from(lo) when a lower bound exists.  An upper-bound-only
-         * predicate (e.g. WHERE pk < 100) falls back to AP_SCAN and the
-         * WHERE filter stops the scan when the bound is exceeded. */
-        Value lo_key;
-        memset(&lo_key, 0, sizeof(lo_key));
-        if (root && find_range_lo(root, rel, (int)rel->pk_col_idx, &lo_key)) {
-            ap.kind = AP_SCAN_FROM;
-            ap.key  = lo_key;
-        }
-        break;
-    }
-
-    case ACCESS_INDEX_LOOKUP: {
-        Value key;
-        memset(&key, 0, sizeof(key));
-        if (root && find_eq_value(root, rel, plan.index_col_idx, &key)) {
-            ap.kind    = AP_GET_INDEX;
-            ap.col_idx = plan.index_col_idx;
-            ap.key     = key;
-        }
-        break;
-    }
-
-    case ACCESS_INDEX_RANGE: {
-        /* Use storage_scan_by_index(lo) when a lower bound exists on the
-         * indexed column.  Upper-bound-only predicates (e.g. col < 100)
-         * fall back to AP_SCAN — the WHERE filter handles the bound during
-         * the full scan. */
-        Value lo_key;
-        memset(&lo_key, 0, sizeof(lo_key));
-        if (root && find_range_lo(root, rel, plan.index_col_idx, &lo_key)) {
-            ap.kind    = AP_SCAN_BY_INDEX;
-            ap.col_idx = plan.index_col_idx;
-            ap.key     = lo_key;
-        }
-        /* else: stays AP_SCAN */
-        break;
-    }
-    }
-
-    return ap;
-}
+/* find_eq_value, find_range_lo, plan_to_ap
+ * → moved to exec_access_path.hpp (shared with dml.cpp) */
 
 /* ======================================================================
  * Design 3 row-building helpers
@@ -1149,9 +719,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
             validate_expr_cols(s->where_clause->root.get(), rel);
         if (bad) {
             snprintf(out, cap,
-                     "  Error: '%s' is not a column in '%s'"
-                     " (if this is a value, quote it or check spelling"
-                     " — keywords like TRUE/FALSE/NULL are case-sensitive)",
+                     "ERROR: column '%s' does not exist in table '%s'",
                      bad, s->table_name.c_str());
             return MYDB_ERR;
         }
@@ -1170,28 +738,13 @@ int exec_select(EngineState *eng, const SelectStatement *s,
     }
 
     /* ------------------------------------------------------------------
-     * Step 3c: literal type compatibility — reject values that cannot be
-     * cast to the target column type (e.g. 'user10' vs INT column).
-     * Without this, strtol("user10") silently produces 0 and the query
-     * returns wrong rows instead of an error.
-     * ------------------------------------------------------------------ */
-    {
-        const char *type_err =
-            where_validate_literal_types(s->where_clause.get(), rel);
-        if (type_err) {
-            snprintf(out, cap, "  Error: %s", type_err);
-            return MYDB_ERR;
-        }
-    }
-
-    /* ------------------------------------------------------------------
      * Step 4: validate ORDER BY columns (non-aggregate queries only).
      * ------------------------------------------------------------------ */
     if (!has_agg) {
         for (const auto &item : s->order_by) {
             if (resolve_col(rel, item.column) < 0) {
                 snprintf(out, cap,
-                         "  Error: column '%s' does not exist in table '%s'",
+                         "ERROR: column '%s' does not exist in table '%s'",
                          item.column.c_str(), s->table_name.c_str());
                 return MYDB_ERR;
             }
@@ -1207,7 +760,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
             if (item.column == "*") continue;   /* COUNT(*) — no column */
             if (resolve_col(rel, item.column) < 0) {
                 snprintf(out, cap,
-                         "  Error: column '%s' does not exist in table '%s'",
+                         "ERROR: column '%s' does not exist in table '%s'",
                          item.column.c_str(), s->table_name.c_str());
                 return MYDB_ERR;
             }
@@ -1229,7 +782,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
         for (const auto &col_name : s->group_by) {
             if (resolve_col(rel, col_name) < 0) {
                 snprintf(out, cap,
-                         "  Error: column '%s' does not exist in table '%s'",
+                         "ERROR: column '%s' does not exist in table '%s'",
                          col_name.c_str(), s->table_name.c_str());
                 return MYDB_ERR;
             }
@@ -1256,7 +809,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
             const char *bad = validate_expr_cols(s->having.get(), rel);
             if (bad) {
                 snprintf(out, cap,
-                         "  Error: column '%s' does not exist in table '%s'",
+                         "ERROR: column '%s' does not exist in table '%s'",
                          bad, s->table_name.c_str());
                 return MYDB_ERR;
             }

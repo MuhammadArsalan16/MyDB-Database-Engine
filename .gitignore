@@ -33,3 +33,4 @@ compile_commands.json
 
 # ── Query parser binary ────────────────────────────────────────────────
 query_parser/mydb
+memory/
