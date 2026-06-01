@@ -655,7 +655,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
     /* ------------------------------------------------------------------
      * Defer unimplemented sub-phases gracefully.
      * ------------------------------------------------------------------ */
-    if (s->join_clause) {
+    if (!s->join_list.empty() || s->from_list.size() > 1) {
         snprintf(out, cap, "  Error: JOIN is not yet implemented");
         return MYDB_ERR;
     }
@@ -683,14 +683,14 @@ int exec_select(EngineState *eng, const SelectStatement *s,
      * ------------------------------------------------------------------ */
     int rc = engine_check_access(eng, 0);
     if (rc != MYDB_OK) {
-        format_error(rc, out, cap, s->table_name.c_str());
+        format_error(rc, out, cap, s->from_list[0].table_name.c_str());
         return rc;
     }
 
-    const RelationDef *rel = engine_find_relation(eng, s->table_name.c_str());
+    const RelationDef *rel = engine_find_relation(eng, s->from_list[0].table_name.c_str());
     if (!rel) {
         snprintf(out, cap, "  Error: table '%s' does not exist",
-                 s->table_name.c_str());
+                 s->from_list[0].table_name.c_str());
         return MYDB_ERR_NOT_FOUND;
     }
     RelationDef *rel_rw = (RelationDef *)rel;   /* storage API takes non-const */
@@ -704,7 +704,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
                 if (resolve_col(rel, item.column) < 0) {
                     snprintf(out, cap,
                              "  Error: column '%s' does not exist in table '%s'",
-                             item.column.c_str(), s->table_name.c_str());
+                             item.column.c_str(), s->from_list[0].table_name.c_str());
                     return MYDB_ERR;
                 }
             }
@@ -720,7 +720,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
         if (bad) {
             snprintf(out, cap,
                      "ERROR: column '%s' does not exist in table '%s'",
-                     bad, s->table_name.c_str());
+                     bad, s->from_list[0].table_name.c_str());
             return MYDB_ERR;
         }
     }
@@ -745,7 +745,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
             if (resolve_col(rel, item.column) < 0) {
                 snprintf(out, cap,
                          "ERROR: column '%s' does not exist in table '%s'",
-                         item.column.c_str(), s->table_name.c_str());
+                         item.column.c_str(), s->from_list[0].table_name.c_str());
                 return MYDB_ERR;
             }
         }
@@ -761,7 +761,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
             if (resolve_col(rel, item.column) < 0) {
                 snprintf(out, cap,
                          "ERROR: column '%s' does not exist in table '%s'",
-                         item.column.c_str(), s->table_name.c_str());
+                         item.column.c_str(), s->from_list[0].table_name.c_str());
                 return MYDB_ERR;
             }
         }
@@ -783,7 +783,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
             if (resolve_col(rel, col_name) < 0) {
                 snprintf(out, cap,
                          "ERROR: column '%s' does not exist in table '%s'",
-                         col_name.c_str(), s->table_name.c_str());
+                         col_name.c_str(), s->from_list[0].table_name.c_str());
                 return MYDB_ERR;
             }
         }
@@ -810,7 +810,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
             if (bad) {
                 snprintf(out, cap,
                          "ERROR: column '%s' does not exist in table '%s'",
-                         bad, s->table_name.c_str());
+                         bad, s->from_list[0].table_name.c_str());
                 return MYDB_ERR;
             }
         }

@@ -1,5 +1,7 @@
 #include "../include/Parser.hpp"
 #include <iostream>
+#include <unordered_set>
+#include <algorithm>
 
 Parser::Parser(std::vector<Token> tokens) : tokens(std::move(tokens)) {}
 
@@ -52,6 +54,44 @@ std::string Parser::parse_qualified_ident() {
         ident += "." + t2.value;
     }
     return ident;
+}
+
+/* Keywords that must never appear as table or object names.
+ * Non-reserved keywords (TABLE, USER, USERS, INDEX, etc.) are intentionally
+ * absent so they can be used as identifiers. */
+static const std::unordered_set<std::string> RESERVED_KEYWORDS = {
+    /* statement starters */
+    "SELECT","INSERT","UPDATE","DELETE","CREATE","DROP","ALTER",
+    "USE","SHOW","ANALYZE","DESCRIBE","DISCONNECT",
+    "BEGIN","COMMIT","ROLLBACK",
+    /* clause boundaries */
+    "FROM","WHERE","JOIN","INNER","LEFT","RIGHT","FULL","OUTER","ON",
+    "INTO","VALUES","SET","BY","HAVING","DISTINCT",
+    /* operators / predicates */
+    "AND","OR","NOT","IS","IN","BETWEEN","LIKE","AS",
+    /* value literals */
+    "NULL","TRUE","FALSE",
+    /* constraint / column modifiers */
+    "UNIQUE","REFERENCES","INDEXED","AUTO_INCREMENT","AUTOINCR",
+    "CASCADE","RESTRICT","IDENTIFIED",
+    /* data types */
+    "INT","INTEGER","DECIMAL","VARCHAR","ENUM","BOOL","BOOLEAN","DATE","DATETIME",
+    /* aggregate functions */
+    "COUNT","SUM","AVG","MIN","MAX",
+};
+
+std::string Parser::parse_bare_name(const std::string& context) {
+    Token t = advance();
+    if (t.type == TokenType::IDENTIFIER) return t.value;
+    if (t.type == TokenType::KEYWORD) {
+        if (RESERVED_KEYWORDS.count(t.value))
+            throw_error("'" + t.value + "' is a reserved keyword and cannot be used as an identifier");
+        /* keywords are uppercased by the lexer; lowercase them back when used as identifiers */
+        std::string name = t.value;
+        std::transform(name.begin(), name.end(), name.begin(), ::tolower);
+        return name;
+    }
+    throw_error(context);
 }
 
 // --- Main Parsing Dispatcher ---
@@ -152,62 +192,69 @@ std::unique_ptr<SelectStatement> Parser::parse_select() {
 
     consume(TokenType::KEYWORD, "FROM", "Expected 'FROM' after column list.");
 
-    // Parse Table Name
-    Token table_token = advance();
-    if (table_token.type != TokenType::IDENTIFIER) throw_error("Expected table name.");
-    stmt->table_name = table_token.value;
+    // Helper: consume an optional table alias ("AS ident" or bare "ident")
+    auto parse_table_alias = [&]() -> std::string {
+        if (match(TokenType::KEYWORD, "AS")) return advance().value;
+        if (peek().type == TokenType::IDENTIFIER) return advance().value;
+        return "";
+    };
 
-    // --- NEW: Parse Optional JOIN Clause ---
-// --- FULL JOIN PARSING LOGIC ---
-    bool has_join = false;
-    JoinType j_type = JoinType::INNER;
+    // Parse one or more comma-separated FROM tables (implicit join)
+    do {
+        FromItem fi;
+        fi.table_name = parse_bare_name("Expected table name after FROM.");
+        fi.alias      = parse_table_alias();
+        stmt->from_list.push_back(std::move(fi));
+    } while (match(TokenType::SYMBOL, ","));
 
-    if (match(TokenType::KEYWORD, "LEFT")) {
-        match(TokenType::KEYWORD, "OUTER"); // 'OUTER' is optional in SQL, so we just match and ignore
-        consume(TokenType::KEYWORD, "JOIN", "Expected 'JOIN' after 'LEFT'.");
-        j_type = JoinType::LEFT;
-        has_join = true;
-    } else if (match(TokenType::KEYWORD, "RIGHT")) {
-        match(TokenType::KEYWORD, "OUTER");
-        consume(TokenType::KEYWORD, "JOIN", "Expected 'JOIN' after 'RIGHT'.");
-        j_type = JoinType::RIGHT;
-        has_join = true;
-    } else if (match(TokenType::KEYWORD, "FULL")) {
-        match(TokenType::KEYWORD, "OUTER");
-        consume(TokenType::KEYWORD, "JOIN", "Expected 'JOIN' after 'FULL'.");
-        j_type = JoinType::FULL;
-        has_join = true;
-    } else if (match(TokenType::KEYWORD, "INNER")) {
-        consume(TokenType::KEYWORD, "JOIN", "Expected 'JOIN' after 'INNER'.");
-        j_type = JoinType::INNER;
-        has_join = true;
-    } else if (match(TokenType::KEYWORD, "JOIN")) {
-        j_type = JoinType::INNER; // Standard JOIN is an INNER JOIN
-        has_join = true;
-    }
+    // Parse zero or more explicit JOINs
+    auto is_join_start = [&]() -> bool {
+        if (peek().type != TokenType::KEYWORD) return false;
+        const std::string &v = peek().value;
+        return v == "LEFT" || v == "RIGHT" || v == "FULL" ||
+               v == "INNER" || v == "JOIN";
+    };
 
-    if (has_join) {
-        stmt->join_clause = std::make_unique<JoinClause>();
-        stmt->join_clause->join_type = j_type;
-        
-        Token join_table_token = advance();
-        if (join_table_token.type != TokenType::IDENTIFIER) throw_error("Expected table name after JOIN.");
-        stmt->join_clause->join_table = join_table_token.value;
-consume(TokenType::KEYWORD, "ON", "Expected 'ON' after JOIN table name.");
-        
-        std::string left_cond = parse_qualified_ident();
-        if (left_cond.find('.') == std::string::npos) {
-            throw_error("Left side of ON condition must be in 'table.column' format (e.g., users.id).");
+    while (is_join_start()) {
+        JoinClause jc;
+        if (match(TokenType::KEYWORD, "LEFT")) {
+            match(TokenType::KEYWORD, "OUTER");
+            consume(TokenType::KEYWORD, "JOIN", "Expected 'JOIN' after 'LEFT'.");
+            jc.join_type = JoinType::LEFT;
+        } else if (match(TokenType::KEYWORD, "RIGHT")) {
+            match(TokenType::KEYWORD, "OUTER");
+            consume(TokenType::KEYWORD, "JOIN", "Expected 'JOIN' after 'RIGHT'.");
+            jc.join_type = JoinType::RIGHT;
+        } else if (match(TokenType::KEYWORD, "FULL")) {
+            match(TokenType::KEYWORD, "OUTER");
+            consume(TokenType::KEYWORD, "JOIN", "Expected 'JOIN' after 'FULL'.");
+            jc.join_type = JoinType::FULL;
+        } else if (match(TokenType::KEYWORD, "INNER")) {
+            consume(TokenType::KEYWORD, "JOIN", "Expected 'JOIN' after 'INNER'.");
+            jc.join_type = JoinType::INNER;
+        } else {
+            match(TokenType::KEYWORD, "JOIN");
+            jc.join_type = JoinType::INNER;
         }
-        stmt->join_clause->left_condition = left_cond;
+
+        jc.join_table       = parse_bare_name("Expected table name after JOIN.");
+        jc.join_table_alias = parse_table_alias();
+
+        consume(TokenType::KEYWORD, "ON", "Expected 'ON' after JOIN table name.");
+
+        std::string lhs = parse_qualified_ident();
+        if (lhs.find('.') == std::string::npos)
+            throw_error("Left side of ON condition must be in 'table.column' format.");
+        jc.left_condition = lhs;
 
         consume(TokenType::OPERATOR, "=", "Expected '=' in JOIN condition.");
-        
-        std::string right_cond = parse_qualified_ident();
-        if (right_cond.find('.') == std::string::npos) {
-            throw_error("Right side of ON condition must be in 'table.column' format (e.g., orders.user_id).");
-        }
-        stmt->join_clause->right_condition = right_cond;
+
+        std::string rhs = parse_qualified_ident();
+        if (rhs.find('.') == std::string::npos)
+            throw_error("Right side of ON condition must be in 'table.column' format.");
+        jc.right_condition = rhs;
+
+        stmt->join_list.push_back(std::move(jc));
     }
 
     // Parse Optional WHERE Clause
@@ -270,10 +317,7 @@ std::unique_ptr<CreateTableStatement> Parser::parse_create_table() {
 
     consume(TokenType::KEYWORD, "TABLE", "Expected 'TABLE' after 'CREATE'.");
     
-    // Parse Table Name
-    Token table_token = advance();
-    if (table_token.type != TokenType::IDENTIFIER) throw_error("Expected table name.");
-    stmt->table_name = table_token.value;
+    stmt->table_name = parse_bare_name("Expected table name.");
 
     consume(TokenType::SYMBOL, "(", "Expected '(' to define columns.");
 
@@ -480,11 +524,7 @@ std::unique_ptr<InsertStatement> Parser::parse_insert() {
     auto stmt = std::make_unique<InsertStatement>();
 
     consume(TokenType::KEYWORD, "INTO", "Expected 'INTO' after 'INSERT'.");
-    
-    // Parse Table Name
-    Token table_token = advance();
-    if (table_token.type != TokenType::IDENTIFIER) throw_error("Expected table name.");
-    stmt->table_name = table_token.value;
+    stmt->table_name = parse_bare_name("Expected table name.");
 
     // Optional columns
     if (match(TokenType::SYMBOL, "(")) {
@@ -536,9 +576,7 @@ std::unique_ptr<InsertStatement> Parser::parse_insert() {
 std::unique_ptr<UpdateStatement> Parser::parse_update() {
     auto stmt = std::make_unique<UpdateStatement>();
 
-    Token table_token = advance();
-    if (table_token.type != TokenType::IDENTIFIER) throw_error("Expected table name after UPDATE.");
-    stmt->table_name = table_token.value;
+    stmt->table_name = parse_bare_name("Expected table name after UPDATE.");
 
     consume(TokenType::KEYWORD, "SET", "Expected 'SET' keyword.");
 
@@ -570,10 +608,7 @@ std::unique_ptr<DeleteStatement> Parser::parse_delete() {
     auto stmt = std::make_unique<DeleteStatement>();
 
     consume(TokenType::KEYWORD, "FROM", "Expected 'FROM' after DELETE.");
-
-    Token table_token = advance();
-    if (table_token.type != TokenType::IDENTIFIER) throw_error("Expected table name.");
-    stmt->table_name = table_token.value;
+    stmt->table_name = parse_bare_name("Expected table name.");
 
     // Optional WHERE clause
     if (match(TokenType::KEYWORD, "WHERE")) {
@@ -779,9 +814,7 @@ std::unique_ptr<Expr> Parser::parse_term() {
 std::unique_ptr<DropTableStatement> Parser::parse_drop_table() {
     auto stmt = std::make_unique<DropTableStatement>();
     consume(TokenType::KEYWORD, "TABLE", "Expected TABLE after DROP");
-    Token t = advance();
-    if (t.type != TokenType::IDENTIFIER) throw_error("Expected table name");
-    stmt->table_name = t.value;
+    stmt->table_name = parse_bare_name("Expected table name.");
     consume(TokenType::SYMBOL, ";", "Expected ;");
     return stmt;
 }
@@ -846,10 +879,7 @@ std::unique_ptr<AnalyzeTableStatement> Parser::parse_analyze() {
     /* ANALYZE TABLE <table_name> ; */
     consume(TokenType::KEYWORD, "TABLE", "Expected TABLE after ANALYZE");
     auto stmt = std::make_unique<AnalyzeTableStatement>();
-    Token t = advance();
-    if (t.type != TokenType::IDENTIFIER)
-        throw_error("Expected table name after ANALYZE TABLE");
-    stmt->table_name = t.value;
+    stmt->table_name = parse_bare_name("Expected table name after ANALYZE TABLE.");
     consume(TokenType::SYMBOL, ";", "Expected ; after ANALYZE TABLE");
     return stmt;
 }
@@ -861,18 +891,11 @@ std::unique_ptr<CreateIndexStatement> Parser::parse_create_index() {
 
     /* Index name is optional: if the next token is the keyword ON, skip name. */
     if (!(peek().type == TokenType::KEYWORD && peek().value == "ON")) {
-        Token name_tok = advance();
-        if (name_tok.type != TokenType::IDENTIFIER)
-            throw_error("Expected index name or ON after CREATE INDEX");
-        stmt->index_name = name_tok.value;
+        stmt->index_name = parse_bare_name("Expected index name or ON after CREATE INDEX.");
     }
 
     consume(TokenType::KEYWORD, "ON", "Expected ON after index name");
-
-    Token table_tok = advance();
-    if (table_tok.type != TokenType::IDENTIFIER)
-        throw_error("Expected table name after ON");
-    stmt->table_name = table_tok.value;
+    stmt->table_name = parse_bare_name("Expected table name after ON.");
 
     consume(TokenType::SYMBOL, "(", "Expected ( after table name");
     stmt->column_name = parse_qualified_ident();
@@ -1021,11 +1044,7 @@ std::unique_ptr<ASTNode> Parser::parse_describe()
         stmt->full = true;
     }
 
-    Token t = advance();
-    if (t.type != TokenType::IDENTIFIER && t.type != TokenType::KEYWORD)
-        throw_error("Expected table name after DESCRIBE");
-
-    stmt->table_name = t.value;
+    stmt->table_name = parse_bare_name("Expected table name after DESCRIBE.");
     consume(TokenType::SYMBOL, ";", "Expected ; after DESCRIBE table_name");
     return stmt;
 }

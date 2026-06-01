@@ -25,6 +25,7 @@ private:
     [[noreturn]] void throw_error(const std::string& error_msg);
     void consume(TokenType type, const std::string& value, const std::string& error_msg);
     std::string parse_qualified_ident();
+    std::string parse_bare_name(const std::string& context);
 
     // Specific statement parsers
     std::unique_ptr<SelectStatement> parse_select();

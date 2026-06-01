@@ -44,9 +44,15 @@ struct WhereClause {
     std::unique_ptr<Expr> root;
 };
 
+struct FromItem {
+    std::string table_name;
+    std::string alias;
+};
+
 struct JoinClause {
-    JoinType join_type = JoinType::INNER; // Default
+    JoinType    join_type = JoinType::INNER;
     std::string join_table;
+    std::string join_table_alias;
     std::string left_condition;
     std::string right_condition;
 };
@@ -72,9 +78,10 @@ struct OrderByItem {
 struct SelectStatement : public ASTNode {
     std::vector<SelectItem> select_list;
     bool is_select_all = false;
-    std::string table_name;
-    
-    std::unique_ptr<JoinClause> join_clause;
+
+    std::vector<FromItem>   from_list;   /* comma-separated FROM tables (implicit join) */
+    std::vector<JoinClause> join_list;   /* explicit JOINs (zero or more) */
+
     std::unique_ptr<WhereClause> where_clause;
     std::vector<std::string> group_by;
     std::unique_ptr<Expr> having;
@@ -86,9 +93,15 @@ struct SelectStatement : public ASTNode {
 
     void print() const override {
         std::cout << "\n[AST] Action: SELECT\n";
-        std::cout << "      Table : " << table_name << "\n      Cols  : ";
+        std::cout << "      From  :";
+        for (const auto &fi : from_list) {
+            std::cout << " " << fi.table_name;
+            if (!fi.alias.empty()) std::cout << " AS " << fi.alias;
+            std::cout << ",";
+        }
+        std::cout << "\n      Cols  : ";
         if (is_select_all) std::cout << "*\n";
-        else { 
+        else {
             for (const auto& item : select_list) {
                 if (item.kind == SelectItem::Kind::Aggregate) {
                     std::cout << item.agg_func << "(" << (item.agg_distinct ? "DISTINCT " : "") << item.column << ") ";
@@ -98,19 +111,17 @@ struct SelectStatement : public ASTNode {
                 }
                 if (!item.alias.empty()) std::cout << "AS " << item.alias << " ";
             }
-            std::cout << "\n"; 
+            std::cout << "\n";
         }
-        
-        if (join_clause) {
-            std::string j_type_str = "INNER";
-            if (join_clause->join_type == JoinType::LEFT) j_type_str = "LEFT";
-            if (join_clause->join_type == JoinType::RIGHT) j_type_str = "RIGHT";
-            if (join_clause->join_type == JoinType::FULL) j_type_str = "FULL";
-
-            std::cout << "      Join  : " << j_type_str << " JOIN " << join_clause->join_table 
-                      << " ON " << join_clause->left_condition << " = " << join_clause->right_condition << "\n";
+        for (const auto &jc : join_list) {
+            std::string jt = "INNER";
+            if (jc.join_type == JoinType::LEFT)  jt = "LEFT";
+            if (jc.join_type == JoinType::RIGHT) jt = "RIGHT";
+            if (jc.join_type == JoinType::FULL)  jt = "FULL";
+            std::cout << "      Join  : " << jt << " JOIN " << jc.join_table;
+            if (!jc.join_table_alias.empty()) std::cout << " AS " << jc.join_table_alias;
+            std::cout << " ON " << jc.left_condition << " = " << jc.right_condition << "\n";
         }
-
         if (where_clause) {
             std::cout << "      Where : <expr tree>\n";
         }
