@@ -1,6 +1,5 @@
 add_library(engine STATIC
     src/database_file.c
-    src/crypto.c
     src/engine.c
     src/stats_buffer.c
 )
@@ -22,7 +21,7 @@ target_include_directories(engine PUBLIC
 # include paths transitively.
 target_link_libraries(engine PUBLIC
         storage_engine system_schema partition_manager
-        query_parser execution_engine
+        query_parser execution_engine crypto
 )
 
 target_compile_options(engine PRIVATE -Wall -Wextra -Wpedantic)

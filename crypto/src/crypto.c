@@ -139,17 +139,23 @@ void crypto_hash_password(const char *password,
     sha256(buf, SALT_LEN + pw_len, out);
 }
 
-int crypto_random_salt(uint8_t salt[SALT_LEN])
+int crypto_random_bytes(uint8_t *buf, size_t len)
 {
+    if (!buf) return MYDB_ERR;
     int fd = open("/dev/urandom", O_RDONLY);
     if (fd < 0) return MYDB_ERR;
 
     size_t got = 0;
-    while (got < SALT_LEN) {
-        ssize_t n = read(fd, salt + got, SALT_LEN - got);
+    while (got < len) {
+        ssize_t n = read(fd, buf + got, len - got);
         if (n <= 0) { close(fd); return MYDB_ERR; }
         got += (size_t)n;
     }
     close(fd);
     return MYDB_OK;
+}
+
+int crypto_random_salt(uint8_t salt[SALT_LEN])
+{
+    return crypto_random_bytes(salt, SALT_LEN);
 }

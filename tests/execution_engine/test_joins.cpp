@@ -46,7 +46,8 @@ static void rm_rf(const char *path)
 static int sql(const char *query)
 {
     memset(g_res, 0, sizeof(g_res));
-    return engine_execute_sql(&g_eng, query, g_res, sizeof(g_res));
+    /* Embedded single-session path: engine_start logged into conn slot 0. */
+    return engine_execute_sql(&g_eng, 0, query, g_res, sizeof(g_res));
 }
 
 int main(void)

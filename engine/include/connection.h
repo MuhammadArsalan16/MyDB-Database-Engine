@@ -15,14 +15,17 @@ extern "C" {
  * carries the per-session auth and schema state that was previously
  * scattered across EngineState fields.
  *
- * Phase 1: single-session, MAX_CONNECTIONS = 1.
- * Future: multi-session — increase capacity and add a mutex.
+ * Multi-session: the network server (mydb-server) accepts up to
+ * MAX_CONNECTIONS clients, each occupying one slot.  Execution is still
+ * single-threaded — the server's poll() loop runs one statement at a time
+ * (SESSION_BUSY) — so no mutex is needed yet; that arrives with concurrency.
  *
- * PartitionCtx does NOT copy these structs; it holds Connection* pointers
- * into this pool (see SubConnPool in partition_ctx.h).
+ * PartitionCtx does NOT track connections: it is connection-agnostic and
+ * shared by every connection on the same partition.  The engine owns
+ * connection→partition routing and the PartitionCtx.n_refs count.
  */
 
-#define MAX_CONNECTIONS  1   /* Phase 1 */
+#define MAX_CONNECTIONS  32   /* network sessions; bump with the server */
 
 typedef struct Connection {
     uint32_t  connection_id;

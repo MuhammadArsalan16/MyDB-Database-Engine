@@ -1,16 +1,22 @@
 #!/usr/bin/env bash
-# build.sh — configure, build, and install MyDB.
+# build.sh — configure, build, install, and (first-run) bootstrap MyDB.
 #
-# Wraps the cmake configure + build steps and symlinks the `mydb`
-# binary into ~/.local/bin so it resolves as a bare command from
-# anywhere. After this succeeds:
+# Builds the two binaries and symlinks both into ~/.local/bin so they
+# resolve as bare commands from anywhere:
 #
-#   mydb init  -u root    # bootstrap the engine (interactive)
-#   mydb start -u root    # log in and open the SQL REPL
+#   mydbd                 # the daemon (server-side engine)
+#   mydb  connect -u root # the light client REPL
+#
+# On the first build (engine not yet bootstrapped) it also runs the
+# interactive bootstrap (`mydbd init`), prompting for the root password.
+# After this succeeds:
+#
+#   mydbd                  # start the server (foreground)
+#   mydb connect -u root   # in another terminal: log in and run SQL
 #
 # Usage:
-#   ./build.sh           # incremental build + install
-#   ./build.sh --clean   # wipe build/ for a from-scratch rebuild
+#   ./build.sh           # incremental build + install (+ init on first run)
+#   ./build.sh --clean   # wipe build/ and $MYDB_HOME for a from-scratch rebuild
 
 set -euo pipefail
 
@@ -36,26 +42,46 @@ cmake -S . -B build
 echo "==> building"
 cmake --build build
 
-# Install: symlink ./build/bin/mydb into a directory on $PATH.
+# Install: symlink both binaries into a directory on $PATH.
 # ~/.local/bin is on PATH by default on Fedora and most modern distros
-# (per systemd / XDG). A symlink (not a copy) means subsequent rebuilds
-# are picked up automatically — no re-install after every change.
+# (per systemd / XDG). Symlinks (not copies) mean subsequent rebuilds are
+# picked up automatically — no re-install after every change.
 INSTALL_DIR="$HOME/.local/bin"
-INSTALL_LINK="$INSTALL_DIR/mydb"
 mkdir -p "$INSTALL_DIR"
-ln -sf "$PWD/build/bin/mydb" "$INSTALL_LINK"
-echo "==> installed: $INSTALL_LINK -> $PWD/build/bin/mydb"
+for b in mydbd mydb; do
+    ln -sf "$PWD/build/bin/$b" "$INSTALL_DIR/$b"
+    echo "==> installed: $INSTALL_DIR/$b -> $PWD/build/bin/$b"
+done
 
-# Warn if ~/.local/bin isn't on PATH so the symlink isn't a no-op.
+# Warn if ~/.local/bin isn't on PATH so the symlinks aren't a no-op.
 case ":${PATH:-}:" in
     *":$INSTALL_DIR:"*) ;;
     *)
         echo
         echo "WARNING: $INSTALL_DIR is not on \$PATH."
-        echo "  Add this to your shell rc to make 'mydb' resolve:"
+        echo "  Add this to your shell rc so 'mydbd' / 'mydb' resolve:"
         echo "    export PATH=\"\$HOME/.local/bin:\$PATH\""
         ;;
 esac
 
+# First-run bootstrap: if the engine has never been initialised, run the
+# interactive `mydbd init` now (prompts for the root password).  Skipped on
+# every later build once $MYDB_HOME/__database.mydb exists.
+MYDB_DIR="${MYDB_HOME:-$HOME/.mydb}"
+INIT_USER="${MYDB_INIT_USER:-root}"
+if [[ ! -f "$MYDB_DIR/__database.mydb" ]]; then
+    if [[ -t 0 ]]; then
+        echo
+        echo "==> engine not initialised — bootstrapping user '$INIT_USER'"
+        "$PWD/build/bin/mydbd" init -u "$INIT_USER"
+    else
+        echo
+        echo "==> engine not initialised. Run it interactively:"
+        echo "    mydbd init -u $INIT_USER"
+    fi
+fi
+
 echo
-echo "Done. Next:  mydb init -u root"
+echo "Done."
+echo "  Start the server :  mydbd"
+echo "  Connect a client :  mydb connect -u $INIT_USER"

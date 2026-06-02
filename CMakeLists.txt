@@ -16,6 +16,10 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Storage engine — stateless I/O layer (v3): BufferPool, BTree, Page,
 # DiskManager, RelationDef only.  No session state.
 add_subdirectory(storage_engine)
+# crypto — SHA-256 + salt helpers, shared by engine (login/bootstrap) and the
+# network client (challenge-response). Lifted out of engine/ when the client
+# became a second consumer. Built before engine + client.
+add_subdirectory(crypto)
 # System schema (users + privileges) — engine-level metadata, lives outside
 # any partition. Depends on storage_engine for common.h / file_header / checksum.
 add_subdirectory(system_schema)
@@ -36,7 +40,13 @@ add_subdirectory(execution_engine)
 # flow, and the bootstrap path. Pulls in crypto helpers (SHA-256 + salt).
 # Engine links query_parser + execution_engine to drive engine_execute_sql.
 add_subdirectory(engine)
-# `mydb` executable (admin subcommands like `mydb init`).
+# Server module — listener/protocol/session/auth/dispatch/event-loop library
+# (mydb_server), linked into the mydb-server binary. Built after engine.
+add_subdirectory(server)
+# Client module — socket + REPL library (mydb_client), no engine inside.
+# Built after server (it reuses server/protocol.c) and crypto.
+add_subdirectory(client)
+# `mydb-server` + `mydb-client` executables (thin mains over the libs above).
 add_subdirectory(bin)
 
 # Tests

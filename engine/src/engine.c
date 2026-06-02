@@ -68,11 +68,51 @@ static uint64_t now_yyyymmddhhmmss(void)
 }
 
 
-/* The single active session.  Phase 1 runs one connection at conns[0];
- * when the pool grows this becomes a lookup by connection id. */
+/* ====================================================================
+ *  Connection slots — the engine owns the master ConnectionPool.
+ *
+ *  A conn_id IS the slot index (0..MAX_CONNECTIONS-1); -1 means "none".
+ *  cur_conn() returns the connection whose request is currently in flight
+ *  (eng->active_conn), set by the public entry points.  Single-threaded:
+ *  exactly one request runs at a time, so one active_conn field suffices.
+ * ==================================================================== */
+
+/* Resolve a conn_id to its Connection*, or NULL if out of range / not live. */
+static Connection *conn_at(EngineState *eng, int conn_id)
+{
+    if (!eng || conn_id < 0 || conn_id >= MAX_CONNECTIONS) return NULL;
+    Connection *c = &eng->conn_pool.conns[conn_id];
+    return c->logged_in ? c : NULL;
+}
+
+/* The connection whose request is currently being served. */
 static Connection *cur_conn(EngineState *eng)
 {
-    return &eng->conn_pool.conns[0];
+    int idx = eng->active_conn;
+    if (idx < 0 || idx >= MAX_CONNECTIONS) idx = 0;   /* defensive fallback */
+    return &eng->conn_pool.conns[idx];
+}
+
+/* Claim a free connection slot.  Returns its index (the conn_id) or -1 when
+ * the pool is full.  The slot is zeroed and marked with a connection_id. */
+static int conn_alloc(EngineState *eng)
+{
+    for (int i = 0; i < MAX_CONNECTIONS; i++) {
+        Connection *c = &eng->conn_pool.conns[i];
+        if (!c->logged_in) {
+            memset(c, 0, sizeof(*c));
+            c->connection_id = (uint32_t)(i + 1);
+            return i;
+        }
+    }
+    return -1;
+}
+
+/* Release a connection slot back to the pool. */
+static void conn_free(EngineState *eng, int conn_id)
+{
+    if (conn_id < 0 || conn_id >= MAX_CONNECTIONS) return;
+    memset(&eng->conn_pool.conns[conn_id], 0, sizeof(Connection));
 }
 
 
@@ -261,6 +301,7 @@ int engine_init(const char *root_dir, EngineState *out)
     out->system_schema.privileges.fd  = -1;
     /* partitions[] already NULL from memset; loaded lazily on login / USE. */
     out->conn_pool.n_active           = 0;
+    out->active_conn                  = -1;   /* no request in flight */
 
     char db_path[256];
     if (join1(db_path, sizeof(db_path), root_dir, "__database.mydb") < 0)
@@ -315,11 +356,11 @@ int engine_close(EngineState *eng)
         if (db_close(&eng->database) != MYDB_OK) rc = MYDB_ERR;
     }
 
-    Connection *c = cur_conn(eng);
-    c->logged_in     = 0;
-    c->schema_active = 0;
-    c->partition_open = 0;
+    /* Clear every connection slot (server may have several open at shutdown). */
+    for (int i = 0; i < MAX_CONNECTIONS; i++)
+        memset(&eng->conn_pool.conns[i], 0, sizeof(Connection));
     eng->conn_pool.n_active = 0;
+    eng->active_conn        = -1;
     return rc;
 }
 
@@ -355,17 +396,70 @@ int engine_start(const char *root_dir,
  *  Login
  * ==================================================================== */
 
+/* Open a fresh session for an already-authenticated user: claim a connection
+ * slot, acquire the user's partition (if they own one), stamp last_login, and
+ * populate the slot.  On success returns MYDB_OK and writes the new conn_id
+ * (slot index) to *conn_id_out.  Shared by engine_login (plaintext, local) and
+ * engine_login_response (network challenge-response).  `u` is updated with the
+ * new last_login. */
+static int session_open(EngineState *eng, UserSlot *u,
+                        const char *username, int *conn_id_out)
+{
+    int slot = conn_alloc(eng);
+    if (slot < 0) return MYDB_ERR;      /* connection pool full */
+
+    /* Acquire the partition runtime context — only if the user owns one.
+     * Analyst accounts (no owned partition) still get a slot; their
+     * partition_open stays 0 and partition_id stays 0 until USE resolves a
+     * target partition through their privileges. */
+    uint8_t  partition_open = 0;
+    uint32_t partition_id   = 0;
+    PartitionEntry *p = db_find_by_owner(&eng->database, u->user_id);
+    if (p) {
+        if (engine_acquire_partition(eng, p->partition_id, p->path) == NULL) {
+            conn_free(eng, slot);
+            return MYDB_ERR;
+        }
+        partition_open = 1;
+        partition_id   = p->partition_id;
+    }
+
+    /* Stamp last_login on the user record (persists to disk). */
+    u->last_login = now_yyyymmddhhmmss();
+    if (users_update(&eng->system_schema.users, u) != MYDB_OK) {
+        engine_release_partition(eng, partition_id);
+        conn_free(eng, slot);
+        return MYDB_ERR;
+    }
+
+    /* Populate the session's Connection slot (connection_id set by conn_alloc). */
+    Connection *c = &eng->conn_pool.conns[slot];
+    c->user_id        = u->user_id;
+    c->partition_id   = partition_id;
+    c->partition_open = partition_open;
+    c->schema_active  = 0;
+    c->logged_in      = 1;
+    c->current_schema_name[0] = '\0';
+    strncpy(c->username, username, sizeof(c->username) - 1);
+    c->username[sizeof(c->username) - 1] = '\0';
+    eng->conn_pool.n_active++;
+
+    if (conn_id_out) *conn_id_out = slot;
+    return MYDB_OK;
+}
+
+/* Plaintext login (local / bootstrap path, e.g. engine_start + tests).  The
+ * network server uses engine_login_response instead.  On success the new
+ * session is also made the active connection so the embedded single-session
+ * caller's subsequent engine_execute_sql works. */
 int engine_login(EngineState *eng,
                  const char *username, const char *password)
 {
     if (!eng || !username || !password)         return MYDB_ERR;
-    Connection *c = cur_conn(eng);
-    if (c->logged_in)                            return MYDB_ERR;
 
     UserSlot u;
     int rc = users_find_by_name(&eng->system_schema.users, username, &u);
     if (rc != MYDB_OK) return rc;        /* MYDB_ERR_NOT_FOUND on miss */
-
     if (!u.is_active) return MYDB_ERR_PERM;
 
     /* Verify password — SHA-256(salt || password). */
@@ -374,41 +468,84 @@ int engine_login(EngineState *eng,
     if (memcmp(computed, u.password_hash, SHA256_DIGEST_LEN) != 0)
         return MYDB_ERR_PERM;
 
-    /* Acquire the partition runtime context — only if the user owns one.
-     * Users without a partition (analyst accounts) can still log in; their
-     * conn->partition_open stays 0 and conn->partition_id stays 0 until
-     * USE resolves a target partition through their privileges. */
-    uint8_t  partition_open = 0;
-    uint32_t partition_id   = 0;
-    PartitionEntry *p = db_find_by_owner(&eng->database, u.user_id);
-    if (p) {
-        /* Acquire the owner's partition into the engine table (loads it via
-         * pctx_init + pctx_open_catalog and takes one reference). */
-        if (engine_acquire_partition(eng, p->partition_id, p->path) == NULL)
-            return MYDB_ERR;
-        partition_open = 1;
-        partition_id   = p->partition_id;
-    }
+    int conn_id = -1;
+    rc = session_open(eng, &u, username, &conn_id);
+    if (rc != MYDB_OK) return rc;
+    eng->active_conn = conn_id;          /* embedded path: make it current */
+    return MYDB_OK;
+}
 
-    /* Stamp last_login on the user record (persists to disk). */
-    u.last_login = now_yyyymmddhhmmss();
-    rc = users_update(&eng->system_schema.users, &u);
-    if (rc != MYDB_OK) {
-        engine_release_partition(eng, partition_id);
-        return rc;
-    }
+/* Look up a user's password salt for the network challenge-response handshake.
+ * Copies SALT_LEN bytes into salt_out.  Returns MYDB_ERR_NOT_FOUND for an
+ * unknown user (the auth handler answers with a fake salt to avoid leaking
+ * which usernames exist). */
+int engine_get_user_salt(EngineState *eng, const char *username,
+                         uint8_t salt_out[SALT_LEN])
+{
+    if (!eng || !username || !salt_out) return MYDB_ERR;
+    UserSlot u;
+    int rc = users_find_by_name(&eng->system_schema.users, username, &u);
+    if (rc != MYDB_OK) return rc;
+    memcpy(salt_out, u.password_salt, SALT_LEN);
+    return MYDB_OK;
+}
 
-    /* Populate the session's Connection slot. */
-    c->connection_id  = 1;
-    c->user_id        = u.user_id;
-    c->partition_id   = partition_id;
-    c->partition_open = partition_open;
-    c->schema_active  = 0;
-    c->logged_in      = 1;
-    c->current_schema_name[0] = '\0';
-    strncpy(c->username, username, sizeof(c->username) - 1);
-    c->username[sizeof(c->username) - 1] = '\0';
-    eng->conn_pool.n_active = 1;
+/* Network login: verify a challenge-response and open a session.
+ *
+ *   stored_hash = SHA-256(salt || password)          (already on disk)
+ *   client sends response = SHA-256(nonce || stored_hash)
+ *   we recompute the same and compare.
+ *
+ * On success writes the new conn_id (>= 0) to *conn_id_out and returns
+ * MYDB_OK.  MYDB_ERR_NOT_FOUND (unknown user) and MYDB_ERR_PERM (bad
+ * response / inactive) are both reported as auth failure by the caller. */
+int engine_login_response(EngineState *eng, const char *username,
+                          const uint8_t response[SHA256_DIGEST_LEN],
+                          const uint8_t nonce[MYDB_NONCE_LEN],
+                          int *conn_id_out)
+{
+    if (!eng || !username || !response || !nonce || !conn_id_out)
+        return MYDB_ERR;
+    *conn_id_out = -1;
+
+    UserSlot u;
+    int rc = users_find_by_name(&eng->system_schema.users, username, &u);
+    if (rc != MYDB_OK) return rc;        /* MYDB_ERR_NOT_FOUND */
+    if (!u.is_active) return MYDB_ERR_PERM;
+
+    /* expected = SHA-256(nonce || stored_hash) */
+    uint8_t buf[MYDB_NONCE_LEN + SHA256_DIGEST_LEN];
+    memcpy(buf, nonce, MYDB_NONCE_LEN);
+    memcpy(buf + MYDB_NONCE_LEN, u.password_hash, SHA256_DIGEST_LEN);
+    uint8_t expected[SHA256_DIGEST_LEN];
+    sha256(buf, sizeof(buf), expected);
+    if (memcmp(expected, response, SHA256_DIGEST_LEN) != 0)
+        return MYDB_ERR_PERM;
+
+    return session_open(eng, &u, username, conn_id_out);
+}
+
+/* Close a network session: roll back any open transaction, drop the
+ * connection's reference on its partition (flush + evict at n_refs 0), and
+ * free the slot.  Called by the server on QUIT or client disconnect. */
+int engine_logout(EngineState *eng, int conn_id)
+{
+    Connection *c = conn_at(eng, conn_id);
+    if (!c) return MYDB_ERR;
+
+    eng->active_conn = conn_id;          /* scope cleanup to this connection */
+
+    /* Best-effort rollback of any open explicit transaction on this
+     * connection's partition (pre-WAL, single-user txn manager). */
+    PartitionCtx *part = engine_find_partition(eng, c->partition_id);
+    if (part) pm_rollback(part);
+
+    uint32_t pid = c->partition_id;
+    conn_free(eng, conn_id);
+    if (eng->conn_pool.n_active > 0) eng->conn_pool.n_active--;
+    engine_release_partition(eng, pid);  /* --n_refs; flush + evict at 0 */
+
+    eng->active_conn = -1;
     return MYDB_OK;
 }
 
@@ -857,12 +994,17 @@ int engine_alter_user_quota(EngineState *eng,
  *  result_out and the parser's PARSER_ERR is returned to the caller.
  * ==================================================================== */
 
-int engine_execute_sql(EngineState *eng, const char *sql,
+int engine_execute_sql(EngineState *eng, int conn_id, const char *sql,
                        char *result_out, size_t result_cap)
 {
     if (!eng || !sql || !result_out || result_cap == 0) return MYDB_ERR;
-    Connection *c = cur_conn(eng);
-    if (!c->logged_in) return MYDB_ERR_PERM;
+
+    /* Scope the statement to the requesting connection.  cur_conn() and every
+     * engine helper it reaches resolve through eng->active_conn for the
+     * duration of this call (single-threaded: one statement at a time). */
+    Connection *c = conn_at(eng, conn_id);
+    if (!c) { eng->active_conn = -1; return MYDB_ERR_PERM; }
+    eng->active_conn = conn_id;
 
     ParserAST *ast = NULL;
     char err_buf[256];
@@ -872,6 +1014,7 @@ int engine_execute_sql(EngineState *eng, const char *sql,
     if (rc != PARSER_OK) {
         snprintf(result_out, result_cap, "  Error: %s",
                  err_buf[0] ? err_buf : "parse error");
+        eng->active_conn = -1;
         return MYDB_ERR;
     }
 
@@ -926,5 +1069,6 @@ int engine_execute_sql(EngineState *eng, const char *sql,
                  "  (%.2fs)", elapsed);
     }
 
+    eng->active_conn = -1;
     return rc;
 }

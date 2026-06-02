@@ -4,6 +4,7 @@
 #include <stddef.h>
 
 #include "common.h"
+#include "crypto.h"           /* SALT_LEN, SHA256_DIGEST_LEN, MYDB_NONCE_LEN */
 #include "database_file.h"
 #include "relation_def.h"
 #include "system_schema.h"
@@ -62,6 +63,15 @@ typedef struct EngineState {
      * Connection slots — NOT on EngineState directly.  Phase 1 runs a
      * single session at conns[0]. */
     ConnectionPool conn_pool;
+
+    /* Index into conn_pool.conns of the connection whose request is currently
+     * being served, or -1 when none.  Set at the top of each public entry
+     * point (engine_execute_sql / engine_login* / engine_logout) and cleared
+     * on return; cur_conn() resolves it.  Safe as a single field only because
+     * execution is single-threaded (the server's poll loop runs one statement
+     * at a time).  When concurrency lands this becomes thread-local or moves
+     * fully into ExecContext. */
+    int            active_conn;
 
     /* Table of loaded partition runtime contexts — one PartitionCtx per
      * active partition (Catalog, Cache 2, TransactionManager, embedded
@@ -138,15 +148,46 @@ int engine_start(const char *root_dir,
 /*  Session lifecycle                                                  */
 /* ------------------------------------------------------------------ */
 
-/* Verify password against system_schema.users. On success, populate
- * eng->current_user_id, open the user's partition catalog into
- * eng->active_catalog (if they own one), and stamp last_login.
+/* Plaintext login (local / bootstrap path, e.g. engine_start + tests).
+ * Verifies the password against system_schema.users, claims a connection
+ * slot, acquires the user's partition (if owned), and stamps last_login.
+ * Also makes the new session the active connection so an embedded
+ * single-session caller's engine_execute_sql works without a conn_id.
+ * The network server uses engine_login_response instead.
  *
  * Returns:
  *   MYDB_ERR_NOT_FOUND  unknown username
- *   MYDB_ERR_PERM       wrong password OR is_active==0 */
+ *   MYDB_ERR_PERM       wrong password OR is_active==0
+ *   MYDB_ERR            connection pool full / partition load failure */
 int engine_login(EngineState *eng,
                  const char *username, const char *password);
+
+/* ------------------------------------------------------------------ */
+/*  Network session lifecycle (mydb-server)                            */
+/* ------------------------------------------------------------------ */
+
+/* Look up a user's password salt for the challenge-response handshake.
+ * Copies SALT_LEN bytes into salt_out.  MYDB_ERR_NOT_FOUND for an unknown
+ * user (the auth handler answers with a fake salt to avoid leaking which
+ * usernames exist). */
+int engine_get_user_salt(EngineState *eng, const char *username,
+                         uint8_t salt_out[SALT_LEN]);
+
+/* Network login via challenge-response.  The client sends
+ * response = SHA-256(nonce || SHA-256(salt || password)); the engine
+ * recomputes it from the stored hash and the server-issued nonce and
+ * compares.  On success opens a session and writes the new conn_id (>= 0)
+ * to *conn_id_out.  Returns MYDB_ERR_NOT_FOUND / MYDB_ERR_PERM on auth
+ * failure (the caller reports both identically), MYDB_ERR otherwise. */
+int engine_login_response(EngineState *eng, const char *username,
+                          const uint8_t response[SHA256_DIGEST_LEN],
+                          const uint8_t nonce[MYDB_NONCE_LEN],
+                          int *conn_id_out);
+
+/* Close a network session: roll back any open transaction, drop the
+ * connection's reference on its partition (flush + evict at refcount 0),
+ * and free the slot.  Called by the server on QUIT or client disconnect. */
+int engine_logout(EngineState *eng, int conn_id);
 
 /* Switch the active schema. Caller must be logged in.
  *
@@ -261,23 +302,25 @@ int engine_alter_user_quota(EngineState *eng,
 /* ------------------------------------------------------------------ */
 /*  SQL execution entry point                                          */
 /*                                                                    */
-/*  The single door bin/REPL uses to run a SQL string. The engine     */
-/*  pipeline:                                                          */
+/*  The single door the server (and embedded callers) use to run a    */
+/*  SQL string for a given connection. `conn_id` is the handle from    */
+/*  engine_login_response (or 0 for the embedded single-session path); */
+/*  the engine scopes the statement to that connection. The pipeline:  */
 /*    1. parser_parse(sql)              -> opaque AST handle           */
 /*    2. exec_engine_execute(eng, ast)  -> walks AST, writes result    */
 /*    3. parser_free_ast(ast)           -> always, on every path       */
 /*                                                                    */
-/*  Bin never sees the parser or execution engine modules — engine    */
+/*  Callers never see the parser or execution engine modules — engine  */
 /*  is the single front door for raw SQL. Result string is NUL-       */
 /*  terminated and truncated to result_cap-1 bytes.                   */
 /*                                                                    */
 /*  Returns:                                                          */
 /*    MYDB_OK         statement executed; result_out has the result    */
 /*    MYDB_ERR        parse error (message in result_out)              */
-/*    MYDB_ERR_PERM   not logged in                                    */
+/*    MYDB_ERR_PERM   not logged in / unknown conn_id                  */
 /*    other           propagated from execution engine                 */
 /* ------------------------------------------------------------------ */
-int engine_execute_sql(EngineState *eng,
+int engine_execute_sql(EngineState *eng, int conn_id,
                        const char *sql,
                        char *result_out, size_t result_cap);
 

@@ -1,0 +1,26 @@
+[Unit]
+Description=MyDB Database Engine
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mydbd
+ExecStop=/bin/kill -TERM $MAINPID
+Restart=on-failure
+RestartSec=5
+
+User=mydb
+Group=mydb
+
+Environment=MYDB_HOME=/var/lib/mydb
+
+RuntimeDirectory=mydb
+RuntimeDirectoryMode=0750
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mydbd
+
+[Install]
+WantedBy=multi-user.target
