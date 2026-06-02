@@ -1582,6 +1582,85 @@ static void test_dml_stubs(void)
 }
 
 /* ======================================================================
+ * JOINs — INNER / LEFT / RIGHT / FULL, implicit, multi-table
+ * ====================================================================== */
+
+static void test_joins(void)
+{
+    printf("\n[test_joins]\n");
+    engine_setup();
+
+    sql("CREATE DATABASE jdb;");
+    sql("USE jdb;");
+    sql("CREATE TABLE customers (id INT PRIMARY KEY, name VARCHAR(20));");
+    sql("CREATE TABLE orders (id INT PRIMARY KEY, customer_id INT, amount INT);");
+
+    /* customers 101,102,103 ; 103 (Omar) has no orders */
+    sql("INSERT INTO customers (id, name) VALUES (101, 'Ali');");
+    sql("INSERT INTO customers (id, name) VALUES (102, 'Sara');");
+    sql("INSERT INTO customers (id, name) VALUES (103, 'Omar');");
+
+    /* orders: order 3 references customer 104 which does not exist */
+    sql("INSERT INTO orders (id, customer_id, amount) VALUES (1, 101, 50);");
+    sql("INSERT INTO orders (id, customer_id, amount) VALUES (2, 102, 80);");
+    sql("INSERT INTO orders (id, customer_id, amount) VALUES (3, 104, 60);");
+
+    int rc;
+
+    /* INNER JOIN — only orders with a matching customer (1,2) */
+    rc = sql("SELECT * FROM orders JOIN customers ON orders.customer_id = customers.id;");
+    CHECK(rc == MYDB_OK,                       "INNER JOIN → OK");
+    CHECK(strstr(g_res, "(2 rows)") != NULL,   "INNER JOIN → 2 rows");
+    CHECK(strstr(g_res, "Ali")  != NULL,       "INNER JOIN → Ali present");
+    CHECK(strstr(g_res, "Omar") == NULL,       "INNER JOIN → Omar absent (no order)");
+
+    /* LEFT JOIN — all orders; order 3 gets NULL customer */
+    rc = sql("SELECT * FROM orders LEFT JOIN customers ON orders.customer_id = customers.id;");
+    CHECK(rc == MYDB_OK,                       "LEFT JOIN → OK");
+    CHECK(strstr(g_res, "(3 rows)") != NULL,   "LEFT JOIN → 3 rows");
+    CHECK(strstr(g_res, "NULL") != NULL,       "LEFT JOIN → NULL-padded right side");
+
+    /* RIGHT JOIN — all customers; Omar gets NULL order */
+    rc = sql("SELECT * FROM orders RIGHT JOIN customers ON orders.customer_id = customers.id;");
+    CHECK(rc == MYDB_OK,                       "RIGHT JOIN → OK");
+    CHECK(strstr(g_res, "(3 rows)") != NULL,   "RIGHT JOIN → 3 rows");
+    CHECK(strstr(g_res, "Omar") != NULL,       "RIGHT JOIN → Omar present (no order)");
+
+    /* FULL JOIN — matched + order 3 (NULL cust) + Omar (NULL order) */
+    rc = sql("SELECT * FROM orders FULL JOIN customers ON orders.customer_id = customers.id;");
+    CHECK(rc == MYDB_OK,                       "FULL JOIN → OK");
+    CHECK(strstr(g_res, "(4 rows)") != NULL,   "FULL JOIN → 4 rows");
+    CHECK(strstr(g_res, "Omar") != NULL,       "FULL JOIN → Omar present");
+
+    /* Implicit comma join (INNER semantics) */
+    rc = sql("SELECT * FROM orders o, customers c WHERE o.customer_id = c.id;");
+    CHECK(rc == MYDB_OK,                       "implicit JOIN → OK");
+    CHECK(strstr(g_res, "(2 rows)") != NULL,   "implicit JOIN → 2 rows");
+
+    /* JOIN + WHERE filter — only the amount>70 matched order (2 → Sara) */
+    rc = sql("SELECT * FROM orders JOIN customers ON orders.customer_id = customers.id "
+             "WHERE orders.amount > 70;");
+    CHECK(rc == MYDB_OK,                       "JOIN + WHERE → OK");
+    CHECK(strstr(g_res, "(1 row)") != NULL,    "JOIN + WHERE → 1 row");
+    CHECK(strstr(g_res, "Sara") != NULL,       "JOIN + WHERE → Sara present");
+
+    /* Three-table chained join */
+    sql("CREATE TABLE items (id INT PRIMARY KEY, order_id INT, label VARCHAR(20));");
+    sql("INSERT INTO items (id, order_id, label) VALUES (1, 1, 'book');");
+    sql("INSERT INTO items (id, order_id, label) VALUES (2, 2, 'pen');");
+
+    rc = sql("SELECT * FROM items i "
+             "JOIN orders o ON i.order_id = o.id "
+             "JOIN customers c ON o.customer_id = c.id;");
+    CHECK(rc == MYDB_OK,                       "3-table JOIN → OK");
+    CHECK(strstr(g_res, "(2 rows)") != NULL,   "3-table JOIN → 2 rows");
+    CHECK(strstr(g_res, "book") != NULL,       "3-table JOIN → item present");
+    CHECK(strstr(g_res, "Ali")  != NULL,       "3-table JOIN → customer present");
+
+    engine_teardown();
+}
+
+/* ======================================================================
  * main
  * ====================================================================== */
 
@@ -1602,6 +1681,7 @@ int main(void)
     test_analyze_table();
     test_user_ddl();
     test_dml_stubs();
+    test_joins();
 
     rm_rf(TEST_ROOT);
 
