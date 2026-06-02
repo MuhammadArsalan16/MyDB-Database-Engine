@@ -1,8 +1,5 @@
 #include "storage.h"
-#include "stats.h"
-#include "engine.h"
 #include "page.h"
-#include "buffer_pool.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -15,18 +12,6 @@
 /* ------------------------------------------------------------------ */
 /*  Internal types                                                       */
 /* ------------------------------------------------------------------ */
-
-/* One entry in the open-table registry. Storage caches DiskManager +
- * BTree handles per relation_name so a single SQL session doesn't
- * reopen the file on every call. */
-typedef struct {
-    char        name[MAX_TABLE_NAME];
-    int         id;             /* table_id used with the buffer pool */
-    DiskManager dm;
-    BTree       clustered;
-    BTree       secondary[MAX_SECONDARY_IDX];
-    int         is_open;
-} OpenTable;
 
 /*
  * StorageScan — wraps a BTree cursor with relation context.
@@ -42,111 +27,112 @@ typedef struct {
     int          sec_idx;       /* -1 = clustered scan; >=0 = secondary index scan */
 } StorageScan;
 
-/* Singleton storage state (one engine per process) */
-typedef struct {
-    EngineState        *eng;             /* set by storage_init */
-    BufferPool          bp;
-    TransactionManager  trx;
-    OpenTable           open_tables[MAX_TABLES];
-    int                 num_open;
-    int                 next_table_id;   /* monotonic counter for table IDs */
-    int                 initialized;
-    DiskManager        *last_written_dm; /* set by DML; fsync'd at commit */
-} StorageState;
-
 /*
- * File-static singleton — deliberate exception to the "no globals" rule.
- * A storage engine is inherently a single shared resource per process.
+ * v3: StorageEngine is no longer a file-static singleton.  One instance
+ * lives inside each PartitionCtx (partition_manager).  All functions
+ * receive StorageEngine *se explicitly so the storage layer is stateless
+ * and supports one engine instance per active partition.
+ *
+ * Removed from StorageEngine (v2 → v3):
+ *   - EngineState *eng         — replaced by filesystem context fields
+ *   - TransactionManager trx   — promoted to PartitionCtx (partition_manager)
+ *
+ * Removed from this file (moved to partition_manager):
+ *   - FK constraint helpers    (fk_check_ref_exists, fk_apply_on_delete, etc.)
+ *   - Quota helpers            (quota_headroom, reconcile_growth)
+ *   - Schema/catalog updates   (schema_bump_*, cat_track_alloc, etc.)
+ *   - storage_create_schema / storage_drop_schema
+ *   - storage_analyze_table
+ *   - storage_begin / commit / rollback
  */
-static StorageState g;
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                             */
 /* ------------------------------------------------------------------ */
 
 /* Build the on-disk path for a relation file:
- *   <partition_path>/<schema_name>/<relation>.mydb  */
-static int build_path(char *out, size_t outlen, const char *relation_name)
+ *   <partition_path>/<schema_name>/<relation>.mydb
+ *
+ * v3: uses se->partition_path and se->current_schema_name, which are
+ * set by storage_set_context() when the active schema changes. */
+static int build_path(StorageEngine *se, char *out, size_t outlen,
+                      const char *relation_name)
 {
     int n = snprintf(out, outlen, "%s/%s/%s.mydb",
-                     g.eng->current_partition_path,
-                     g.eng->current_schema_name,
+                     se->partition_path,
+                     se->current_schema_name,
                      relation_name);
     return (n < 0 || (size_t)n >= outlen) ? MYDB_ERR : MYDB_OK;
 }
 
 /* Find an already-open table by relation name; NULL if not open. */
-static OpenTable *find_open(const char *name)
+static OpenTable *find_open(StorageEngine *se, const char *name)
 {
     for (int i = 0; i < MAX_TABLES; i++) {
-        if (g.open_tables[i].is_open &&
-            strcmp(g.open_tables[i].name, name) == 0)
-            return &g.open_tables[i];
+        if (se->open_tables[i].is_open &&
+            strcmp(se->open_tables[i].name, name) == 0)
+            return &se->open_tables[i];
     }
     return NULL;
 }
 
-/* Open a relation lazily: load DiskManager + BTree handles, register
- * the table_id with the trx manager. The fresh writable RelationDef
- * pointer comes from the active schema (storage is the single writer
- * for auto_incr_counter / root_page_no, so we always read through
- * the active SchemaFile rather than trusting the caller's copy). */
-static OpenTable *open_table(const char *name)
+/* Open a relation lazily: load DiskManager + BTree handles.
+ *
+ * v3: rel is passed directly from the caller (partition_manager has
+ * already resolved it from the active SchemaFile).  No TransactionManager
+ * registration here — transaction lifecycle is partition_manager's
+ * responsibility. */
+static OpenTable *open_table(StorageEngine *se, const RelationDef *rel)
 {
-    OpenTable *ot = find_open(name);
+    OpenTable *ot = find_open(se, rel->relation_name);
     if (ot) return ot;
-
-    RelationDef *r = schema_find_relation(&g.eng->active_schema, name);
-    if (!r) return NULL;
 
     int slot = -1;
     for (int i = 0; i < MAX_TABLES; i++) {
-        if (!g.open_tables[i].is_open) { slot = i; break; }
+        if (!se->open_tables[i].is_open) { slot = i; break; }
     }
     if (slot < 0) return NULL;
 
-    ot = &g.open_tables[slot];
+    ot = &se->open_tables[slot];
     memset(ot, 0, sizeof(OpenTable));
 
     char path[512];
-    if (build_path(path, sizeof(path), name) != MYDB_OK) return NULL;
+    if (build_path(se, path, sizeof(path), rel->relation_name) != MYDB_OK)
+        return NULL;
 
     if (disk_open(&ot->dm, path) != MYDB_OK) return NULL;
 
-    strncpy(ot->name, name, MAX_TABLE_NAME - 1);
-    ot->id = g.next_table_id++;
+    strncpy(ot->name, rel->relation_name, MAX_TABLE_NAME - 1);
+    ot->id = se->next_table_id++;
 
     /* clustered B+ tree */
-    btree_init(&ot->clustered, &g.bp, &ot->dm, ot->id,
-               r->root_page_no,
-               r->columns[r->pk_col_idx].type, 0);
+    btree_init(&ot->clustered, &se->bp, &ot->dm, ot->id,
+               rel->root_page_no,
+               rel->columns[rel->pk_col_idx].type, 0);
 
     /* secondary B+ trees — unique cols use is_secondary=1 (rejects duplicates),
      * non-unique (INDEXED) cols use is_secondary=2 (allows duplicates). */
-    for (int i = 0; i < r->num_secondary_indexes; i++) {
-        int     ci     = r->secondary_col_idx[i];
-        uint8_t is_sec = r->columns[ci].is_unique ? 1 : 2;
-        btree_init(&ot->secondary[i], &g.bp, &ot->dm, ot->id,
-                   r->secondary_root_page_no[i],
-                   r->columns[ci].type, is_sec);
+    for (int i = 0; i < rel->num_secondary_indexes; i++) {
+        int     ci     = rel->secondary_col_idx[i];
+        uint8_t is_sec = rel->columns[ci].is_unique ? 1 : 2;
+        btree_init(&ot->secondary[i], &se->bp, &ot->dm, ot->id,
+                   rel->secondary_root_page_no[i],
+                   rel->columns[ci].type, is_sec);
     }
 
     ot->is_open = 1;
-    g.num_open++;
-
-    trx_register_table(&g.trx, ot->id, &ot->dm);
+    se->num_open++;
     return ot;
 }
 
-static int close_table(OpenTable *ot)
+static int close_table(StorageEngine *se, OpenTable *ot)
 {
     if (!ot || !ot->is_open) return MYDB_OK;
-    bp_flush_table(&g.bp, ot->id);
-    bp_evict_table(&g.bp, ot->id);
-    trx_unregister_table(&g.trx, ot->id);
+    bp_flush_table(&se->bp, ot->id);
+    bp_evict_table(&se->bp, ot->id);
     disk_close(&ot->dm);
     ot->is_open = 0;
-    g.num_open--;
+    se->num_open--;
     return MYDB_OK;
 }
 
@@ -326,392 +312,220 @@ static void record_get_pk(const uint8_t *rec, DataType pk_type, Value *out_pk)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Quota reconciliation after DML                                      */
-/*                                                                      */
-/*  Step 2 of the phase 9 plan: a successful DML may have grown the     */
-/*  relation file via btree splits. The pre/post difference in          */
-/*  dm.num_pages tells us by how much. We bump RelationEntry.num_pages  */
-/*  so __schema.mydb stays the persisted source of truth, and call      */
-/*  cat_track_alloc so __catalog.mydb's used_bytes stays consistent     */
-/*  with the partition's actual disk consumption.                       */
-/*                                                                      */
-/*  Note: this is a coarse, post-hoc reconciliation. v1 has no per-page */
-/*  free path, so we never drive deltas negative on user relations      */
-/*  outside DROP TABLE (which uses disk_destroy + cat_track_alloc       */
-/*  directly). Pre-check quota at the entry to DML to avoid growing     */
-/*  past the quota; this reconciliation closes the loop afterwards.    */
+/*  Storage engine lifecycle                                            */
 /* ------------------------------------------------------------------ */
 
-static void reconcile_growth(OpenTable *ot, const char *relation_name,
-                             uint32_t pages_before)
+int storage_init(StorageEngine *se)
 {
-    uint32_t pages_after = ot->dm.num_pages;
-    if (pages_after == pages_before) return;
-    int32_t delta = (int32_t)(pages_after - pages_before);
+    if (!se) return MYDB_ERR;
+    if (se->initialized) return MYDB_OK;
 
-    /* If the clustered B+ tree grew taller, sync tree_height in RAM
-     * before schema_bump_relation_pages calls schema_save_page0, so
-     * both changes are flushed in the same write. */
-    uint8_t h = btree_compute_height(&ot->clustered);
-    RelationEntry *e = schema_find_relation_stat(&g.eng->active_schema,
-                                                  relation_name);
-    if (e && h > e->tree_height)
-        e->tree_height = h;
+    memset(se, 0, sizeof(*se));
+    se->next_table_id = 1;
 
-    schema_bump_relation_pages(&g.eng->active_schema, relation_name, delta);
-    cat_track_alloc(&g.eng->active_catalog, (int64_t)delta * PAGE_SIZE);
-}
+    bp_init(&se->bp);
 
-/* Quota pre-check: we don't know exactly how many pages a DML will
- * allocate (b-tree splits depend on key size and tree shape), but a
- * conservative upper bound of 4 pages catches the common "1 leaf
- * split + maybe 1 internal split + maybe 1 root growth" pattern.
- * Returns MYDB_OK if at least `headroom_pages` pages still fit under
- * the partition quota, MYDB_ERR_FULL otherwise. */
-static int quota_headroom(uint32_t headroom_pages)
-{
-    Catalog *c = &g.eng->active_catalog;
-    if (c->header.used_bytes > c->header.quota_bytes) return MYDB_ERR_FULL;
-    uint64_t need = (uint64_t)headroom_pages * PAGE_SIZE;
-    if (c->header.quota_bytes - c->header.used_bytes < need) return MYDB_ERR_FULL;
+    se->initialized = 1;
     return MYDB_OK;
 }
 
-#define DML_QUOTA_HEADROOM_PAGES 4
-
-/* ------------------------------------------------------------------ */
-/*  Engine lifecycle                                                    */
-/* ------------------------------------------------------------------ */
-
-int storage_init(EngineState *eng)
+int storage_shutdown(StorageEngine *se)
 {
-    if (!eng) return MYDB_ERR;
-    if (g.initialized) return MYDB_OK;
-
-    memset(&g, 0, sizeof(g));
-    g.eng           = eng;
-    g.next_table_id = 1;
-
-    bp_init(&g.bp);
-    trx_init(&g.trx, &g.bp);
-
-    g.initialized = 1;
-    return MYDB_OK;
-}
-
-int storage_shutdown(void)
-{
-    if (!g.initialized) return MYDB_OK;
-
-    if (trx_is_active(&g.trx)) trx_commit(&g.trx);
+    if (!se || !se->initialized) return MYDB_OK;
 
     for (int i = 0; i < MAX_TABLES; i++) {
-        if (g.open_tables[i].is_open)
-            close_table(&g.open_tables[i]);
+        if (se->open_tables[i].is_open)
+            close_table(se, &se->open_tables[i]);
     }
 
-    g.eng         = NULL;
-    g.initialized = 0;
+    se->initialized = 0;
     return MYDB_OK;
 }
 
-int storage_flush_all_dirty(void)
+int storage_flush_all_dirty(StorageEngine *se)
 {
-    if (!g.initialized) return MYDB_OK;
-    return bp_flush_dirty_all(&g.bp);
+    if (!se || !se->initialized) return MYDB_OK;
+    return bp_flush_dirty_all(&se->bp);
+}
+
+/* Evict all pages from the buffer pool without flushing.
+ * Used by partition_manager on ROLLBACK to discard in-memory dirty
+ * changes — the disk retains the pre-transaction data. */
+int storage_evict_all(StorageEngine *se)
+{
+    if (!se || !se->initialized) return MYDB_OK;
+    for (int i = 0; i < MAX_TABLES; i++) {
+        if (se->open_tables[i].is_open)
+            bp_evict_table(&se->bp, se->open_tables[i].id);
+    }
+    return MYDB_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Context management                                                  */
+/* ------------------------------------------------------------------ */
+
+/* Set the active filesystem context.
+ * Called by partition_manager (pctx_open_schema) when the active schema
+ * changes, so that build_path() inside storage.c produces correct paths
+ * without the storage layer knowing about PartitionCtx. */
+void storage_set_context(StorageEngine *se,
+                         const char *partition_path,
+                         const char *schema_name)
+{
+    if (!se) return;
+    strncpy(se->partition_path, partition_path,
+            sizeof(se->partition_path) - 1);
+    strncpy(se->current_schema_name, schema_name,
+            sizeof(se->current_schema_name) - 1);
+}
+
+/* Clear the active schema name (called on deactivate / schema switch).
+ * build_path() will return MYDB_ERR for any call that arrives after
+ * deactivation, guarding against stale-path table opens. */
+void storage_clear_schema(StorageEngine *se)
+{
+    if (!se) return;
+    se->current_schema_name[0] = '\0';
 }
 
 /* ------------------------------------------------------------------ */
 /*  DDL                                                                 */
 /* ------------------------------------------------------------------ */
 
-int storage_create_schema(const char *name)
+/*
+ * Create a new relation file and allocate its B+ tree root page(s).
+ * Fills in rel->root_page_no and rel->secondary_root_page_no[].
+ *
+ * v3: no quota checking and no SchemaFile/Catalog side-effects here.
+ * partition_manager is responsible for:
+ *   - Checking quota headroom before calling.
+ *   - Calling schema_add_relation() after this returns.
+ *   - Updating cat_track_alloc() with (pages_allocated * PAGE_SIZE).
+ *
+ * Pre-check quota: clustered root + one root per secondary index.
+ */
+int storage_create_table(StorageEngine *se, RelationDef *rel)
 {
-    if (!g.initialized || !name || name[0] == '\0') return MYDB_ERR;
-    if (strlen(name) >= sizeof(g.eng->current_schema_name)) return MYDB_ERR;
-
-    /* Owner check: only partition owners can create schemas. Analysts
-     * (no partition) get MYDB_ERR_PERM here. */
-    if (!g.eng->partition_open) return MYDB_ERR_PERM;
-
-    /* Reject duplicates against the partition catalog. */
-    if (cat_find_schema(&g.eng->active_catalog, name) != NULL)
-        return MYDB_ERR_DUPLICATE;
-
-    /* Build <partition>/<name>/ and <partition>/<name>/__schema.mydb. */
-    char dir[256], path[256];
-    int n = snprintf(dir, sizeof(dir), "%s/%s",
-                     g.eng->current_partition_path, name);
-    if (n < 0 || (size_t)n >= sizeof(dir)) return MYDB_ERR;
-    n = snprintf(path, sizeof(path), "%s/__schema.mydb", dir);
-    if (n < 0 || (size_t)n >= sizeof(path)) return MYDB_ERR;
-
-    /* mkdir; tolerate EEXIST only if it's already a directory. */
-    if (mkdir(dir, 0755) != 0) {
-        struct stat st;
-        if (errno != EEXIST || stat(dir, &st) != 0 || !S_ISDIR(st.st_mode))
-            return MYDB_ERR;
-    }
-
-    SchemaFile sf;
-    int rc = schema_create(path, g.eng->current_partition_id, name, &sf);
-    if (rc != MYDB_OK) {
-        rmdir(dir);   /* best-effort cleanup if dir was newly created */
-        return rc;
-    }
-    schema_close(&sf);
-
-    rc = cat_add_schema(&g.eng->active_catalog, name);
-    if (rc != MYDB_OK) {
-        unlink(path);
-        rmdir(dir);
-        return rc;
-    }
-    return MYDB_OK;
-}
-
-int storage_drop_schema(const char *name)
-{
-    if (!g.initialized || !name || name[0] == '\0') return MYDB_ERR;
-    if (!g.eng->partition_open) return MYDB_ERR_PERM;
-
-    /* Reject dropping the currently active schema — caller must USE
-     * another database (or none) before dropping this one. */
-    if (g.eng->schema_active &&
-        strncmp(g.eng->current_schema_name, name,
-                sizeof(g.eng->current_schema_name)) == 0)
-        return MYDB_ERR;   /* exec_drop_database checks and surfaces a message */
-
-    /* Schema must be registered in the partition catalog. */
-    if (cat_find_schema(&g.eng->active_catalog, name) == NULL)
-        return MYDB_ERR_NOT_FOUND;
-
-    /* Build schema directory path. */
-    char schema_dir[512], schema_file[512];
-    int n = snprintf(schema_dir, sizeof(schema_dir), "%s/%s",
-                     g.eng->current_partition_path, name);
-    if (n < 0 || (size_t)n >= sizeof(schema_dir)) return MYDB_ERR;
-
-    n = snprintf(schema_file, sizeof(schema_file), "%s/__schema.mydb", schema_dir);
-    if (n < 0 || (size_t)n >= sizeof(schema_file)) return MYDB_ERR;
-
-    /* Open the schema file to enumerate relation files. */
-    SchemaFile sf;
-    int rc = schema_open(schema_file, &sf);
-    if (rc != MYDB_OK) return rc;
-
-    /* Compute bytes used so we can credit them back to the quota. */
-    uint64_t freed_bytes = schema_compute_size_bytes(&sf);
-
-    /* Close any cached open-table handles for relations in this schema.
-     * Since we only have one active schema at a time and we rejected the
-     * active case above, no open tables should be from this schema — but
-     * close defensively anyway. */
-    for (int i = 0; i < MAX_RELATIONS_PER_SCHEMA; i++) {
-        if (!sf.relations[i].is_valid) continue;
-
-        /* Evict from open-table cache. */
-        OpenTable *ot = find_open(sf.relations[i].relation_name);
-        if (ot) close_table(ot);
-
-        /* Delete the relation data file. */
-        char rel_path[512];
-        n = snprintf(rel_path, sizeof(rel_path), "%s/%s.mydb",
-                     schema_dir, sf.relations[i].relation_name);
-        if (n > 0 && (size_t)n < sizeof(rel_path))
-            unlink(rel_path);   /* ignore errors — file may already be gone */
-    }
-
-    schema_close(&sf);
-
-    /* Delete optional stats file. */
-    char stats_path[512];
-    n = snprintf(stats_path, sizeof(stats_path), "%s/__stats.mydb", schema_dir);
-    if (n > 0 && (size_t)n < sizeof(stats_path))
-        unlink(stats_path);   /* idempotent — missing is fine */
-
-    /* Delete the schema metadata file. */
-    unlink(schema_file);
-
-    /* Remove the now-empty schema directory. */
-    rmdir(schema_dir);
-
-    /* Credit freed data pages back to the partition quota. */
-    if (freed_bytes > 0)
-        cat_track_alloc(&g.eng->active_catalog, -(int64_t)freed_bytes);
-
-    /* Remove the schema slot from __catalog.mydb. */
-    return cat_remove_schema(&g.eng->active_catalog, name);
-}
-
-int storage_create_table(RelationDef *rel)
-{
-    if (!g.initialized || !rel) return MYDB_ERR;
-    if (!g.eng->schema_active) return MYDB_ERR_PERM;
-    if (schema_find_relation(&g.eng->active_schema, rel->relation_name) != NULL)
-        return MYDB_ERR_DUPLICATE;
-
-    /* Pre-check quota: clustered root + one root per secondary index. */
-    uint32_t need_pages = 1u + rel->num_secondary_indexes;
-    if (quota_headroom(need_pages) != MYDB_OK) return MYDB_ERR_FULL;
+    if (!se || !se->initialized || !rel) return MYDB_ERR;
+    if (se->current_schema_name[0] == '\0') return MYDB_ERR_PERM;
 
     rel->root_page_no = INVALID_PAGE;
 
     char path[512];
-    if (build_path(path, sizeof(path), rel->relation_name) != MYDB_OK)
+    if (build_path(se, path, sizeof(path), rel->relation_name) != MYDB_OK)
         return MYDB_ERR;
 
     DiskManager dm;
     if (disk_create(&dm, path) != MYDB_OK) return MYDB_ERR;
 
-    /* Allocate the clustered root through partition_alloc_page so the
-     * partition quota counter reflects the growth. partition_alloc_page
-     * grows the file on disk; bp_fetch_page brings it into a frame so
-     * we can initialise it. */
+    /* Allocate the clustered root page via disk_alloc_page (raw allocator,
+     * no quota tracking — partition_manager tracks the quota delta).
+     * bp_fetch_page brings the new page into a frame so we can initialise it. */
     uint32_t root_pno;
-    int rc = partition_alloc_page(&g.eng->active_catalog, &dm,
-                                  g.eng->current_user_id, &root_pno);
+    int rc = disk_alloc_page(&dm, &root_pno);
     if (rc != MYDB_OK) { disk_close(&dm); return rc; }
 
-    uint8_t *root_page = bp_fetch_page(&g.bp, &dm, 0 /*temp id*/, root_pno);
+    uint8_t *root_page = bp_fetch_page(&se->bp, &dm, 0 /*temp id*/, root_pno);
     if (!root_page) { disk_close(&dm); return MYDB_ERR; }
     page_init(root_page, root_pno, PAGE_TYPE_DATA);
-    bp_unpin_page(&g.bp, 0, root_pno, 1);
-    bp_flush_table(&g.bp, 0);
-    bp_evict_table(&g.bp, 0);
+    bp_unpin_page(&se->bp, 0, root_pno, 1);
+    bp_flush_table(&se->bp, 0);
+    bp_evict_table(&se->bp, 0);
 
     rel->root_page_no = root_pno;
 
     /* Same pattern for each secondary index root. */
     for (int i = 0; i < rel->num_secondary_indexes; i++) {
         uint32_t sec_pno;
-        rc = partition_alloc_page(&g.eng->active_catalog, &dm,
-                                  g.eng->current_user_id, &sec_pno);
+        rc = disk_alloc_page(&dm, &sec_pno);
         if (rc != MYDB_OK) { disk_close(&dm); return rc; }
 
-        uint8_t *sp = bp_fetch_page(&g.bp, &dm, 0, sec_pno);
+        uint8_t *sp = bp_fetch_page(&se->bp, &dm, 0, sec_pno);
         if (!sp) { disk_close(&dm); return MYDB_ERR; }
         page_init(sp, sec_pno, PAGE_TYPE_DATA);
-        bp_unpin_page(&g.bp, 0, sec_pno, 1);
-        bp_flush_table(&g.bp, 0);
-        bp_evict_table(&g.bp, 0);
+        bp_unpin_page(&se->bp, 0, sec_pno, 1);
+        bp_flush_table(&se->bp, 0);
+        bp_evict_table(&se->bp, 0);
         rel->secondary_root_page_no[i] = sec_pno;
     }
 
     disk_close(&dm);
-
-    /* Persist the relation in the active schema. schema_add_relation
-     * takes a snapshot of *rel into its defs[] slot — subsequent
-     * mutations (auto_incr_counter, etc.) flow through schema_flush_
-     * relation. */
-    rc = schema_add_relation(&g.eng->active_schema, rel);
-    if (rc != MYDB_OK) return rc;
-
-    /* schema_add_relation already sets tree_height = 1 for the new
-     * relation.  Bump num_pages for the root pages we just allocated
-     * (partition_alloc_page already bumped used_bytes). */
-    schema_bump_relation_pages(&g.eng->active_schema, rel->relation_name,
-                               (int32_t)need_pages);
-
-    /* Keep the partition catalog's SchemaEntry.num_relations in sync so
-     * DESCRIBE PARTITION shows the correct table count. */
-    SchemaEntry *se = cat_find_schema(&g.eng->active_catalog,
-                                      g.eng->current_schema_name);
-    if (se) {
-        se->num_relations++;
-        cat_save(&g.eng->active_catalog);
-    }
-
     return MYDB_OK;
 }
 
-int storage_drop_table(RelationDef *rel)
+/*
+ * Close the open handle for table_name (if cached) and unlink its file.
+ *
+ * v3: no SchemaFile or Catalog side-effects.  partition_manager calls
+ * schema_remove_relation() and cat_track_alloc() around this call.
+ */
+int storage_drop_table(StorageEngine *se, const char *table_name)
 {
-    if (!g.initialized || !rel) return MYDB_ERR;
-    if (!g.eng->schema_active) return MYDB_ERR_PERM;
+    if (!se || !se->initialized || !table_name) return MYDB_ERR;
 
-    OpenTable *ot = find_open(rel->relation_name);
-    if (ot) close_table(ot);
-
-    /* Reclaim the partition quota for the file's pages before deleting. */
-    RelationEntry *e = schema_find_relation_stat(&g.eng->active_schema,
-                                                  rel->relation_name);
-    if (e && e->num_pages > 0) {
-        cat_track_alloc(&g.eng->active_catalog,
-                        -(int64_t)e->num_pages * PAGE_SIZE);
-    }
+    OpenTable *ot = find_open(se, table_name);
+    if (ot) close_table(se, ot);
 
     char path[512];
-    if (build_path(path, sizeof(path), rel->relation_name) != MYDB_OK)
+    if (build_path(se, path, sizeof(path), table_name) != MYDB_OK)
         return MYDB_ERR;
     disk_destroy(path);
-
-    int rc = schema_remove_relation(&g.eng->active_schema, rel->relation_name);
-    if (rc != MYDB_OK) return rc;
-
-    /* Keep the partition catalog's SchemaEntry.num_relations in sync. */
-    SchemaEntry *se = cat_find_schema(&g.eng->active_catalog,
-                                      g.eng->current_schema_name);
-    if (se && se->num_relations > 0) {
-        se->num_relations--;
-        cat_save(&g.eng->active_catalog);
-    }
-
     return MYDB_OK;
 }
 
-int storage_add_index(RelationDef *rel, int col_idx)
+/*
+ * Allocate a secondary-index root page, initialise its B+ tree, and
+ * backfill all existing clustered rows into it.
+ *
+ * Caller (partition_manager) must:
+ *   - Pass the WRITABLE RelationDef* (from SchemaFile) — this function
+ *     mutates rel->secondary_col_idx, rel->secondary_root_page_no, and
+ *     rel->num_secondary_indexes in place.
+ *   - Call schema_flush_relation() after this returns to persist the
+ *     updated RelationDef.
+ *   - Call schema_bump_relation_pages() and cat_track_alloc() for quota.
+ *
+ * v3: no quota checking, no schema flush, no catalog update here.
+ */
+int storage_add_index(StorageEngine *se, RelationDef *rel, int col_idx)
 {
-    if (!g.initialized || !rel) return MYDB_ERR;
-    if (!g.eng->schema_active) return MYDB_ERR_PERM;
-    if (engine_check_access(g.eng, 1) != MYDB_OK) return MYDB_ERR_PERM;
+    if (!se || !se->initialized || !rel) return MYDB_ERR;
+    if (se->current_schema_name[0] == '\0') return MYDB_ERR_PERM;
 
-    /* Work through the authoritative in-schema copy */
-    RelationDef *r = schema_find_relation(&g.eng->active_schema,
-                                          rel->relation_name);
-    if (!r) return MYDB_ERR_NOT_FOUND;
-
-    if (col_idx < 0 || col_idx >= r->num_columns) return MYDB_ERR;
+    if (col_idx < 0 || col_idx >= rel->num_columns) return MYDB_ERR;
 
     /* Reject if this column is already indexed */
-    for (int i = 0; i < r->num_secondary_indexes; i++) {
-        if (r->secondary_col_idx[i] == (uint8_t)col_idx)
+    for (int i = 0; i < rel->num_secondary_indexes; i++) {
+        if (rel->secondary_col_idx[i] == (uint8_t)col_idx)
             return MYDB_ERR_DUPLICATE;
     }
-    if (r->num_secondary_indexes >= MAX_SECONDARY_IDX) return MYDB_ERR_FULL;
-    if (quota_headroom(1) != MYDB_OK) return MYDB_ERR_FULL;
+    if (rel->num_secondary_indexes >= MAX_SECONDARY_IDX) return MYDB_ERR_FULL;
 
     /* Open (or reuse) the table handle */
-    OpenTable *ot = open_table(r->relation_name);
+    OpenTable *ot = open_table(se, rel);
     if (!ot) return MYDB_ERR;
 
     /* Allocate a new root page for the secondary B-tree */
     uint32_t sec_pno;
-    int rc = partition_alloc_page(&g.eng->active_catalog, &ot->dm,
-                                  g.eng->current_user_id, &sec_pno);
+    int rc = disk_alloc_page(&ot->dm, &sec_pno);
     if (rc != MYDB_OK) return rc;
 
-    uint8_t *sp = bp_fetch_page(&g.bp, &ot->dm, ot->id, sec_pno);
+    uint8_t *sp = bp_fetch_page(&se->bp, &ot->dm, ot->id, sec_pno);
     if (!sp) return MYDB_ERR;
     page_init(sp, sec_pno, PAGE_TYPE_INDEX);
-    bp_unpin_page(&g.bp, ot->id, sec_pno, 1);
+    bp_unpin_page(&se->bp, ot->id, sec_pno, 1);
 
     /* Register the new index in the in-memory RelationDef */
-    int idx_slot = r->num_secondary_indexes;
-    r->secondary_col_idx[idx_slot]      = (uint8_t)col_idx;
-    r->secondary_root_page_no[idx_slot] = sec_pno;
-    r->num_secondary_indexes++;
+    int idx_slot = rel->num_secondary_indexes;
+    rel->secondary_col_idx[idx_slot]      = (uint8_t)col_idx;
+    rel->secondary_root_page_no[idx_slot] = sec_pno;
+    rel->num_secondary_indexes++;
 
     /* Wire up the BTree handle in the open-table slot */
-    uint8_t is_sec = r->columns[col_idx].is_unique ? 1 : 2;
-    btree_init(&ot->secondary[idx_slot], &g.bp, &ot->dm, ot->id,
-               sec_pno, r->columns[col_idx].type, is_sec);
-
-    /* Persist the updated RelationDef before backfill so a crash after
-     * a partial backfill leaves the index visible (and rebuildable). */
-    rc = schema_flush_relation(&g.eng->active_schema, r->relation_name);
-    if (rc != MYDB_OK) return rc;
-    schema_bump_relation_pages(&g.eng->active_schema, r->relation_name, 1);
+    uint8_t is_sec = rel->columns[col_idx].is_unique ? 1 : 2;
+    btree_init(&ot->secondary[idx_slot], &se->bp, &ot->dm, ot->id,
+               sec_pno, rel->columns[col_idx].type, is_sec);
 
     /* Backfill: scan every existing row and insert into the new secondary
      * B-tree.  We collect the full row from the clustered leaf and use the
@@ -728,7 +542,7 @@ int storage_add_index(RelationDef *rel, int col_idx)
 
         Row row;
         memset(&row, 0, sizeof(row));
-        deserialize_row_value(rec_buf + voff, rec_len - voff, r, &row);
+        deserialize_row_value(rec_buf + voff, rec_len - voff, rel, &row);
 
         /* Skip NULL values — nulls are not indexed */
         if (row.cols[col_idx].is_null) continue;
@@ -754,568 +568,187 @@ int storage_add_index(RelationDef *rel, int col_idx)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Transaction delegation                                              */
-/* ------------------------------------------------------------------ */
-
-int storage_begin(void)    { return trx_begin(&g.trx); }
-int storage_commit(void)
-{
-    int rc = trx_commit(&g.trx);
-    if (rc == MYDB_OK) {
-        if (g.last_written_dm)
-            fsync(g.last_written_dm->fd);
-        if (g.eng && g.eng->active_schema.fd >= 0)
-            fsync(g.eng->active_schema.fd);
-        g.last_written_dm = NULL;
-    }
-    return rc;
-}
-int storage_rollback(void) { return trx_rollback(&g.trx); }
-
-/* ------------------------------------------------------------------ */
-/*  FK constraint helpers                                               */
-/* ------------------------------------------------------------------ */
-
-/* Return the index of the column named col_name in r, or -1. */
-static int find_col_idx(const RelationDef *r, const char *col_name)
-{
-    for (int i = 0; i < r->num_columns; i++)
-        if (strncmp(r->columns[i].name, col_name, MAX_COLUMN_NAME) == 0)
-            return i;
-    return -1;
-}
-
-/* On INSERT / UPDATE: verify every FK value in row exists in the
- * referenced relation's clustered index. NULL FK values are skipped
- * (NULL satisfies any FK constraint). */
-static int fk_check_ref_exists(const RelationDef *r, const Row *row)
-{
-    for (int i = 0; i < r->num_foreign_keys; i++) {
-        const ForeignKey *fk = &r->foreign_keys[i];
-
-        int fk_col = find_col_idx(r, fk->column_name);
-        if (fk_col < 0) return MYDB_ERR;
-
-        if (row->cols[fk_col].is_null) continue;
-
-        RelationDef *ref = schema_find_relation(&g.eng->active_schema,
-                                               fk->ref_relation_name);
-        if (!ref) return MYDB_ERR_FK_VIOLATION;
-
-        OpenTable *ref_ot = open_table(ref->relation_name);
-        if (!ref_ot) return MYDB_ERR;
-
-        Value fk_val = row->cols[fk_col];
-        BTreeSearchResult res;
-        if (btree_search(&ref_ot->clustered, &fk_val, &res) != MYDB_OK || !res.found)
-            return MYDB_ERR_FK_VIOLATION;
-    }
-    return MYDB_OK;
-}
-
-/* Forward declaration — defined after the FK helpers. */
-static int read_record_by_rid(OpenTable *ot, RID rid,
-                               uint8_t *out, uint16_t *out_len);
-
-/* fk_check_not_referenced — pure RESTRICT check used by the UPDATE path.
- * Returns MYDB_ERR_FK_VIOLATION if any referencing row exists. */
-static int fk_check_not_referenced(const RelationDef *r, const Value *pk_val)
-{
-    const char *pk_col_name = r->columns[r->pk_col_idx].name;
-    SchemaFile *sf = &g.eng->active_schema;
-
-    for (int i = 0; i < MAX_RELATIONS_PER_SCHEMA; i++) {
-        if (!sf->relations[i].is_valid) continue;
-        RelationDef *ref_rel = &sf->defs[i];
-
-        for (int j = 0; j < ref_rel->num_foreign_keys; j++) {
-            const ForeignKey *fk = &ref_rel->foreign_keys[j];
-
-            if (strncmp(fk->ref_relation_name, r->relation_name,
-                        MAX_TABLE_NAME) != 0) continue;
-            if (strncmp(fk->ref_column_name, pk_col_name,
-                        MAX_COLUMN_NAME) != 0) continue;
-
-            int fk_col = find_col_idx(ref_rel, fk->column_name);
-            if (fk_col < 0) continue;
-
-            OpenTable *ref_ot = open_table(ref_rel->relation_name);
-            if (!ref_ot) return MYDB_ERR;
-
-            Cursor btree_cur;
-            if (btree_cursor_open(&ref_ot->clustered, &btree_cur) != MYDB_OK)
-                return MYDB_ERR;
-
-            uint8_t  rec_buf[PAGE_SIZE];
-            uint16_t rec_len;
-            while (btree_cursor_next(&btree_cur, rec_buf, &rec_len) == MYDB_OK) {
-                uint16_t klen = ((uint16_t)rec_buf[0] << 8) | rec_buf[1];
-                uint16_t voff = 2 + klen + 2;
-                Row row;
-                memset(&row, 0, sizeof(row));
-                deserialize_row_value(rec_buf + voff, rec_len - voff,
-                                      ref_rel, &row);
-                if (value_compare(&row.cols[fk_col], pk_val) == 0) {
-                    btree_cursor_close(&btree_cur);
-                    return MYDB_ERR_FK_VIOLATION;
-                }
-            }
-            btree_cursor_close(&btree_cur);
-        }
-    }
-    return MYDB_OK;
-}
-
-/* (FK_ACTION_MAX_ROWS removed — RID collection now uses a heap-allocated
- * growing array, so there is no per-operation row limit.) */
-
-/*
- * fk_apply_on_delete — enforce ON DELETE actions for every FK that
- * references relation `r` at primary key `pk_val`.
- *
- * RESTRICT (0) : return MYDB_ERR_FK_VIOLATION if any referencing row exists.
- * CASCADE  (1) : delete all referencing rows (recursive — may cascade further).
- * SET_NULL (2) : set the FK column to NULL in all referencing rows.
- *
- * Called only from storage_delete. The UPDATE path always uses
- * fk_check_not_referenced (RESTRICT-only) because ON UPDATE actions
- * are out of scope for Phase 1.
- */
-static int fk_apply_on_delete(const RelationDef *r, const Value *pk_val)
-{
-    const char *pk_col_name = r->columns[r->pk_col_idx].name;
-    SchemaFile *sf = &g.eng->active_schema;
-
-    for (int i = 0; i < MAX_RELATIONS_PER_SCHEMA; i++) {
-        if (!sf->relations[i].is_valid) continue;
-        RelationDef *ref_rel = &sf->defs[i];
-
-        for (int j = 0; j < ref_rel->num_foreign_keys; j++) {
-            const ForeignKey *fk = &ref_rel->foreign_keys[j];
-
-            if (strncmp(fk->ref_relation_name, r->relation_name,
-                        MAX_TABLE_NAME) != 0) continue;
-            if (strncmp(fk->ref_column_name, pk_col_name,
-                        MAX_COLUMN_NAME) != 0) continue;
-
-            int fk_col = find_col_idx(ref_rel, fk->column_name);
-            if (fk_col < 0) continue;
-
-            uint8_t action = fk->on_delete_action;
-
-            OpenTable *ref_ot = open_table(ref_rel->relation_name);
-            if (!ref_ot) return MYDB_ERR;
-
-            /* ---- RESTRICT: scan and fail on first match ---- */
-            if (action == FK_ON_DELETE_RESTRICT) {
-                Cursor btree_cur;
-                if (btree_cursor_open(&ref_ot->clustered, &btree_cur) != MYDB_OK)
-                    return MYDB_ERR;
-
-                uint8_t  rec_buf[PAGE_SIZE];
-                uint16_t rec_len;
-                while (btree_cursor_next(&btree_cur, rec_buf, &rec_len) == MYDB_OK) {
-                    uint16_t klen = ((uint16_t)rec_buf[0] << 8) | rec_buf[1];
-                    uint16_t voff = 2 + klen + 2;
-                    Row row;
-                    memset(&row, 0, sizeof(row));
-                    deserialize_row_value(rec_buf + voff, rec_len - voff,
-                                          ref_rel, &row);
-                    if (value_compare(&row.cols[fk_col], pk_val) == 0) {
-                        btree_cursor_close(&btree_cur);
-                        return MYDB_ERR_FK_VIOLATION;
-                    }
-                }
-                btree_cursor_close(&btree_cur);
-                continue;
-            }
-
-            /* ---- CASCADE / SET_NULL: collect matching RIDs first,
-             *     then apply the action outside the scan loop to avoid
-             *     cursor invalidation while the table is being mutated.
-             *
-             *     Heap-allocated growing array — no arbitrary row cap.
-             *     Starts at 64, doubles on overflow.  Freed before every
-             *     return path (success or failure). ---- */
-            int   rid_cap = 64;
-            int   nfound  = 0;
-            RID  *rids    = (RID *)malloc((size_t)rid_cap * sizeof(RID));
-            if (!rids) return MYDB_ERR;
-
-            Cursor btree_cur;
-            if (btree_cursor_open(&ref_ot->clustered, &btree_cur) != MYDB_OK) {
-                free(rids);
-                return MYDB_ERR;
-            }
-
-            uint8_t  rec_buf[PAGE_SIZE];
-            uint16_t rec_len;
-            while (btree_cursor_next(&btree_cur, rec_buf, &rec_len) == MYDB_OK) {
-                uint16_t klen = ((uint16_t)rec_buf[0] << 8) | rec_buf[1];
-                uint16_t voff = 2 + klen + 2;
-                Row row;
-                memset(&row, 0, sizeof(row));
-                deserialize_row_value(rec_buf + voff, rec_len - voff,
-                                      ref_rel, &row);
-
-                if (value_compare(&row.cols[fk_col], pk_val) != 0) continue;
-
-                /* Grow the array if full */
-                if (nfound == rid_cap) {
-                    rid_cap *= 2;
-                    RID *tmp = (RID *)realloc(rids, (size_t)rid_cap * sizeof(RID));
-                    if (!tmp) {
-                        btree_cursor_close(&btree_cur);
-                        free(rids);
-                        return MYDB_ERR;
-                    }
-                    rids = tmp;
-                }
-                rids[nfound].page_no = btree_cur.last_page_no;
-                rids[nfound].slot_no = btree_cur.last_slot;
-                nfound++;
-            }
-            btree_cursor_close(&btree_cur);
-
-            /* Apply the action for every collected RID.
-             * Use fk_rc + break so rids is always freed before returning. */
-            int fk_rc = MYDB_OK;
-            for (int k = 0; k < nfound; k++) {
-                if (action == FK_ON_DELETE_CASCADE) {
-                    /* Recursive: storage_delete may itself cascade further */
-                    fk_rc = storage_delete(ref_rel, rids[k]);
-                    if (fk_rc != MYDB_OK) break;
-                } else {
-                    /* SET_NULL: re-fetch the row, zero the FK column, update */
-                    ref_ot = open_table(ref_rel->relation_name);
-                    if (!ref_ot) { fk_rc = MYDB_ERR; break; }
-
-                    uint8_t  r_buf[PAGE_SIZE];
-                    uint16_t r_len;
-                    if (read_record_by_rid(ref_ot, rids[k], r_buf, &r_len) != MYDB_OK) {
-                        fk_rc = MYDB_ERR; break;
-                    }
-
-                    uint16_t klen = ((uint16_t)r_buf[0] << 8) | r_buf[1];
-                    uint16_t voff = 2 + klen + 2;
-                    Row updated_row;
-                    memset(&updated_row, 0, sizeof(updated_row));
-                    deserialize_row_value(r_buf + voff, r_len - voff,
-                                          ref_rel, &updated_row);
-                    updated_row.cols[fk_col].is_null = 1;
-
-                    fk_rc = storage_update(ref_rel, rids[k], &updated_row);
-                    if (fk_rc != MYDB_OK) break;
-                }
-            }
-            free(rids);
-            if (fk_rc != MYDB_OK) return fk_rc;
-        }
-    }
-    return MYDB_OK;
-}
-
-
-/* ------------------------------------------------------------------ */
-/*  DML — INSERT                                                        */
-/* ------------------------------------------------------------------ */
-
-int storage_insert(RelationDef *rel, Row *row)
-{
-    if (!g.initialized || !rel || !row) return MYDB_ERR;
-    if (engine_check_access(g.eng, 1) != MYDB_OK) return MYDB_ERR_PERM;
-
-    /* Read the writable RelationDef from the active schema — caller's
-     * pointer may be a parser-side const view. */
-    RelationDef *r = schema_find_relation(&g.eng->active_schema,
-                                          rel->relation_name);
-    if (!r) return MYDB_ERR_NOT_FOUND;
-
-    OpenTable *ot = open_table(rel->relation_name);
-    if (!ot) return MYDB_ERR;
-
-    if (quota_headroom(DML_QUOTA_HEADROOM_PAGES) != MYDB_OK)
-        return MYDB_ERR_FULL;
-
-    int auto_txn = !trx_is_active(&g.trx);
-    if (auto_txn) trx_begin(&g.trx);
-
-    /* NOT NULL */
-    for (int i = 0; i < r->num_columns; i++) {
-        if (r->columns[i].is_not_null && !r->columns[i].is_auto_increment) {
-            if (row->cols[i].is_null) {
-                if (auto_txn) trx_rollback(&g.trx);
-                return MYDB_ERR_NULL_VIOLATION;
-            }
-        }
-    }
-
-    /* FK referential integrity */
-    int fk_rc = fk_check_ref_exists(r, row);
-    if (fk_rc != MYDB_OK) {
-        if (auto_txn) trx_rollback(&g.trx);
-        return fk_rc;
-    }
-
-    /* AUTO_INCREMENT */
-    int pk = r->pk_col_idx;
-    if (r->columns[pk].is_auto_increment) {
-        if (row->cols[pk].is_null || row->cols[pk].v.int_val == 0) {
-            row->cols[pk].type      = TYPE_INT;
-            row->cols[pk].is_null   = 0;
-            row->cols[pk].v.int_val = (int32_t)r->auto_incr_counter;
-            r->auto_incr_counter++;
-        }
-    }
-
-    uint32_t pages_before = ot->dm.num_pages;
-
-    uint8_t  rec_buf[PAGE_SIZE];
-    uint16_t rec_len = build_clustered_record(r, row, trx_current_id(&g.trx),
-                                              rec_buf);
-
-    RID rid;
-    int rc = btree_insert(&ot->clustered, &row->cols[pk], rec_buf, rec_len, &rid);
-    if (rc != MYDB_OK) {
-        reconcile_growth(ot, rel->relation_name, pages_before);
-        if (auto_txn) trx_rollback(&g.trx);
-        return rc;
-    }
-
-    for (int i = 0; i < r->num_secondary_indexes; i++) {
-        int ci = r->secondary_col_idx[i];
-        uint8_t  srec[MAX_VARCHAR_LEN + 2 + 4 + 2];
-        uint16_t slen = build_secondary_record(&row->cols[ci], rid, srec);
-
-        rc = btree_insert(&ot->secondary[i], &row->cols[ci], srec, slen, NULL);
-        if (rc != MYDB_OK) {
-            reconcile_growth(ot, rel->relation_name, pages_before);
-            if (auto_txn) trx_rollback(&g.trx);
-            return rc;
-        }
-    }
-
-    reconcile_growth(ot, rel->relation_name, pages_before);
-    schema_bump_relation_rows(&g.eng->active_schema, rel->relation_name, 1);
-
-    if (r->columns[pk].is_auto_increment)
-        schema_flush_relation(&g.eng->active_schema, rel->relation_name);
-
-    g.last_written_dm = &ot->dm;
-
-    if (auto_txn) trx_commit(&g.trx);
-    return MYDB_OK;
-}
-
-/* ------------------------------------------------------------------ */
 /*  Read a raw clustered record by RID                                  */
 /* ------------------------------------------------------------------ */
 
-static int read_record_by_rid(OpenTable *ot, RID rid,
+static int read_record_by_rid(StorageEngine *se, OpenTable *ot, RID rid,
                                uint8_t *rec_out, uint16_t *len_out)
 {
-    uint8_t *page = bp_fetch_page(&g.bp, &ot->dm, ot->id, rid.page_no);
+    uint8_t *page = bp_fetch_page(&se->bp, &ot->dm, ot->id, rid.page_no);
     if (!page) return MYDB_ERR;
 
     uint16_t data_off, data_sz;
     int rc = page_get_record(page, rid.slot_no, &data_off, &data_sz);
     if (rc != MYDB_OK) {
-        bp_unpin_page(&g.bp, ot->id, rid.page_no, 0);
+        bp_unpin_page(&se->bp, ot->id, rid.page_no, 0);
         return rc;
     }
 
     memcpy(rec_out, page + data_off, data_sz);
     *len_out = data_sz;
-    bp_unpin_page(&g.bp, ot->id, rid.page_no, 0);
+    bp_unpin_page(&se->bp, ot->id, rid.page_no, 0);
+    return MYDB_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/*  DML — INSERT                                                        */
+/*                                                                      */
+/*  v3: All constraint checking (NOT NULL, FK, UNIQUE), quota checks,  */
+/*  AUTO_INCREMENT management, schema stat updates, and transaction     */
+/*  management have moved to partition_manager (pm_insert).            */
+/*  This function is a pure B+ tree insert — it takes a fully-formed   */
+/*  row and trx_id and writes it to disk.                              */
+/* ------------------------------------------------------------------ */
+
+int storage_insert(StorageEngine *se, RelationDef *rel,
+                   Row *row, uint64_t trx_id, RID *rid_out)
+{
+    if (!se || !se->initialized || !rel || !row) return MYDB_ERR;
+
+    OpenTable *ot = open_table(se, rel);
+    if (!ot) return MYDB_ERR;
+
+    int pk = rel->pk_col_idx;
+
+    uint8_t  rec_buf[PAGE_SIZE];
+    uint16_t rec_len = build_clustered_record(rel, row, trx_id, rec_buf);
+
+    RID rid;
+    int rc = btree_insert(&ot->clustered, &row->cols[pk], rec_buf, rec_len, &rid);
+    if (rc != MYDB_OK) return rc;
+
+    for (int i = 0; i < rel->num_secondary_indexes; i++) {
+        int ci = rel->secondary_col_idx[i];
+        uint8_t  srec[MAX_VARCHAR_LEN + 2 + 4 + 2];
+        uint16_t slen = build_secondary_record(&row->cols[ci], rid, srec);
+
+        rc = btree_insert(&ot->secondary[i], &row->cols[ci], srec, slen, NULL);
+        if (rc != MYDB_OK) return rc;
+    }
+
+    se->last_written_dm = &ot->dm;
+    if (rid_out) *rid_out = rid;
     return MYDB_OK;
 }
 
 /* ------------------------------------------------------------------ */
 /*  DML — DELETE                                                        */
+/*                                                                      */
+/*  v3: FK referential integrity (RESTRICT / CASCADE / SET_NULL) and   */
+/*  schema row-count updates have moved to partition_manager.          */
+/*  This function performs the pure B+ tree deletion.                  */
 /* ------------------------------------------------------------------ */
 
-int storage_delete(RelationDef *rel, RID rid)
+int storage_delete(StorageEngine *se, RelationDef *rel, RID rid)
 {
-    if (!g.initialized || !rel) return MYDB_ERR;
-    if (engine_check_access(g.eng, 1) != MYDB_OK) return MYDB_ERR_PERM;
+    if (!se || !se->initialized || !rel) return MYDB_ERR;
 
-    RelationDef *r = schema_find_relation(&g.eng->active_schema,
-                                          rel->relation_name);
-    if (!r) return MYDB_ERR_NOT_FOUND;
-
-    OpenTable *ot = open_table(rel->relation_name);
+    OpenTable *ot = open_table(se, rel);
     if (!ot) return MYDB_ERR;
-
-    int auto_txn = !trx_is_active(&g.trx);
-    if (auto_txn) trx_begin(&g.trx);
 
     uint8_t  rec[PAGE_SIZE];
     uint16_t rec_len;
-    if (read_record_by_rid(ot, rid, rec, &rec_len) != MYDB_OK) {
-        if (auto_txn) trx_rollback(&g.trx);
+    if (read_record_by_rid(se, ot, rid, rec, &rec_len) != MYDB_OK)
         return MYDB_ERR;
-    }
 
     Value pk_val;
-    record_get_pk(rec, r->columns[r->pk_col_idx].type, &pk_val);
-
-    /* FK referential integrity — apply ON DELETE action (RESTRICT / CASCADE
-     * / SET_NULL) for every FK that references this row. */
-    int fk_rc = fk_apply_on_delete(r, &pk_val);
-    if (fk_rc != MYDB_OK) {
-        if (auto_txn) trx_rollback(&g.trx);
-        return fk_rc;
-    }
+    record_get_pk(rec, rel->columns[rel->pk_col_idx].type, &pk_val);
 
     uint16_t klen = ((uint16_t)rec[0] << 8) | rec[1];
     uint16_t voff = 2 + klen + 2;
     Row row;
     memset(&row, 0, sizeof(row));
-    deserialize_row_value(rec + voff, rec_len - voff, r, &row);
+    deserialize_row_value(rec + voff, rec_len - voff, rel, &row);
 
-    for (int i = 0; i < r->num_secondary_indexes; i++) {
-        int ci = r->secondary_col_idx[i];
+    for (int i = 0; i < rel->num_secondary_indexes; i++) {
+        int ci = rel->secondary_col_idx[i];
         btree_delete(&ot->secondary[i], &row.cols[ci]);
     }
 
-    int rc = btree_delete(&ot->clustered, &pk_val);
-    if (rc == MYDB_OK)
-        schema_bump_relation_rows(&g.eng->active_schema, rel->relation_name, -1);
-    if (auto_txn) {
-        if (rc == MYDB_OK) trx_commit(&g.trx); else trx_rollback(&g.trx);
-    }
-    return rc;
+    return btree_delete(&ot->clustered, &pk_val);
 }
 
 /* ------------------------------------------------------------------ */
 /*  DML — UPDATE                                                        */
+/*                                                                      */
+/*  v3: Validate-before-delete (UNIQUE / FK checks) and schema updates */
+/*  have moved to partition_manager.  This function performs the pure  */
+/*  delete-old + insert-new B+ tree operation.                         */
 /* ------------------------------------------------------------------ */
 
-int storage_update(RelationDef *rel, RID rid, Row *new_row)
+int storage_update(StorageEngine *se, RelationDef *rel,
+                   RID rid, Row *new_row, uint64_t trx_id)
 {
-    if (!g.initialized || !rel || !new_row) return MYDB_ERR;
-    if (engine_check_access(g.eng, 1) != MYDB_OK) return MYDB_ERR_PERM;
+    if (!se || !se->initialized || !rel || !new_row) return MYDB_ERR;
 
-    RelationDef *r = schema_find_relation(&g.eng->active_schema,
-                                          rel->relation_name);
-    if (!r) return MYDB_ERR_NOT_FOUND;
-
-    OpenTable *ot = open_table(rel->relation_name);
+    OpenTable *ot = open_table(se, rel);
     if (!ot) return MYDB_ERR;
-
-    if (quota_headroom(DML_QUOTA_HEADROOM_PAGES) != MYDB_OK)
-        return MYDB_ERR_FULL;
-
-    int auto_txn = !trx_is_active(&g.trx);
-    if (auto_txn) trx_begin(&g.trx);
-
-    /* NOT NULL */
-    for (int i = 0; i < r->num_columns; i++) {
-        if (r->columns[i].is_not_null && new_row->cols[i].is_null) {
-            if (auto_txn) trx_rollback(&g.trx);
-            return MYDB_ERR_NULL_VIOLATION;
-        }
-    }
 
     uint8_t  old_rec[PAGE_SIZE];
     uint16_t old_rec_len;
-    if (read_record_by_rid(ot, rid, old_rec, &old_rec_len) != MYDB_OK) {
-        if (auto_txn) trx_rollback(&g.trx);
+    if (read_record_by_rid(se, ot, rid, old_rec, &old_rec_len) != MYDB_OK)
         return MYDB_ERR;
-    }
 
     Value old_pk;
-    record_get_pk(old_rec, r->columns[r->pk_col_idx].type, &old_pk);
+    record_get_pk(old_rec, rel->columns[rel->pk_col_idx].type, &old_pk);
 
     uint16_t klen = ((uint16_t)old_rec[0] << 8) | old_rec[1];
     uint16_t voff = 2 + klen + 2;
     Row old_row;
     memset(&old_row, 0, sizeof(old_row));
-    deserialize_row_value(old_rec + voff, old_rec_len - voff, r, &old_row);
-
-    /* FK checks: new row's FK values must reference existing rows;
-     * if the PK changes, the old PK must not be referenced by others. */
-    {
-        int fk_rc = fk_check_ref_exists(r, new_row);
-        if (fk_rc != MYDB_OK) {
-            if (auto_txn) trx_rollback(&g.trx);
-            return fk_rc;
-        }
-    }
+    deserialize_row_value(old_rec + voff, old_rec_len - voff, rel, &old_row);
 
     /*
      * Validate-before-delete: if any UNIQUE key changes to a value that
      * already exists for another live row, fail the update without
      * touching the existing data.
+     * v3: FK and PK duplicate checks are done by partition_manager before
+     * calling here; only secondary UNIQUE conflicts are checked at this
+     * level because storage owns the secondary index state.
      */
-    const Value *new_pk = &new_row->cols[r->pk_col_idx];
+    const Value *new_pk = &new_row->cols[rel->pk_col_idx];
     int pk_changed = (value_compare(&old_pk, new_pk) != 0);
     if (pk_changed) {
-        int fk_rc = fk_check_not_referenced(r, &old_pk);
-        if (fk_rc != MYDB_OK) {
-            if (auto_txn) trx_rollback(&g.trx);
-            return fk_rc;
-        }
-    }
-    if (pk_changed) {
         BTreeSearchResult res;
-        if (btree_search(&ot->clustered, new_pk, &res) == MYDB_OK && res.found) {
-            if (auto_txn) trx_rollback(&g.trx);
+        if (btree_search(&ot->clustered, new_pk, &res) == MYDB_OK && res.found)
             return MYDB_ERR_DUPLICATE;
-        }
     }
 
     int sec_changed[MAX_SECONDARY_IDX] = {0};
-    for (int i = 0; i < r->num_secondary_indexes; i++) {
-        int ci = r->secondary_col_idx[i];
+    for (int i = 0; i < rel->num_secondary_indexes; i++) {
+        int ci = rel->secondary_col_idx[i];
         sec_changed[i] = (value_compare(&old_row.cols[ci], &new_row->cols[ci]) != 0);
         if (sec_changed[i]) {
             BTreeSearchResult res;
             if (btree_search(&ot->secondary[i], &new_row->cols[ci], &res) == MYDB_OK
-                && res.found) {
-                if (auto_txn) trx_rollback(&g.trx);
+                && res.found)
                 return MYDB_ERR_DUPLICATE;
-            }
         }
     }
 
-    uint32_t pages_before = ot->dm.num_pages;
-
-    for (int i = 0; i < r->num_secondary_indexes; i++) {
+    for (int i = 0; i < rel->num_secondary_indexes; i++) {
         if (!sec_changed[i]) continue;
-        int ci = r->secondary_col_idx[i];
+        int ci = rel->secondary_col_idx[i];
         btree_delete(&ot->secondary[i], &old_row.cols[ci]);
     }
     btree_delete(&ot->clustered, &old_pk);
 
     uint8_t  new_rec[PAGE_SIZE];
-    uint16_t new_rec_len = build_clustered_record(r, new_row,
-                                                   trx_current_id(&g.trx), new_rec);
+    uint16_t new_rec_len = build_clustered_record(rel, new_row, trx_id, new_rec);
     RID new_rid;
-    int rc = btree_insert(&ot->clustered, new_pk,
-                          new_rec, new_rec_len, &new_rid);
-    if (rc != MYDB_OK) {
-        reconcile_growth(ot, rel->relation_name, pages_before);
-        if (auto_txn) trx_rollback(&g.trx);
-        return rc;
-    }
+    int rc = btree_insert(&ot->clustered, new_pk, new_rec, new_rec_len, &new_rid);
+    if (rc != MYDB_OK) return rc;
 
-    for (int i = 0; i < r->num_secondary_indexes; i++) {
+    for (int i = 0; i < rel->num_secondary_indexes; i++) {
         if (!sec_changed[i]) continue;
-        int ci = r->secondary_col_idx[i];
+        int ci = rel->secondary_col_idx[i];
         uint8_t  srec[MAX_VARCHAR_LEN + 2 + 4 + 2];
         uint16_t slen = build_secondary_record(&new_row->cols[ci], new_rid, srec);
         rc = btree_insert(&ot->secondary[i], &new_row->cols[ci], srec, slen, NULL);
-        if (rc != MYDB_OK) {
-            reconcile_growth(ot, rel->relation_name, pages_before);
-            if (auto_txn) trx_rollback(&g.trx);
-            return rc;
-        }
+        if (rc != MYDB_OK) return rc;
     }
 
-    reconcile_growth(ot, rel->relation_name, pages_before);
-
-    if (auto_txn) trx_commit(&g.trx);
+    se->last_written_dm = &ot->dm;
     return MYDB_OK;
 }
 
@@ -1323,26 +756,22 @@ int storage_update(RelationDef *rel, RID rid, Row *new_row)
 /*  DQL — storage_get_by_index                                         */
 /* ------------------------------------------------------------------ */
 
-Row *storage_get_by_index(RelationDef *rel, int col_idx, Value *key)
+Row *storage_get_by_index(StorageEngine *se, RelationDef *rel,
+                           int col_idx, Value *key)
 {
-    if (!g.initialized || !rel || !key) return NULL;
-    if (engine_check_access(g.eng, 0) != MYDB_OK) return NULL;
-
-    RelationDef *r = schema_find_relation(&g.eng->active_schema,
-                                          rel->relation_name);
-    if (!r) return NULL;
+    if (!se || !se->initialized || !rel || !key) return NULL;
 
     /* Find which secondary index covers col_idx */
     int sec_idx = -1;
-    for (int i = 0; i < r->num_secondary_indexes; i++) {
-        if (r->secondary_col_idx[i] == (uint8_t)col_idx) {
+    for (int i = 0; i < rel->num_secondary_indexes; i++) {
+        if (rel->secondary_col_idx[i] == (uint8_t)col_idx) {
             sec_idx = i;
             break;
         }
     }
     if (sec_idx < 0) return NULL;   /* col has no secondary index */
 
-    OpenTable *ot = open_table(rel->relation_name);
+    OpenTable *ot = open_table(se, rel);
     if (!ot) return NULL;
 
     /* Step 1: descend secondary tree → secondary record {klen, key, page_no, slot_no} */
@@ -1350,12 +779,12 @@ Row *storage_get_by_index(RelationDef *rel, int col_idx, Value *key)
     if (btree_search(&ot->secondary[sec_idx], key, &sec_res) != MYDB_OK) return NULL;
     if (!sec_res.found) return NULL;
 
-    uint8_t *sec_page = bp_fetch_page(&g.bp, &ot->dm, ot->id, sec_res.page_no);
+    uint8_t *sec_page = bp_fetch_page(&se->bp, &ot->dm, ot->id, sec_res.page_no);
     if (!sec_page) return NULL;
 
     uint16_t doff, dsz;
     if (page_get_record(sec_page, sec_res.slot_no, &doff, &dsz) != MYDB_OK) {
-        bp_unpin_page(&g.bp, ot->id, sec_res.page_no, 0);
+        bp_unpin_page(&se->bp, ot->id, sec_res.page_no, 0);
         return NULL;
     }
 
@@ -1365,28 +794,28 @@ Row *storage_get_by_index(RelationDef *rel, int col_idx, Value *key)
     RID rid;
     memcpy(&rid.page_no, srec + 2 + klen,     4);
     memcpy(&rid.slot_no, srec + 2 + klen + 4, 2);
-    bp_unpin_page(&g.bp, ot->id, sec_res.page_no, 0);
+    bp_unpin_page(&se->bp, ot->id, sec_res.page_no, 0);
 
     /* Step 2: fetch full row from clustered tree using the RID */
-    uint8_t *clust_page = bp_fetch_page(&g.bp, &ot->dm, ot->id, rid.page_no);
+    uint8_t *clust_page = bp_fetch_page(&se->bp, &ot->dm, ot->id, rid.page_no);
     if (!clust_page) return NULL;
 
     uint16_t cdoff, cdsz;
     if (page_get_record(clust_page, rid.slot_no, &cdoff, &cdsz) != MYDB_OK) {
-        bp_unpin_page(&g.bp, ot->id, rid.page_no, 0);
+        bp_unpin_page(&se->bp, ot->id, rid.page_no, 0);
         return NULL;
     }
 
     uint8_t rec[PAGE_SIZE];
     memcpy(rec, clust_page + cdoff, cdsz);
-    bp_unpin_page(&g.bp, ot->id, rid.page_no, 0);
+    bp_unpin_page(&se->bp, ot->id, rid.page_no, 0);
 
     uint16_t cklen = ((uint16_t)rec[0] << 8) | rec[1];
     uint16_t voff  = 2 + cklen + 2;
 
     static Row result;
     memset(&result, 0, sizeof(result));
-    deserialize_row_value(rec + voff, cdsz - voff, r, &result);
+    deserialize_row_value(rec + voff, cdsz - voff, rel, &result);
     result.rid = rid;
     return &result;
 }
@@ -1395,26 +824,22 @@ Row *storage_get_by_index(RelationDef *rel, int col_idx, Value *key)
 /*  DQL — storage_scan_by_index                                        */
 /* ------------------------------------------------------------------ */
 
-Cursor *storage_scan_by_index(RelationDef *rel, int col_idx, Value *lo)
+Cursor *storage_scan_by_index(StorageEngine *se, RelationDef *rel,
+                               int col_idx, Value *lo)
 {
-    if (!g.initialized || !rel) return NULL;
-    if (engine_check_access(g.eng, 0) != MYDB_OK) return NULL;
-
-    RelationDef *r = schema_find_relation(&g.eng->active_schema,
-                                          rel->relation_name);
-    if (!r) return NULL;
+    if (!se || !se->initialized || !rel) return NULL;
 
     /* Find the secondary index that covers col_idx. */
     int sec_idx = -1;
-    for (int i = 0; i < r->num_secondary_indexes; i++) {
-        if (r->secondary_col_idx[i] == (uint8_t)col_idx) {
+    for (int i = 0; i < rel->num_secondary_indexes; i++) {
+        if (rel->secondary_col_idx[i] == (uint8_t)col_idx) {
             sec_idx = i;
             break;
         }
     }
     if (sec_idx < 0) return NULL;   /* col has no secondary index */
 
-    OpenTable *ot = open_table(rel->relation_name);
+    OpenTable *ot = open_table(se, rel);
     if (!ot) return NULL;
 
     StorageScan *sc = (StorageScan *)malloc(sizeof(StorageScan));
@@ -1422,7 +847,7 @@ Cursor *storage_scan_by_index(RelationDef *rel, int col_idx, Value *lo)
 
     memset(sc, 0, sizeof(StorageScan));
     sc->ot      = ot;
-    sc->rel     = r;
+    sc->rel     = rel;
     sc->sec_idx = sec_idx;
 
     int rc = lo
@@ -1437,41 +862,36 @@ Cursor *storage_scan_by_index(RelationDef *rel, int col_idx, Value *lo)
 /*  DQL — storage_get_by_pk                                            */
 /* ------------------------------------------------------------------ */
 
-Row *storage_get_by_pk(RelationDef *rel, Value *pk)
+Row *storage_get_by_pk(StorageEngine *se, RelationDef *rel, Value *pk)
 {
-    if (!g.initialized || !rel || !pk) return NULL;
-    if (engine_check_access(g.eng, 0) != MYDB_OK) return NULL;
+    if (!se || !se->initialized || !rel || !pk) return NULL;
 
-    RelationDef *r = schema_find_relation(&g.eng->active_schema,
-                                          rel->relation_name);
-    if (!r) return NULL;
-
-    OpenTable *ot = open_table(rel->relation_name);
+    OpenTable *ot = open_table(se, rel);
     if (!ot) return NULL;
 
     BTreeSearchResult res;
     if (btree_search(&ot->clustered, pk, &res) != MYDB_OK) return NULL;
     if (!res.found) return NULL;
 
-    uint8_t *page = bp_fetch_page(&g.bp, &ot->dm, ot->id, res.page_no);
+    uint8_t *page = bp_fetch_page(&se->bp, &ot->dm, ot->id, res.page_no);
     if (!page) return NULL;
 
     uint16_t data_off, data_sz;
     if (page_get_record(page, res.slot_no, &data_off, &data_sz) != MYDB_OK) {
-        bp_unpin_page(&g.bp, ot->id, res.page_no, 0);
+        bp_unpin_page(&se->bp, ot->id, res.page_no, 0);
         return NULL;
     }
 
     uint8_t rec[PAGE_SIZE];
     memcpy(rec, page + data_off, data_sz);
-    bp_unpin_page(&g.bp, ot->id, res.page_no, 0);
+    bp_unpin_page(&se->bp, ot->id, res.page_no, 0);
 
     uint16_t klen = ((uint16_t)rec[0] << 8) | rec[1];
     uint16_t voff = 2 + klen + 2;
 
     static Row result;
     memset(&result, 0, sizeof(result));
-    deserialize_row_value(rec + voff, data_sz - voff, r, &result);
+    deserialize_row_value(rec + voff, data_sz - voff, rel, &result);
     result.rid.page_no = res.page_no;
     result.rid.slot_no = res.slot_no;
     return &result;
@@ -1481,16 +901,11 @@ Row *storage_get_by_pk(RelationDef *rel, Value *pk)
 /*  DQL — scan cursor                                                   */
 /* ------------------------------------------------------------------ */
 
-Cursor *storage_scan(RelationDef *rel)
+Cursor *storage_scan(StorageEngine *se, RelationDef *rel)
 {
-    if (!g.initialized || !rel) return NULL;
-    if (engine_check_access(g.eng, 0) != MYDB_OK) return NULL;
+    if (!se || !se->initialized || !rel) return NULL;
 
-    RelationDef *r = schema_find_relation(&g.eng->active_schema,
-                                          rel->relation_name);
-    if (!r) return NULL;
-
-    OpenTable *ot = open_table(rel->relation_name);
+    OpenTable *ot = open_table(se, rel);
     if (!ot) return NULL;
 
     StorageScan *sc = (StorageScan *)malloc(sizeof(StorageScan));
@@ -1498,7 +913,7 @@ Cursor *storage_scan(RelationDef *rel)
 
     memset(sc, 0, sizeof(StorageScan));
     sc->ot      = ot;
-    sc->rel     = r;
+    sc->rel     = rel;
     sc->sec_idx = -1;   /* clustered scan */
 
     if (btree_cursor_open(&ot->clustered, &sc->btree_cur) != MYDB_OK) {
@@ -1509,16 +924,11 @@ Cursor *storage_scan(RelationDef *rel)
     return (Cursor *)sc;
 }
 
-Cursor *storage_scan_from(RelationDef *rel, Value *lo)
+Cursor *storage_scan_from(StorageEngine *se, RelationDef *rel, Value *lo)
 {
-    if (!g.initialized || !rel || !lo) return NULL;
-    if (engine_check_access(g.eng, 0) != MYDB_OK) return NULL;
+    if (!se || !se->initialized || !rel || !lo) return NULL;
 
-    RelationDef *r = schema_find_relation(&g.eng->active_schema,
-                                          rel->relation_name);
-    if (!r) return NULL;
-
-    OpenTable *ot = open_table(rel->relation_name);
+    OpenTable *ot = open_table(se, rel);
     if (!ot) return NULL;
 
     StorageScan *sc = (StorageScan *)malloc(sizeof(StorageScan));
@@ -1526,7 +936,7 @@ Cursor *storage_scan_from(RelationDef *rel, Value *lo)
 
     memset(sc, 0, sizeof(StorageScan));
     sc->ot      = ot;
-    sc->rel     = r;
+    sc->rel     = rel;
     sc->sec_idx = -1;   /* clustered scan */
 
     if (btree_cursor_open_at(&ot->clustered, lo, &sc->btree_cur) != MYDB_OK) {
@@ -1575,19 +985,23 @@ Row *cursor_next(Cursor *cur)
     memcpy(&rid.page_no, sc->rec_buf + 2 + klen,     4);
     memcpy(&rid.slot_no, sc->rec_buf + 2 + klen + 4, 2);
 
-    uint8_t *clust_page = bp_fetch_page(&g.bp, &sc->ot->dm,
+    /* Fetch the full row from the clustered index using the RID.
+     * The BufferPool pointer is accessible via the clustered BTree handle
+     * stored in the OpenTable (sc->ot->clustered.bp). */
+    BufferPool *bp = sc->ot->clustered.bp;
+    uint8_t *clust_page = bp_fetch_page(bp, &sc->ot->dm,
                                          sc->ot->id, rid.page_no);
     if (!clust_page) return NULL;
 
     uint16_t doff, dsz;
     if (page_get_record(clust_page, rid.slot_no, &doff, &dsz) != MYDB_OK) {
-        bp_unpin_page(&g.bp, sc->ot->id, rid.page_no, 0);
+        bp_unpin_page(bp, sc->ot->id, rid.page_no, 0);
         return NULL;
     }
 
     uint8_t clust_rec[PAGE_SIZE];
     memcpy(clust_rec, clust_page + doff, dsz);
-    bp_unpin_page(&g.bp, sc->ot->id, rid.page_no, 0);
+    bp_unpin_page(bp, sc->ot->id, rid.page_no, 0);
 
     uint16_t cklen = ((uint16_t)clust_rec[0] << 8) | clust_rec[1];
     uint16_t voff  = 2 + cklen + 2;
@@ -1607,321 +1021,43 @@ void cursor_close(Cursor *cur)
     free(sc);
 }
 
-/* ======================================================================
- * storage_analyze_table
- *
- * Full table scan → compute per-column statistics → write __stats.mydb.
- *
- * For every column (including PK) we always collect:
- *   total_rows, num_nulls, num_distinct, min_numeric, max_numeric.
- *
- * For non-VARCHAR columns we additionally decide between:
- *   MCV       — num_distinct ≤ STATS_MAX_ENTRIES, or type is BOOL/ENUM.
- *               Store all distinct values sorted by frequency (desc).
- *   HISTOGRAM — num_distinct > STATS_MAX_ENTRIES AND type is numeric/date.
- *               Build STATS_MAX_ENTRIES equi-height buckets.
- *   (none)    — VARCHAR: only scalar stats stored; no MCV or histogram.
- *
- * The internal hash map tracks up to ANALYZE_HM_LIMIT = 256 distinct
- * values.  Beyond that limit the map stops accepting new keys but
- * existing counts keep growing.  For high-cardinality columns the
- * histogram is built from the sampled 256 values; selectivity estimates
- * will be approximate but not wrong in a dangerous direction.
- * ====================================================================== */
-
-/* ------------------------------------------------------------------ */
-/*  Per-column scratch types (file-scope to avoid C99 VLA issues)     */
-/* ------------------------------------------------------------------ */
-
-#define ANALYZE_HM_CAP    512    /* open-addressing capacity (power-of-2)  */
-#define ANALYZE_HM_MASK  (ANALYZE_HM_CAP - 1)
-#define ANALYZE_HM_LIMIT  256    /* stop adding new keys beyond this many   */
-
-typedef struct {
-    int64_t  key;
-    uint32_t count;
-    uint8_t  used;
-    uint8_t  _pad[3];
-} AnalyzeSlot;   /* 16 B */
-
-typedef struct {
-    AnalyzeSlot slots[ANALYZE_HM_CAP];  /* 512 × 16 B = 8 KB */
-    int64_t  min_val;
-    int64_t  max_val;
-    uint32_t null_count;
-    uint32_t distinct_count;     /* unique values seen (capped at ANALYZE_HM_LIMIT) */
-    uint8_t  hm_full;            /* 1 once distinct_count hit the limit */
-    uint8_t  has_any;            /* 1 once we've seen at least one non-null value */
-    uint8_t  skip_blob;          /* 1 for VARCHAR (no MCV/histogram) */
-    uint8_t  _pad;
-} ColAnalysis;   /* ~8 KB per column */
-
-/* ------------------------------------------------------------------ */
-/*  (key, count) pair used during sort                                 */
-/* ------------------------------------------------------------------ */
-typedef struct { int64_t key; uint32_t count; } KVPair;
-
-static int kv_cmp_key (const void *a, const void *b)
+/* Fetch a full row by its Record ID.
+ * Used by partition_manager for FK constraint resolution. */
+Row *storage_get_by_rid(StorageEngine *se, RelationDef *rel, RID rid)
 {
-    const KVPair *ka = a, *kb = b;
-    if (ka->key < kb->key) return -1;
-    if (ka->key > kb->key) return  1;
-    return 0;
-}
-static int kv_cmp_freq(const void *a, const void *b)
-{
-    const KVPair *ka = a, *kb = b;
-    /* descending frequency */
-    if (ka->count > kb->count) return -1;
-    if (ka->count < kb->count) return  1;
-    return 0;
+    if (!se || !rel) return NULL;
+    OpenTable *ot = open_table(se, rel);
+    if (!ot) return NULL;
+
+    uint8_t  rec[PAGE_SIZE];
+    uint16_t rec_len;
+    if (read_record_by_rid(se, ot, rid, rec, &rec_len) != MYDB_OK) return NULL;
+
+    uint16_t klen = ((uint16_t)rec[0] << 8) | rec[1];
+    uint16_t voff = 2 + klen + 2;
+
+    static Row result;
+    memset(&result, 0, sizeof(result));
+    deserialize_row_value(rec + voff, rec_len - voff, rel, &result);
+    result.rid = rid;
+    return &result;
 }
 
 /* ------------------------------------------------------------------ */
-/*  Encode a Value as int64 for the hash map / stats struct           */
+/*  Page-count query                                                    */
+/*                                                                      */
+/*  partition_manager calls this before and after DDL/DML operations   */
+/*  to compute the page delta for quota tracking:                      */
+/*    pages_before = storage_table_page_count(se, name);              */
+/*    storage_insert(se, rel, row, trx_id, &rid);                     */
+/*    delta = storage_table_page_count(se, name) - pages_before;      */
+/*    cat_track_alloc(catalog, delta * PAGE_SIZE);                     */
 /* ------------------------------------------------------------------ */
-static int64_t val_to_i64(const Value *v)
+
+uint32_t storage_table_page_count(StorageEngine *se, const char *table_name)
 {
-    switch (v->type) {
-        case TYPE_INT:      return (int64_t)v->v.int_val;
-        case TYPE_DECIMAL:  return v->v.decimal_val;
-        case TYPE_DATE:     return (int64_t)v->v.date_val;
-        case TYPE_DATETIME: return v->v.datetime_val;
-        case TYPE_BOOL:     return (int64_t)v->v.bool_val;
-        case TYPE_ENUM:     return (int64_t)v->v.enum_val;
-        case TYPE_VARCHAR:  return 0;  /* not used */
-    }
-    return 0;
-}
-
-/* ------------------------------------------------------------------ */
-/*  Hash map insert — FNV-1a-ish mixing on 64-bit key                 */
-/* ------------------------------------------------------------------ */
-static void hm_insert(ColAnalysis *ca, int64_t key)
-{
-    uint32_t h = (uint32_t)(((uint64_t)key ^ ((uint64_t)key >> 32))
-                             & ANALYZE_HM_MASK);
-    for (int t = 0; t < ANALYZE_HM_CAP; t++) {
-        AnalyzeSlot *s = &ca->slots[h];
-        if (!s->used) {
-            if (ca->hm_full) return;    /* limit reached, drop new key */
-            s->key   = key;
-            s->count = 1;
-            s->used  = 1;
-            ca->distinct_count++;
-            if (ca->distinct_count >= ANALYZE_HM_LIMIT)
-                ca->hm_full = 1;
-            return;
-        }
-        if (s->key == key) { s->count++; return; }
-        h = (h + 1) & ANALYZE_HM_MASK;
-    }
-}
-
-/* ------------------------------------------------------------------ */
-/*  Extract live entries from a hash map into a flat KVPair array     */
-/*  Returns count of entries written.                                 */
-/* ------------------------------------------------------------------ */
-static int hm_extract(const ColAnalysis *ca, KVPair *out, int max_out)
-{
-    int n = 0;
-    for (int i = 0; i < ANALYZE_HM_CAP && n < max_out; i++) {
-        if (ca->slots[i].used) {
-            out[n].key   = ca->slots[i].key;
-            out[n].count = ca->slots[i].count;
-            n++;
-        }
-    }
-    return n;
-}
-
-/* ------------------------------------------------------------------ */
-/*  Build __stats.mydb path in the active schema directory            */
-/* ------------------------------------------------------------------ */
-static int build_stats_path(char *out, size_t outlen)
-{
-    int n = snprintf(out, outlen, "%s/%s/__stats.mydb",
-                     g.eng->current_partition_path,
-                     g.eng->current_schema_name);
-    return (n < 0 || (size_t)n >= outlen) ? MYDB_ERR : MYDB_OK;
-}
-
-/* ------------------------------------------------------------------ */
-/*  storage_analyze_table                                             */
-/* ------------------------------------------------------------------ */
-int storage_analyze_table(RelationDef *rel)
-{
-    if (!g.initialized)         return MYDB_ERR;
-    if (!g.eng->schema_active)  return MYDB_ERR;
-
-    /* Read-only operation — analyst access is sufficient. */
-    if (engine_check_access(g.eng, 0) != MYDB_OK) return MYDB_ERR_PERM;
-
-    /* Locate the relation's slot so we know which stats page to write. */
-    RelationEntry *ent = schema_find_relation_stat(&g.eng->active_schema,
-                                                    rel->relation_name);
-    if (!ent) return MYDB_ERR_NOT_FOUND;
-    int slot_idx = (int)(ent - g.eng->active_schema.relations);
-
-    /* Open or create __stats.mydb for the active schema. */
-    char stats_path[512];
-    if (build_stats_path(stats_path, sizeof(stats_path)) != MYDB_OK)
-        return MYDB_ERR;
-
-    StatsFile sf;
-    int rc = stats_open(stats_path, &sf);
-    if (rc == MYDB_ERR_NOT_FOUND)
-        rc = stats_create(stats_path, g.eng->current_schema_name, &sf);
-    if (rc != MYDB_OK) return rc;
-
-    /* Blank this relation's stats page in memory. */
-    stats_reset_relation(&sf, slot_idx);
-
-    /* ----------------------------------------------------------------
-     * Phase 1: full table scan.
-     *
-     * We allocate one ColAnalysis per column on the stack.  Each entry
-     * is ~8 KB; 32 columns = ~256 KB — well within Linux's 8 MB default.
-     * ---------------------------------------------------------------- */
-    ColAnalysis ca[MAX_COLUMNS];
-    memset(ca, 0, sizeof(ca));
-
-    /* Mark VARCHAR columns so the inner loop can skip hash-map work. */
-    for (int i = 0; i < rel->num_columns; i++)
-        if (rel->columns[i].type == TYPE_VARCHAR)
-            ca[i].skip_blob = 1;
-
-    uint32_t total_rows = 0;
-
-    Cursor *cur = storage_scan(rel);
-    if (cur) {
-        Row *row;
-        while ((row = cursor_next(cur)) != NULL) {
-            total_rows++;
-            for (int i = 0; i < rel->num_columns; i++) {
-                const Value *v = &row->cols[i];
-
-                if (v->is_null) {
-                    ca[i].null_count++;
-                    continue;
-                }
-
-                /* Update min / max. */
-                int64_t enc = val_to_i64(v);
-                if (!ca[i].has_any) {
-                    ca[i].min_val = enc;
-                    ca[i].max_val = enc;
-                    ca[i].has_any = 1;
-                } else {
-                    if (enc < ca[i].min_val) ca[i].min_val = enc;
-                    if (enc > ca[i].max_val) ca[i].max_val = enc;
-                }
-
-                if (!ca[i].skip_blob)
-                    hm_insert(&ca[i], enc);
-            }
-        }
-        cursor_close(cur);
-    }
-
-    /* ----------------------------------------------------------------
-     * Phase 2: write per-column stats.
-     * ---------------------------------------------------------------- */
-    for (int i = 0; i < rel->num_columns; i++) {
-        ColumnStats *cs = &sf.pages[slot_idx].cols[i];
-
-        cs->has_stats    = 1;
-        cs->total_rows   = total_rows;
-        cs->num_nulls    = ca[i].null_count;
-        cs->num_distinct = ca[i].distinct_count;
-        cs->min_numeric  = ca[i].min_val;
-        cs->max_numeric  = ca[i].max_val;
-
-        if (total_rows == 0 || ca[i].skip_blob) {
-            /* VARCHAR or empty table: scalar stats only. */
-            cs->stats_type = STATS_TYPE_NONE;
-            continue;
-        }
-
-        /* Decide: MCV or histogram?
-         *
-         * BOOL and ENUM always get MCV — their cardinality is tiny.
-         * For other types: MCV when we can store all distinct values
-         * exactly (num_distinct ≤ STATS_MAX_ENTRIES); histogram otherwise. */
-        DataType dtype = rel->columns[i].type;
-        int want_mcv = (dtype == TYPE_BOOL || dtype == TYPE_ENUM)
-                       || (ca[i].distinct_count <= STATS_MAX_ENTRIES);
-
-        /* Extract all live (key, count) pairs from the hash map. */
-        KVPair pairs[ANALYZE_HM_LIMIT];
-        int    npairs = hm_extract(&ca[i], pairs, ANALYZE_HM_LIMIT);
-
-        if (npairs == 0) {
-            cs->stats_type = STATS_TYPE_NONE;
-            continue;
-        }
-
-        if (want_mcv) {
-            /* Sort by frequency descending so the planner can short-circuit
-             * the MCV scan as soon as accumulated probability exceeds the
-             * predicate value. */
-            qsort(pairs, (size_t)npairs, sizeof(KVPair), kv_cmp_freq);
-
-            MCVEntry entries[STATS_MAX_ENTRIES];
-            int      nentries = (npairs < STATS_MAX_ENTRIES)
-                                 ? npairs : STATS_MAX_ENTRIES;
-            for (int j = 0; j < nentries; j++) {
-                entries[j].value     = pairs[j].key;
-                entries[j].frequency = pairs[j].count;
-                entries[j].pad       = 0;
-            }
-            /* Ignore MYDB_ERR_FULL — the page still gets saved with
-             * whatever columns fit. */
-            stats_write_mcv(&sf, slot_idx, i, entries, (uint16_t)nentries);
-
-        } else {
-            /* Equi-height histogram.
-             *
-             * Sort pairs by key (ascending) then divide into
-             * STATS_MAX_ENTRIES buckets of roughly equal cumulative count. */
-            qsort(pairs, (size_t)npairs, sizeof(KVPair), kv_cmp_key);
-
-            /* Sum of counts from sampled values (may be < total_rows if
-             * we hit ANALYZE_HM_LIMIT and stopped tracking new keys). */
-            uint64_t total_in_hm = 0;
-            for (int j = 0; j < npairs; j++)
-                total_in_hm += pairs[j].count;
-
-            int nbuckets = (npairs < STATS_MAX_ENTRIES)
-                            ? npairs : STATS_MAX_ENTRIES;
-            uint64_t target = (total_in_hm + (uint64_t)nbuckets - 1)
-                              / (uint64_t)nbuckets;  /* ceil */
-
-            HistBucket buckets[STATS_MAX_ENTRIES];
-            int        nb = 0;
-            uint64_t   accum = 0;
-
-            for (int j = 0; j < npairs && nb < STATS_MAX_ENTRIES; j++) {
-                accum += pairs[j].count;
-                /* Close the bucket on the last pair OR when accumulated
-                 * count meets the target. */
-                int is_last = (j == npairs - 1);
-                if (accum >= target || is_last) {
-                    buckets[nb].upper_bound = pairs[j].key;
-                    buckets[nb].row_count   = (uint32_t)(accum > UINT32_MAX
-                                                          ? UINT32_MAX : accum);
-                    buckets[nb].pad = 0;
-                    nb++;
-                    accum = 0;
-                }
-            }
-
-            stats_write_hist(&sf, slot_idx, i, buckets, (uint16_t)nb);
-        }
-    }
-
-    /* Persist the stats page to __stats.mydb. */
-    rc = stats_save_relation(&sf, slot_idx);
-    stats_close(&sf);
-    return rc;
+    if (!se || !table_name) return 0;
+    OpenTable *ot = find_open(se, table_name);
+    if (!ot) return 0;
+    return ot->dm.num_pages;
 }

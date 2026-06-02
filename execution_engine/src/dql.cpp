@@ -497,7 +497,8 @@ static Row make_key_row(const GroupKey      &key,
  *   - Aggregate slots are live (col_idx, counters, etc.).
  *   - Column slots are zero-initialised and never read.
  */
-static int exec_group_by(const SelectStatement *s,
+static int exec_group_by(ExecContext           *ectx,
+                         const SelectStatement *s,
                          const RelationDef     *rel,
                          RelationDef           *rel_rw,
                          char *out, size_t cap)
@@ -543,17 +544,17 @@ static int exec_group_by(const SelectStatement *s,
 
     switch (ap.kind) {
     case AP_GET_PK: {
-        Row *r = storage_get_by_pk(rel_rw, &ap.key);
+        Row *r = pm_get_by_pk(ectx->partition, rel_rw, &ap.key);
         if (r) feed_row(r);
         break;
     }
     case AP_GET_INDEX: {
-        Row *r = storage_get_by_index(rel_rw, ap.col_idx, &ap.key);
+        Row *r = pm_get_by_index(ectx->partition, rel_rw, ap.col_idx, &ap.key);
         if (r) feed_row(r);
         break;
     }
     case AP_SCAN_FROM: {
-        Cursor *cur = storage_scan_from(rel_rw, &ap.key);
+        Cursor *cur = pm_scan_from(ectx->partition, rel_rw, &ap.key);
         if (cur) {
             Row *r;
             while ((r = cursor_next(cur)) != NULL) feed_row(r);
@@ -562,7 +563,7 @@ static int exec_group_by(const SelectStatement *s,
         break;
     }
     case AP_SCAN_BY_INDEX: {
-        Cursor *cur = storage_scan_by_index(rel_rw, ap.col_idx, &ap.key);
+        Cursor *cur = pm_scan_by_index(ectx->partition, rel_rw, ap.col_idx, &ap.key);
         if (cur) {
             Row *r;
             while ((r = cursor_next(cur)) != NULL) feed_row(r);
@@ -571,7 +572,7 @@ static int exec_group_by(const SelectStatement *s,
         break;
     }
     default: {
-        Cursor *cur = storage_scan(rel_rw);
+        Cursor *cur = pm_scan(ectx->partition, rel_rw);
         if (cur) {
             Row *r;
             while ((r = cursor_next(cur)) != NULL) feed_row(r);
@@ -645,14 +646,14 @@ static int exec_group_by(const SelectStatement *s,
  * each additional table one step at a time, accumulating a set of
  * "combined rows" (one storage Row per participating table).
  *
- * Per-step access path (planner-style, driven by indexes + stats):
+ * Per-step access path (planner-style, driven by indexes):
  *   - both join columns indexed (2-table case)  -> SORT_MERGE   (O(n+m))
  *   - inner table join column indexed           -> INDEX_NLJ    (O(n log m))
  *   - neither indexed                           -> HASH_JOIN    (O(n+m))
  *
- * The ON condition pairs rows during the join; the WHERE clause is applied
- * once at the end over the fully combined row (standard SQL semantics: a
- * WHERE on the right side of a LEFT JOIN correctly drops NULL-padded rows).
+ * v3: all storage access goes through the pm_* wrappers on the partition
+ * context (ectx->partition); the ON condition pairs rows, the WHERE clause
+ * is applied once at the end over the fully combined row.
  * ====================================================================== */
 
 /* One table participating in the join. */
@@ -735,27 +736,27 @@ static std::string vkey(const Value &v)
 }
 
 /* Open a cursor that returns rows sorted by `col` (PK scan or index scan). */
-static Cursor *open_sorted_cursor(RelationDef *rel, int col)
+static Cursor *open_sorted_cursor(PartitionCtx *pc, RelationDef *rel, int col)
 {
-    if (col == (int)rel->pk_col_idx) return storage_scan(rel);
-    return storage_scan_by_index(rel, col, nullptr);
+    if (col == (int)rel->pk_col_idx) return pm_scan(pc, rel);
+    return pm_scan_by_index(pc, rel, col, nullptr);
 }
 
 /* Fetch all inner rows whose `col` equals key. rk is the index kind. */
-static std::vector<Row> lookup_right(RelationDef *rrel, int col,
-                                     const Value &key, int rk)
+static std::vector<Row> lookup_right(PartitionCtx *pc, RelationDef *rrel,
+                                     int col, const Value &key, int rk)
 {
     std::vector<Row> res;
-    Value k = key;   /* storage API takes non-const */
+    Value k = key;   /* pm API takes non-const */
 
     if (col == (int)rrel->pk_col_idx) {
-        Row *r = storage_get_by_pk(rrel, &k);
+        Row *r = pm_get_by_pk(pc, rrel, &k);
         if (r) res.push_back(*r);
     } else if (rk == 1) {
-        Row *r = storage_get_by_index(rrel, col, &k);
+        Row *r = pm_get_by_index(pc, rrel, col, &k);
         if (r) res.push_back(*r);
     } else {
-        Cursor *c = storage_scan_by_index(rrel, col, &k);
+        Cursor *c = pm_scan_by_index(pc, rrel, col, &k);
         if (c) {
             Row *r;
             while ((r = cursor_next(c)) != NULL) {
@@ -924,14 +925,15 @@ static bool j_eval(const Expr *e, const std::vector<JoinSeg> &segs,
 /*  Sort-merge join (2-table fast path, both join columns indexed)     */
 /* ------------------------------------------------------------------ */
 static std::vector<JoinedRow>
-sort_merge_two(RelationDef *L, int lc, RelationDef *R, int rc, JoinType type)
+sort_merge_two(PartitionCtx *pc, RelationDef *L, int lc,
+               RelationDef *R, int rc, JoinType type)
 {
     std::vector<JoinedRow> out;
     bool keepL = (type == JoinType::LEFT  || type == JoinType::FULL);
     bool keepR = (type == JoinType::RIGHT || type == JoinType::FULL);
 
-    Cursor *lcur = open_sorted_cursor(L, lc);
-    Cursor *rcur = open_sorted_cursor(R, rc);
+    Cursor *lcur = open_sorted_cursor(pc, L, lc);
+    Cursor *rcur = open_sorted_cursor(pc, R, rc);
 
     Row lrow, rrow;
     Row *lp = lcur ? cursor_next(lcur) : nullptr; bool lhave = lp; if (lp) lrow = *lp;
@@ -979,9 +981,8 @@ sort_merge_two(RelationDef *L, int lc, RelationDef *R, int rc, JoinType type)
 /* ------------------------------------------------------------------ */
 /*  One fold step: accumulated `left` ⋈ segs[step.right_seg]           */
 /* ------------------------------------------------------------------ */
-static void join_step(const std::vector<JoinSeg> &segs,
-                      std::vector<JoinedRow> &left,
-                      const JoinStep &st)
+static void join_step(PartitionCtx *pc, const std::vector<JoinSeg> &segs,
+                      std::vector<JoinedRow> &left, const JoinStep &st)
 {
     RelationDef *rrel  = (RelationDef *)segs[st.right_seg].rel;
     size_t       total = segs.size();
@@ -992,7 +993,7 @@ static void join_step(const std::vector<JoinSeg> &segs,
     /* Cartesian product (implicit join with no linking equality). */
     if (st.cross) {
         std::vector<Row> rrows;
-        Cursor *c = storage_scan(rrel);
+        Cursor *c = pm_scan(pc, rrel);
         if (c) { Row *r; while ((r = cursor_next(c)) != NULL) rrows.push_back(*r);
                  cursor_close(c); }
         for (auto &lr : left)
@@ -1025,7 +1026,7 @@ static void join_step(const std::vector<JoinSeg> &segs,
             Value key = lr.cells[st.prev_seg].cols[st.prev_col];
             if (key.is_null) { if (keepL) out.push_back(lr); continue; }
 
-            std::vector<Row> ms = lookup_right(rrel, st.new_col, key, rk);
+            std::vector<Row> ms = lookup_right(pc, rrel, st.new_col, key, rk);
             if (!ms.empty())
                 for (auto &R : ms) {
                     JoinedRow nr = lr;
@@ -1037,7 +1038,7 @@ static void join_step(const std::vector<JoinSeg> &segs,
     } else {
         /* HASH_JOIN — build a hash table on the inner (right) table. */
         std::unordered_map<std::string, std::vector<Row>> hm;
-        Cursor *c = storage_scan(rrel);
+        Cursor *c = pm_scan(pc, rrel);
         if (c) {
             Row *r;
             while ((r = cursor_next(c)) != NULL) {
@@ -1064,7 +1065,7 @@ static void join_step(const std::vector<JoinSeg> &segs,
 
     /* RIGHT / FULL — append inner rows that never matched any left row. */
     if (keepR) {
-        Cursor *c = storage_scan(rrel);
+        Cursor *c = pm_scan(pc, rrel);
         if (c) {
             Row *r;
             while ((r = cursor_next(c)) != NULL) {
@@ -1112,10 +1113,12 @@ static void collect_eq(const Expr *e, const std::vector<JoinSeg> &segs,
 /* ====================================================================== */
 /*  exec_join_select — top-level JOIN handler                            */
 /* ====================================================================== */
-static int exec_join_select(EngineState *eng, const SelectStatement *s,
+static int exec_join_select(ExecContext *ectx, const SelectStatement *s,
                             char *out, size_t cap)
 {
-    int rc = engine_check_access(eng, 0);
+    PartitionCtx *pc = ectx->partition;
+
+    int rc = engine_check_access(ectx->engine, 0);
     if (rc != MYDB_OK) {
         format_error(rc, out, cap, s->from_list[0].table_name.c_str());
         return rc;
@@ -1135,7 +1138,7 @@ static int exec_join_select(EngineState *eng, const SelectStatement *s,
     /* ---- Build the segment list (FROM tables, then JOIN tables) ---- */
     std::vector<JoinSeg> segs;
     for (const auto &fi : s->from_list) {
-        const RelationDef *r = engine_find_relation(eng, fi.table_name.c_str());
+        const RelationDef *r = pm_find_relation_const(pc, fi.table_name.c_str());
         if (!r) {
             snprintf(out, cap, "  Error: table '%s' does not exist",
                      fi.table_name.c_str());
@@ -1145,7 +1148,7 @@ static int exec_join_select(EngineState *eng, const SelectStatement *s,
     }
     int first_join_seg = (int)segs.size();
     for (const auto &jc : s->join_list) {
-        const RelationDef *r = engine_find_relation(eng, jc.join_table.c_str());
+        const RelationDef *r = pm_find_relation_const(pc, jc.join_table.c_str());
         if (!r) {
             snprintf(out, cap, "  Error: table '%s' does not exist",
                      jc.join_table.c_str());
@@ -1258,7 +1261,8 @@ static int exec_join_select(EngineState *eng, const SelectStatement *s,
         int lk = seg_index_kind(segs[st.prev_seg].rel,  st.prev_col);
         int rk = seg_index_kind(segs[st.right_seg].rel, st.new_col);
         if (lk != 0 && rk != 0) {
-            acc = sort_merge_two((RelationDef *)segs[st.prev_seg].rel,  st.prev_col,
+            acc = sort_merge_two(pc,
+                                 (RelationDef *)segs[st.prev_seg].rel,  st.prev_col,
                                  (RelationDef *)segs[st.right_seg].rel, st.new_col,
                                  st.type);
             done = true;
@@ -1267,7 +1271,7 @@ static int exec_join_select(EngineState *eng, const SelectStatement *s,
 
     if (!done) {
         /* General path: scan the first table, then fold each step. */
-        Cursor *c = storage_scan((RelationDef *)segs[0].rel);
+        Cursor *c = pm_scan(pc, (RelationDef *)segs[0].rel);
         if (c) {
             Row *r;
             while ((r = cursor_next(c)) != NULL) {
@@ -1279,7 +1283,7 @@ static int exec_join_select(EngineState *eng, const SelectStatement *s,
             }
             cursor_close(c);
         }
-        for (const auto &st : steps) join_step(segs, acc, st);
+        for (const auto &st : steps) join_step(pc, segs, acc, st);
     }
 
     /* ---- Final WHERE filter over the combined rows ---- */
@@ -1357,11 +1361,11 @@ static int exec_join_select(EngineState *eng, const SelectStatement *s,
  * exec_select — entry point
  * ====================================================================== */
 
-int exec_select(EngineState *eng, const SelectStatement *s,
+int exec_select(ExecContext *ectx, const SelectStatement *s,
                 char *out, size_t cap)
 {
-    REQUIRE_LOGIN(eng);
-    REQUIRE_SCHEMA(eng);
+    REQUIRE_LOGIN(ectx);
+    REQUIRE_SCHEMA(ectx);
 
     /* ------------------------------------------------------------------
      * Classify the SELECT list.
@@ -1378,7 +1382,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
      * join handler.  Single-table SELECT continues below.
      * ------------------------------------------------------------------ */
     if (!s->join_list.empty() || s->from_list.size() > 1)
-        return exec_join_select(eng, s, out, cap);
+        return exec_join_select(ectx, s, out, cap);
 
     /* Without GROUP BY: mixing aggregate and non-aggregate columns is
      * undefined (which non-aggregate value would appear in the result?).
@@ -1401,13 +1405,13 @@ int exec_select(EngineState *eng, const SelectStatement *s,
     /* ------------------------------------------------------------------
      * Step 1: read access check + find the table.
      * ------------------------------------------------------------------ */
-    int rc = engine_check_access(eng, 0);
+    int rc = engine_check_access(ectx->engine, 0);
     if (rc != MYDB_OK) {
         format_error(rc, out, cap, s->from_list[0].table_name.c_str());
         return rc;
     }
 
-    const RelationDef *rel = engine_find_relation(eng, s->from_list[0].table_name.c_str());
+    const RelationDef *rel = pm_find_relation_const(ectx->partition, s->from_list[0].table_name.c_str());
     if (!rel) {
         snprintf(out, cap, "  Error: table '%s' does not exist",
                  s->from_list[0].table_name.c_str());
@@ -1535,7 +1539,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
             }
         }
 
-        return exec_group_by(s, rel, rel_rw, out, cap);
+        return exec_group_by(ectx, s, rel, rel_rw, out, cap);
     }
 
     /* ------------------------------------------------------------------
@@ -1561,7 +1565,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
      * ------------------------------------------------------------------ */
     Sarg       sargs[32];
     int        n_sargs = extract_sargs(s->where_clause.get(), rel, sargs, 32);
-    PlanNode   plan    = planner_choose_path(eng, rel, sargs, n_sargs);
+    PlanNode   plan    = planner_choose_path(pctx_active_schema(ectx->partition), ectx->stats, rel, sargs, n_sargs);
     AccessPath ap      = plan_to_ap(plan, s->where_clause.get(), rel);
 
     /* ==================================================================
@@ -1584,19 +1588,19 @@ int exec_select(EngineState *eng, const SelectStatement *s,
 
         switch (ap.kind) {
         case AP_GET_PK: {
-            Row *row = storage_get_by_pk(rel_rw, &ap.key);
+            Row *row = pm_get_by_pk(ectx->partition, rel_rw, &ap.key);
             if (row && where_matches(s->where_clause.get(), rel, row))
                 agg_accumulate(states, n, s, rel, row);
             break;
         }
         case AP_GET_INDEX: {
-            Row *row = storage_get_by_index(rel_rw, ap.col_idx, &ap.key);
+            Row *row = pm_get_by_index(ectx->partition, rel_rw, ap.col_idx, &ap.key);
             if (row && where_matches(s->where_clause.get(), rel, row))
                 agg_accumulate(states, n, s, rel, row);
             break;
         }
         case AP_SCAN_FROM: {
-            Cursor *cur = storage_scan_from(rel_rw, &ap.key);
+            Cursor *cur = pm_scan_from(ectx->partition, rel_rw, &ap.key);
             if (cur) {
                 Row *row;
                 while ((row = cursor_next(cur)) != NULL)
@@ -1607,7 +1611,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
             break;
         }
         case AP_SCAN_BY_INDEX: {
-            Cursor *cur = storage_scan_by_index(rel_rw, ap.col_idx, &ap.key);
+            Cursor *cur = pm_scan_by_index(ectx->partition, rel_rw, ap.col_idx, &ap.key);
             if (cur) {
                 Row *row;
                 while ((row = cursor_next(cur)) != NULL)
@@ -1618,7 +1622,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
             break;
         }
         default: {
-            Cursor *cur = storage_scan(rel_rw);
+            Cursor *cur = pm_scan(ectx->partition, rel_rw);
             if (cur) {
                 Row *row;
                 while ((row = cursor_next(cur)) != NULL)
@@ -1649,19 +1653,19 @@ int exec_select(EngineState *eng, const SelectStatement *s,
 
     switch (ap.kind) {
     case AP_GET_PK: {
-        Row *row = storage_get_by_pk(rel_rw, &ap.key);
+        Row *row = pm_get_by_pk(ectx->partition, rel_rw, &ap.key);
         if (row && where_matches(s->where_clause.get(), rel, row))
             all_rows.push_back(*row);
         break;
     }
     case AP_GET_INDEX: {
-        Row *row = storage_get_by_index(rel_rw, ap.col_idx, &ap.key);
+        Row *row = pm_get_by_index(ectx->partition, rel_rw, ap.col_idx, &ap.key);
         if (row && where_matches(s->where_clause.get(), rel, row))
             all_rows.push_back(*row);
         break;
     }
     case AP_SCAN_FROM: {
-        Cursor *cur = storage_scan_from(rel_rw, &ap.key);
+        Cursor *cur = pm_scan_from(ectx->partition, rel_rw, &ap.key);
         if (cur) {
             Row *row;
             while ((row = cursor_next(cur)) != NULL)
@@ -1672,7 +1676,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
         break;
     }
     case AP_SCAN_BY_INDEX: {
-        Cursor *cur = storage_scan_by_index(rel_rw, ap.col_idx, &ap.key);
+        Cursor *cur = pm_scan_by_index(ectx->partition, rel_rw, ap.col_idx, &ap.key);
         if (cur) {
             Row *row;
             while ((row = cursor_next(cur)) != NULL)
@@ -1683,7 +1687,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
         break;
     }
     default: {
-        Cursor *cur = storage_scan(rel_rw);
+        Cursor *cur = pm_scan(ectx->partition, rel_rw);
         if (cur) {
             Row *row;
             while ((row = cursor_next(cur)) != NULL)

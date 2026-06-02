@@ -94,7 +94,6 @@
  */
 
 #include "planner.h"
-#include "engine.h"
 #include "schema_file.h"
 
 #include <string.h>
@@ -371,7 +370,8 @@ static int best_sarg_for_col(const Sarg *sargs, int n_sargs, int col_idx,
 /* ================================================================== */
 /*  planner_choose_path — public                                      */
 /* ================================================================== */
-PlanNode planner_choose_path(struct EngineState *eng,
+PlanNode planner_choose_path(const SchemaFile   *schema,
+                              StatsFile          *sf,
                               const RelationDef  *rel,
                               const Sarg         *sargs,
                               int                 n_sargs)
@@ -382,14 +382,19 @@ PlanNode planner_choose_path(struct EngineState *eng,
     /* ----------------------------------------------------------------
      * Fetch physical-size metadata from the RelationEntry.
      * These three fields feed every cost formula.
+     *
+     * schema is the partition's active SchemaFile, supplied by the
+     * partition_manager via the execution engine.  schema_find_relation_stat
+     * takes a non-const SchemaFile*; the planner only reads it, so the
+     * const is cast away locally (read-only contract preserved).
      * ---------------------------------------------------------------- */
     RelationEntry *ent = schema_find_relation_stat(
-                             &eng->active_schema, rel->relation_name);
+                             (SchemaFile *)schema, rel->relation_name);
 
     uint32_t num_pages   = (ent && ent->num_pages   > 0) ? ent->num_pages   : 1;
     uint32_t num_rows    = (ent && ent->num_rows     > 0) ? ent->num_rows    : 1;
     uint8_t  tree_height = (ent && ent->tree_height  > 0) ? ent->tree_height : 3;
-    int      slot_idx    = ent ? (int)(ent - eng->active_schema.relations) : -1;
+    int      slot_idx    = ent ? (int)(ent - schema->relations) : -1;
 
     int pk_col = (int)rel->pk_col_idx;
 
@@ -466,25 +471,15 @@ PlanNode planner_choose_path(struct EngineState *eng,
     /* ================================================================
      * CBO: genuine ambiguity — compare FULL_SCAN vs index candidates.
      *
-     * Open __stats.mydb to get column selectivity estimates.  If the
-     * file doesn't exist (ANALYZE hasn't been run), selectivity_estimate
-     * falls back to hard-coded defaults, which bias toward FULL_SCAN.
+     * The engine's StatsBuffer hands us an open StatsFile* (or NULL).  We
+     * load this relation's stats page on demand.  If sf is NULL or the page
+     * was never written (ANALYZE not run), selectivity_estimate falls back
+     * to hard-coded defaults, which bias toward FULL_SCAN.
      * ================================================================ */
-    StatsFile sf;
-    int file_opened = 0;
-    int stats_ok    = 0;
+    int stats_ok = 0;
 
-    if (slot_idx >= 0) {
-        char stats_path[512];
-        snprintf(stats_path, sizeof(stats_path), "%s/%s/__stats.mydb",
-                 eng->current_partition_path,
-                 eng->current_schema_name);
-
-        if (stats_open(stats_path, &sf) == MYDB_OK) {
-            file_opened = 1;
-            stats_ok = (stats_load_relation(&sf, slot_idx) == MYDB_OK);
-        }
-    }
+    if (sf && slot_idx >= 0)
+        stats_ok = (stats_load_relation(sf, slot_idx) == MYDB_OK);
 
     /* Baseline: FULL_SCAN.  Every candidate must beat this to win. */
     float best_cost = (float)num_pages * PLANNER_SEQ_IO;
@@ -510,11 +505,11 @@ PlanNode planner_choose_path(struct EngineState *eng,
 
         if (best_sarg_for_col(sargs, n_sargs, pk_col, op, &lo, &hi)) {
             ColumnStats *cs   = stats_ok
-                                 ? stats_get_column(&sf, slot_idx, pk_col) : NULL;
+                                 ? stats_get_column(sf, slot_idx, pk_col) : NULL;
             MCVEntry    *mcv  = stats_ok
-                                 ? stats_get_mcv   (&sf, slot_idx, pk_col) : NULL;
+                                 ? stats_get_mcv   (sf, slot_idx, pk_col) : NULL;
             HistBucket  *hist = stats_ok
-                                 ? stats_get_hist  (&sf, slot_idx, pk_col) : NULL;
+                                 ? stats_get_hist  (sf, slot_idx, pk_col) : NULL;
 
             float sel  = selectivity_estimate(cs, mcv, hist, op, lo, hi);
             float cost = (float)tree_height * PLANNER_RAND_IO
@@ -554,11 +549,11 @@ PlanNode planner_choose_path(struct EngineState *eng,
             continue;
 
         ColumnStats *cs   = stats_ok
-                             ? stats_get_column(&sf, slot_idx, ci) : NULL;
+                             ? stats_get_column(sf, slot_idx, ci) : NULL;
         MCVEntry    *mcv  = stats_ok
-                             ? stats_get_mcv   (&sf, slot_idx, ci) : NULL;
+                             ? stats_get_mcv   (sf, slot_idx, ci) : NULL;
         HistBucket  *hist = stats_ok
-                             ? stats_get_hist  (&sf, slot_idx, ci) : NULL;
+                             ? stats_get_hist  (sf, slot_idx, ci) : NULL;
 
         float sel  = selectivity_estimate(cs, mcv, hist, op, lo, hi);
         float cost = (float)tree_height * PLANNER_RAND_IO
@@ -573,6 +568,7 @@ PlanNode planner_choose_path(struct EngineState *eng,
         }
     }
 
-    if (file_opened) stats_close(&sf);
+    /* The StatsFile handle is owned by the engine's StatsBuffer — the
+     * planner does not close it. */
     return p;
 }

@@ -25,7 +25,7 @@
  * .cpp file that includes ast_executor.hpp can read and test this flag. */
 bool g_in_explicit_txn = false;
 
-int exec_tcl(EngineState * /*eng*/, const TransactionStatement *s,
+int exec_tcl(ExecContext *ectx, const TransactionStatement *s,
              char *out, size_t cap)
 {
     int rc;
@@ -37,9 +37,9 @@ int exec_tcl(EngineState * /*eng*/, const TransactionStatement *s,
             snprintf(out, cap, "  Error: there is already an open transaction");
             return MYDB_ERR;
         }
-        rc = storage_begin();
+        rc = pm_begin(ectx->partition);
         if (rc != MYDB_OK) {
-            snprintf(out, cap, "  Error: storage_begin failed (rc=%d)", rc);
+            snprintf(out, cap, "  Error: pm_begin failed (rc=%d)", rc);
             return rc;
         }
         g_in_explicit_txn = true;
@@ -51,7 +51,7 @@ int exec_tcl(EngineState * /*eng*/, const TransactionStatement *s,
             snprintf(out, cap, "  Error: no active transaction");
             return MYDB_ERR_NO_TXN;
         }
-        rc = storage_commit();
+        rc = pm_commit(ectx->partition);
         g_in_explicit_txn = false;   /* clear even on error — txn is dead */
         if (rc != MYDB_OK) {
             snprintf(out, cap, "  Error: commit failed (rc=%d)", rc);
@@ -65,7 +65,7 @@ int exec_tcl(EngineState * /*eng*/, const TransactionStatement *s,
             snprintf(out, cap, "  Error: no active transaction");
             return MYDB_ERR_NO_TXN;
         }
-        rc = storage_rollback();
+        rc = pm_rollback(ectx->partition);
         g_in_explicit_txn = false;
         if (rc != MYDB_OK) {
             snprintf(out, cap, "  Error: rollback failed (rc=%d)", rc);

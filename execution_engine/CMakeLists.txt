@@ -1,24 +1,26 @@
-# execution_engine — AST walker that sits between the parser and storage.
+# execution_engine — AST walker that sits between the parser and
+# partition_manager.
 #
 # Public API: one C-callable function
-#   int exec_engine_execute(EngineState *, ParserAST *, char *, size_t)
+#   int exec_engine_execute(ExecContext *, ParserAST *, char *, size_t)
 # declared in include/exec_engine_api.h.
 #
 # Link topology note
 # ──────────────────
 # engine → execution_engine (engine is the sole caller of exec_engine_execute).
-# execution_engine → storage_engine  (DML / DQL storage calls).
-# execution_engine → query_parser    (AST types, parser_ast_node).
+# execution_engine → partition_manager (pm_* DDL/DML/DQL/TCL wrappers).
+# execution_engine → planner           (cost-based access path selection).
+# execution_engine → query_parser      (AST types, parser_ast_node).
 #
 # execution_engine does NOT link against `engine` to avoid a circular
 # CMake target dependency.  It only needs engine/include for the
-# EngineState type and engine_* function signatures; the actual symbols
-# are resolved at final-binary link time because every executable that
-# uses the executor also links `engine` (which brings both libraries in).
+# EngineState / ExecContext / Connection types and engine_* signatures;
+# the actual engine_* symbols are resolved at final-binary link time
+# because every executable that uses the executor also links `engine`.
 #
-# engine/include and system_schema/include are added as PRIVATE include
-# paths so implementation files can #include "engine.h" / "system_schema.h"
-# without exposing those paths to downstream consumers of this library.
+# engine/include, system_schema/include and partition_manager/include are
+# added so implementation files can #include "engine.h" / "exec_context.h" /
+# "pm_api.h" etc.  partition_manager is linked (it owns the pm_* symbols).
 
 add_library(execution_engine STATIC
     src/exec_engine_api.cpp
@@ -41,11 +43,12 @@ target_include_directories(execution_engine PUBLIC
 target_include_directories(execution_engine PRIVATE
     ${CMAKE_SOURCE_DIR}/engine/include
     ${CMAKE_SOURCE_DIR}/system_schema/include
+    ${CMAKE_SOURCE_DIR}/partition_manager/include
 )
 
 target_link_libraries(execution_engine
     PUBLIC query_parser
-    PUBLIC storage_engine
+    PUBLIC partition_manager
     PUBLIC planner
 )
 

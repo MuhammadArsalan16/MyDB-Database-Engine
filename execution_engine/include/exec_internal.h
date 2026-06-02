@@ -24,12 +24,15 @@
  *
  * Usage pattern in every DML handler:
  *
- *   AUTOCOMMIT_BEGIN();
- *   rc = storage_insert(rel, &row);   // or update / delete
- *   AUTOCOMMIT_END(rc);
+ *   AUTOCOMMIT_BEGIN(ectx);
+ *   rc = pm_insert(ectx->partition, rel, &row);   // or update / delete
+ *   AUTOCOMMIT_END(ectx, rc);
  *   return rc;
  *
  * AUTOCOMMIT_END does NOT change rc — the caller keeps it.
+ *
+ * The transaction boundary is driven through the partition_manager
+ * (pm_begin / pm_commit / pm_rollback), which owns the TransactionManager.
  */
 
 /*
@@ -37,38 +40,39 @@
  * ---------------------------------------------------
  * Precondition guards used at the top of every handler.
  * Each expands to a complete if-return so it is safe without braces.
+ * The per-session flags now live on the Connection inside ExecContext.
  * Requires: `out`, `cap` in scope (the handler's output buffer params).
  */
 
-#define REQUIRE_LOGIN(eng)                                              \
-    if (!(eng)->logged_in) {                                            \
+#define REQUIRE_LOGIN(ectx)                                             \
+    if (!(ectx)->conn->logged_in) {                                     \
         snprintf(out, cap, "  Error: not logged in");                   \
         return MYDB_ERR_PERM;                                           \
     }
 
-#define REQUIRE_SCHEMA(eng)                                                         \
-    if (!(eng)->schema_active) {                                                    \
+#define REQUIRE_SCHEMA(ectx)                                                        \
+    if (!(ectx)->conn->schema_active) {                                             \
         snprintf(out, cap,                                                          \
                  "  Error: no schema selected — run USE <schema> first");           \
         return MYDB_ERR;                                                            \
     }
 
-#define REQUIRE_PARTITION(eng)                                              \
-    if (!(eng)->partition_open) {                                           \
+#define REQUIRE_PARTITION(ectx)                                            \
+    if (!(ectx)->conn->partition_open) {                                    \
         snprintf(out, cap, "  Error: user owns no partition");              \
         return MYDB_ERR_PERM;                                               \
     }
 
-#define AUTOCOMMIT_BEGIN()              \
-    do {                                \
-        if (!g_in_explicit_txn)         \
-            storage_begin();            \
+#define AUTOCOMMIT_BEGIN(ectx)              \
+    do {                                    \
+        if (!g_in_explicit_txn)             \
+            pm_begin((ectx)->partition);    \
     } while (0)
 
-#define AUTOCOMMIT_END(_rc_)                        \
-    do {                                            \
-        if (!g_in_explicit_txn) {                   \
-            if ((_rc_) == MYDB_OK) storage_commit();\
-            else                   storage_rollback();\
-        }                                           \
+#define AUTOCOMMIT_END(ectx, _rc_)                              \
+    do {                                                        \
+        if (!g_in_explicit_txn) {                               \
+            if ((_rc_) == MYDB_OK) pm_commit((ectx)->partition);\
+            else                   pm_rollback((ectx)->partition);\
+        }                                                       \
     } while (0)

@@ -14,16 +14,16 @@
 
 #include <cstdio>
 
-extern "C" int exec_engine_execute(struct EngineState *eng,
-                                   ParserAST          *ast,
-                                   char               *result_out,
-                                   size_t              result_cap)
+extern "C" int exec_engine_execute(ExecContext *ectx,
+                                   ParserAST   *ast,
+                                   char        *result_out,
+                                   size_t       result_cap)
 {
     /* Basic precondition checks. */
-    if (!eng || !ast || !result_out || result_cap == 0)
+    if (!ectx || !ectx->conn || !ast || !result_out || result_cap == 0)
         return MYDB_ERR;
 
-    if (!eng->logged_in) {
+    if (!ectx->conn->logged_in) {
         std::snprintf(result_out, result_cap, "not logged in");
         return MYDB_ERR_PERM;
     }
@@ -34,5 +34,5 @@ extern "C" int exec_engine_execute(struct EngineState *eng,
         return MYDB_ERR;
     }
 
-    return exec_dispatch(eng, node, result_out, result_cap);
+    return exec_dispatch(ectx, node, result_out, result_cap);
 }

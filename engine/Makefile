@@ -212,6 +212,30 @@ src/engine.c.s:
 	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f engine/CMakeFiles/engine.dir/build.make engine/CMakeFiles/engine.dir/src/engine.c.s
 .PHONY : src/engine.c.s
 
+src/stats_buffer.o: src/stats_buffer.c.o
+.PHONY : src/stats_buffer.o
+
+# target to build an object file
+src/stats_buffer.c.o:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f engine/CMakeFiles/engine.dir/build.make engine/CMakeFiles/engine.dir/src/stats_buffer.c.o
+.PHONY : src/stats_buffer.c.o
+
+src/stats_buffer.i: src/stats_buffer.c.i
+.PHONY : src/stats_buffer.i
+
+# target to preprocess a source file
+src/stats_buffer.c.i:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f engine/CMakeFiles/engine.dir/build.make engine/CMakeFiles/engine.dir/src/stats_buffer.c.i
+.PHONY : src/stats_buffer.c.i
+
+src/stats_buffer.s: src/stats_buffer.c.s
+.PHONY : src/stats_buffer.s
+
+# target to generate assembly for a file
+src/stats_buffer.c.s:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f engine/CMakeFiles/engine.dir/build.make engine/CMakeFiles/engine.dir/src/stats_buffer.c.s
+.PHONY : src/stats_buffer.c.s
+
 # Help Target
 help:
 	@echo "The following are some of the valid targets for this Makefile:"
@@ -231,6 +255,9 @@ help:
 	@echo "... src/engine.o"
 	@echo "... src/engine.i"
 	@echo "... src/engine.s"
+	@echo "... src/stats_buffer.o"
+	@echo "... src/stats_buffer.i"
+	@echo "... src/stats_buffer.s"
 .PHONY : help
 
 
