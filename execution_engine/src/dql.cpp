@@ -494,7 +494,8 @@ static Row make_key_row(const GroupKey      &key,
  *   - Aggregate slots are live (col_idx, counters, etc.).
  *   - Column slots are zero-initialised and never read.
  */
-static int exec_group_by(const SelectStatement *s,
+static int exec_group_by(ExecContext           *ectx,
+                         const SelectStatement *s,
                          const RelationDef     *rel,
                          RelationDef           *rel_rw,
                          char *out, size_t cap)
@@ -540,17 +541,17 @@ static int exec_group_by(const SelectStatement *s,
 
     switch (ap.kind) {
     case AP_GET_PK: {
-        Row *r = storage_get_by_pk(rel_rw, &ap.key);
+        Row *r = pm_get_by_pk(ectx->partition, rel_rw, &ap.key);
         if (r) feed_row(r);
         break;
     }
     case AP_GET_INDEX: {
-        Row *r = storage_get_by_index(rel_rw, ap.col_idx, &ap.key);
+        Row *r = pm_get_by_index(ectx->partition, rel_rw, ap.col_idx, &ap.key);
         if (r) feed_row(r);
         break;
     }
     case AP_SCAN_FROM: {
-        Cursor *cur = storage_scan_from(rel_rw, &ap.key);
+        Cursor *cur = pm_scan_from(ectx->partition, rel_rw, &ap.key);
         if (cur) {
             Row *r;
             while ((r = cursor_next(cur)) != NULL) feed_row(r);
@@ -559,7 +560,7 @@ static int exec_group_by(const SelectStatement *s,
         break;
     }
     case AP_SCAN_BY_INDEX: {
-        Cursor *cur = storage_scan_by_index(rel_rw, ap.col_idx, &ap.key);
+        Cursor *cur = pm_scan_by_index(ectx->partition, rel_rw, ap.col_idx, &ap.key);
         if (cur) {
             Row *r;
             while ((r = cursor_next(cur)) != NULL) feed_row(r);
@@ -568,7 +569,7 @@ static int exec_group_by(const SelectStatement *s,
         break;
     }
     default: {
-        Cursor *cur = storage_scan(rel_rw);
+        Cursor *cur = pm_scan(ectx->partition, rel_rw);
         if (cur) {
             Row *r;
             while ((r = cursor_next(cur)) != NULL) feed_row(r);
@@ -636,11 +637,11 @@ static int exec_group_by(const SelectStatement *s,
  * exec_select — entry point
  * ====================================================================== */
 
-int exec_select(EngineState *eng, const SelectStatement *s,
+int exec_select(ExecContext *ectx, const SelectStatement *s,
                 char *out, size_t cap)
 {
-    REQUIRE_LOGIN(eng);
-    REQUIRE_SCHEMA(eng);
+    REQUIRE_LOGIN(ectx);
+    REQUIRE_SCHEMA(ectx);
 
     /* ------------------------------------------------------------------
      * Classify the SELECT list.
@@ -681,13 +682,13 @@ int exec_select(EngineState *eng, const SelectStatement *s,
     /* ------------------------------------------------------------------
      * Step 1: read access check + find the table.
      * ------------------------------------------------------------------ */
-    int rc = engine_check_access(eng, 0);
+    int rc = engine_check_access(ectx->engine, 0);
     if (rc != MYDB_OK) {
         format_error(rc, out, cap, s->from_list[0].table_name.c_str());
         return rc;
     }
 
-    const RelationDef *rel = engine_find_relation(eng, s->from_list[0].table_name.c_str());
+    const RelationDef *rel = pm_find_relation_const(ectx->partition, s->from_list[0].table_name.c_str());
     if (!rel) {
         snprintf(out, cap, "  Error: table '%s' does not exist",
                  s->from_list[0].table_name.c_str());
@@ -815,7 +816,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
             }
         }
 
-        return exec_group_by(s, rel, rel_rw, out, cap);
+        return exec_group_by(ectx, s, rel, rel_rw, out, cap);
     }
 
     /* ------------------------------------------------------------------
@@ -841,7 +842,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
      * ------------------------------------------------------------------ */
     Sarg       sargs[32];
     int        n_sargs = extract_sargs(s->where_clause.get(), rel, sargs, 32);
-    PlanNode   plan    = planner_choose_path(eng, rel, sargs, n_sargs);
+    PlanNode   plan    = planner_choose_path(pctx_active_schema(ectx->partition), ectx->stats, rel, sargs, n_sargs);
     AccessPath ap      = plan_to_ap(plan, s->where_clause.get(), rel);
 
     /* ==================================================================
@@ -864,19 +865,19 @@ int exec_select(EngineState *eng, const SelectStatement *s,
 
         switch (ap.kind) {
         case AP_GET_PK: {
-            Row *row = storage_get_by_pk(rel_rw, &ap.key);
+            Row *row = pm_get_by_pk(ectx->partition, rel_rw, &ap.key);
             if (row && where_matches(s->where_clause.get(), rel, row))
                 agg_accumulate(states, n, s, rel, row);
             break;
         }
         case AP_GET_INDEX: {
-            Row *row = storage_get_by_index(rel_rw, ap.col_idx, &ap.key);
+            Row *row = pm_get_by_index(ectx->partition, rel_rw, ap.col_idx, &ap.key);
             if (row && where_matches(s->where_clause.get(), rel, row))
                 agg_accumulate(states, n, s, rel, row);
             break;
         }
         case AP_SCAN_FROM: {
-            Cursor *cur = storage_scan_from(rel_rw, &ap.key);
+            Cursor *cur = pm_scan_from(ectx->partition, rel_rw, &ap.key);
             if (cur) {
                 Row *row;
                 while ((row = cursor_next(cur)) != NULL)
@@ -887,7 +888,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
             break;
         }
         case AP_SCAN_BY_INDEX: {
-            Cursor *cur = storage_scan_by_index(rel_rw, ap.col_idx, &ap.key);
+            Cursor *cur = pm_scan_by_index(ectx->partition, rel_rw, ap.col_idx, &ap.key);
             if (cur) {
                 Row *row;
                 while ((row = cursor_next(cur)) != NULL)
@@ -898,7 +899,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
             break;
         }
         default: {
-            Cursor *cur = storage_scan(rel_rw);
+            Cursor *cur = pm_scan(ectx->partition, rel_rw);
             if (cur) {
                 Row *row;
                 while ((row = cursor_next(cur)) != NULL)
@@ -929,19 +930,19 @@ int exec_select(EngineState *eng, const SelectStatement *s,
 
     switch (ap.kind) {
     case AP_GET_PK: {
-        Row *row = storage_get_by_pk(rel_rw, &ap.key);
+        Row *row = pm_get_by_pk(ectx->partition, rel_rw, &ap.key);
         if (row && where_matches(s->where_clause.get(), rel, row))
             all_rows.push_back(*row);
         break;
     }
     case AP_GET_INDEX: {
-        Row *row = storage_get_by_index(rel_rw, ap.col_idx, &ap.key);
+        Row *row = pm_get_by_index(ectx->partition, rel_rw, ap.col_idx, &ap.key);
         if (row && where_matches(s->where_clause.get(), rel, row))
             all_rows.push_back(*row);
         break;
     }
     case AP_SCAN_FROM: {
-        Cursor *cur = storage_scan_from(rel_rw, &ap.key);
+        Cursor *cur = pm_scan_from(ectx->partition, rel_rw, &ap.key);
         if (cur) {
             Row *row;
             while ((row = cursor_next(cur)) != NULL)
@@ -952,7 +953,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
         break;
     }
     case AP_SCAN_BY_INDEX: {
-        Cursor *cur = storage_scan_by_index(rel_rw, ap.col_idx, &ap.key);
+        Cursor *cur = pm_scan_by_index(ectx->partition, rel_rw, ap.col_idx, &ap.key);
         if (cur) {
             Row *row;
             while ((row = cursor_next(cur)) != NULL)
@@ -963,7 +964,7 @@ int exec_select(EngineState *eng, const SelectStatement *s,
         break;
     }
     default: {
-        Cursor *cur = storage_scan(rel_rw);
+        Cursor *cur = pm_scan(ectx->partition, rel_rw);
         if (cur) {
             Row *row;
             while ((row = cursor_next(cur)) != NULL)

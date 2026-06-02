@@ -45,14 +45,14 @@ static int str_to_datatype(const char *s)
  * CREATE DATABASE
  * ====================================================================== */
 
-int exec_create_database(EngineState *eng,
+int exec_create_database(ExecContext *ectx,
                          const CreateDatabaseStatement *s,
                          char *out, size_t cap)
 {
-    REQUIRE_LOGIN(eng);
-    REQUIRE_PARTITION(eng);
+    REQUIRE_LOGIN(ectx);
+    REQUIRE_PARTITION(ectx);
 
-    int rc = storage_create_schema(s->name.c_str());
+    int rc = pm_create_schema(ectx->partition, s->name.c_str());
     if (rc != MYDB_OK) {
         if (rc == MYDB_ERR_DUPLICATE)
             snprintf(out, cap, "  Error: database '%s' already exists", s->name.c_str());
@@ -69,18 +69,18 @@ int exec_create_database(EngineState *eng,
  * DROP DATABASE
  * ====================================================================== */
 
-int exec_drop_database(EngineState *eng,
+int exec_drop_database(ExecContext *ectx,
                        const DropDatabaseStatement *s,
                        char *out, size_t cap)
 {
-    REQUIRE_LOGIN(eng);
-    REQUIRE_PARTITION(eng);
+    REQUIRE_LOGIN(ectx);
+    REQUIRE_PARTITION(ectx);
 
     /* The user must not be inside the schema they are dropping.
-     * storage_drop_schema rejects that with MYDB_ERR — surface a
+     * pm_drop_schema rejects that with MYDB_ERR — surface a
      * clearer message here. */
-    if (eng->schema_active &&
-        s->name == eng->current_schema_name) {
+    if (ectx->conn->schema_active &&
+        s->name == ectx->conn->current_schema_name) {
         snprintf(out, cap,
                  "  Error: cannot drop the currently active database '%s' "
                  "— run USE <another_db> or disconnect first",
@@ -88,7 +88,7 @@ int exec_drop_database(EngineState *eng,
         return MYDB_ERR;
     }
 
-    int rc = storage_drop_schema(s->name.c_str());
+    int rc = pm_drop_schema(ectx->partition, s->name.c_str());
     if (rc == MYDB_ERR_NOT_FOUND) {
         snprintf(out, cap, "  Error: database '%s' does not exist", s->name.c_str());
         return rc;
@@ -98,6 +98,12 @@ int exec_drop_database(EngineState *eng,
         return rc;
     }
 
+    /* The schema's stats file lives in the engine-owned pool
+     * (system_schema/stats/), outside the partition — remove it here since
+     * partition_manager has no visibility into the StatsBuffer. */
+    sb_remove(&ectx->engine->stats_buf, ectx->conn->partition_id,
+              s->name.c_str());
+
     snprintf(out, cap, "OK  Database '%s' dropped", s->name.c_str());
     return MYDB_OK;
 }
@@ -106,28 +112,28 @@ int exec_drop_database(EngineState *eng,
  * DISCONNECT
  * ====================================================================== */
 
-int exec_disconnect(EngineState *eng,
+int exec_disconnect(ExecContext *ectx,
                     const DisconnectStatement * /*s*/,
                     char *out, size_t cap)
 {
-    REQUIRE_LOGIN(eng);
+    REQUIRE_LOGIN(ectx);
 
-    if (!eng->schema_active) {
+    if (!ectx->conn->schema_active) {
         snprintf(out, cap, "  Error: no active database — nothing to disconnect from");
         return MYDB_ERR;
     }
 
     /* Commit any open transaction before closing the schema (mirrors USE). */
     if (g_in_explicit_txn) {
-        storage_commit();
+        pm_commit(ectx->partition);
         g_in_explicit_txn = false;
     }
 
     char prev[64];
-    strncpy(prev, eng->current_schema_name, sizeof(prev) - 1);
+    strncpy(prev, ectx->conn->current_schema_name, sizeof(prev) - 1);
     prev[sizeof(prev) - 1] = '\0';
 
-    int rc = engine_deactivate_schema(eng);
+    int rc = engine_deactivate_schema(ectx->engine);
     if (rc != MYDB_OK) {
         snprintf(out, cap, "  Error: failed to disconnect from '%s'", prev);
         return rc;
@@ -142,10 +148,10 @@ int exec_disconnect(EngineState *eng,
  * USE
  * ====================================================================== */
 
-int exec_use(EngineState *eng, const UseStatement *s,
+int exec_use(ExecContext *ectx, const UseStatement *s,
              char *out, size_t cap)
 {
-    REQUIRE_LOGIN(eng);
+    REQUIRE_LOGIN(ectx);
 
     /*
      * If the user is inside an explicit transaction, USE does an
@@ -153,21 +159,19 @@ int exec_use(EngineState *eng, const UseStatement *s,
      * This matches MySQL behaviour.
      */
     if (g_in_explicit_txn) {
-        storage_commit();
+        pm_commit(ectx->partition);
         g_in_explicit_txn = false;
     }
 
     /*
-     * Flush any dirty pages from the old schema to disk before
-     * swapping Cache 2.  In auto-commit mode this is a no-op (every
-     * DML already committed).  With WAL this becomes critical — WAL
-     * commits leave dirty pages in the buffer pool intentionally, so
-     * we must force them out before losing the schema reference.
+     * Flushing dirty pages from the old schema before swapping Cache 2 is
+     * now the engine's responsibility: engine_use_schema deactivates the
+     * current schema via pctx_deactivate_schema, which flushes through the
+     * partition's StorageEngine.  In auto-commit mode this is a no-op
+     * (every DML already committed); with WAL it becomes critical.  The
+     * execution engine no longer touches storage directly.
      */
-    if (eng->schema_active)
-        storage_flush_all_dirty();
-
-    int rc = engine_use_schema(eng, s->schema_name.c_str());
+    int rc = engine_use_schema(ectx->engine, s->schema_name.c_str());
     if (rc != MYDB_OK) {
         format_error(rc, out, cap, s->schema_name.c_str());
         return rc;
@@ -181,11 +185,11 @@ int exec_use(EngineState *eng, const UseStatement *s,
  * CREATE TABLE
  * ====================================================================== */
 
-int exec_create_table(EngineState *eng, const CreateTableStatement *s,
+int exec_create_table(ExecContext *ectx, const CreateTableStatement *s,
                       char *out, size_t cap)
 {
-    REQUIRE_LOGIN(eng);
-    REQUIRE_SCHEMA(eng);
+    REQUIRE_LOGIN(ectx);
+    REQUIRE_SCHEMA(ectx);
 
     if (s->columns.empty()) {
         snprintf(out, cap, "  Error: CREATE TABLE with no columns");
@@ -357,7 +361,7 @@ int exec_create_table(EngineState *eng, const CreateTableStatement *s,
         }
 
         /* (2) Referenced table must exist in the active schema. */
-        const RelationDef *ref_rel = engine_find_relation(eng, fk.ref_table.c_str());
+        const RelationDef *ref_rel = pm_find_relation_const(ectx->partition, fk.ref_table.c_str());
         if (!ref_rel) {
             snprintf(out, cap,
                      "  Error: FOREIGN KEY references unknown table '%s'",
@@ -404,7 +408,7 @@ int exec_create_table(EngineState *eng, const CreateTableStatement *s,
             rfk.on_delete_action = FK_ON_DELETE_RESTRICT;   /* default */
     }
 
-    int rc = storage_create_table(&rel);
+    int rc = pm_create_table(ectx->partition, &rel);
     if (rc != MYDB_OK) {
         if (rc == MYDB_ERR_DUPLICATE)
             snprintf(out, cap, "  Error: table '%s' already exists",
@@ -422,14 +426,14 @@ int exec_create_table(EngineState *eng, const CreateTableStatement *s,
  * CREATE INDEX
  * ====================================================================== */
 
-int exec_create_index(EngineState *eng, const CreateIndexStatement *s,
+int exec_create_index(ExecContext *ectx, const CreateIndexStatement *s,
                       char *out, size_t cap)
 {
-    REQUIRE_LOGIN(eng);
-    REQUIRE_SCHEMA(eng);
+    REQUIRE_LOGIN(ectx);
+    REQUIRE_SCHEMA(ectx);
 
     /* Resolve the table */
-    const RelationDef *rel = engine_find_relation(eng, s->table_name.c_str());
+    const RelationDef *rel = pm_find_relation_const(ectx->partition, s->table_name.c_str());
     if (!rel) {
         snprintf(out, cap, "  Error: table '%s' does not exist",
                  s->table_name.c_str());
@@ -458,7 +462,7 @@ int exec_create_index(EngineState *eng, const CreateIndexStatement *s,
         return MYDB_ERR;
     }
 
-    int rc = storage_add_index((RelationDef *)rel, col_idx);
+    int rc = pm_add_index(ectx->partition, (RelationDef *)rel, col_idx);
     if (rc != MYDB_OK) {
         if (rc == MYDB_ERR_DUPLICATE)
             snprintf(out, cap,
@@ -482,13 +486,13 @@ int exec_create_index(EngineState *eng, const CreateIndexStatement *s,
  * DROP TABLE
  * ====================================================================== */
 
-int exec_drop_table(EngineState *eng, const DropTableStatement *s,
+int exec_drop_table(ExecContext *ectx, const DropTableStatement *s,
                     char *out, size_t cap)
 {
-    REQUIRE_LOGIN(eng);
-    REQUIRE_SCHEMA(eng);
+    REQUIRE_LOGIN(ectx);
+    REQUIRE_SCHEMA(ectx);
 
-    const RelationDef *rel = engine_find_relation(eng, s->table_name.c_str());
+    const RelationDef *rel = pm_find_relation_const(ectx->partition, s->table_name.c_str());
     if (!rel) {
         snprintf(out, cap, "  Error: table '%s' does not exist",
                  s->table_name.c_str());
@@ -496,11 +500,11 @@ int exec_drop_table(EngineState *eng, const DropTableStatement *s,
     }
 
     /*
-     * storage_drop_table takes RelationDef * (non-const) because it
+     * pm_drop_table takes RelationDef * (non-const) because it
      * zeroes the definition after removing the file.  The const here
      * is the engine's read-only contract; storage is the single writer.
      */
-    int rc = storage_drop_table((RelationDef *)rel);
+    int rc = pm_drop_table(ectx->partition, (RelationDef *)rel);
     if (rc != MYDB_OK) {
         format_error(rc, out, cap, s->table_name.c_str());
         return rc;
@@ -514,23 +518,23 @@ int exec_drop_table(EngineState *eng, const DropTableStatement *s,
  * SHOW TABLES
  * ====================================================================== */
 
-int exec_show_tables(EngineState *eng,
+int exec_show_tables(ExecContext *ectx,
                      const ShowTablesStatement * /*s*/,
                      char *out, size_t cap)
 {
-    REQUIRE_LOGIN(eng);
-    REQUIRE_SCHEMA(eng);
+    REQUIRE_LOGIN(ectx);
+    REQUIRE_SCHEMA(ectx);
 
     char hdr[64];
-    snprintf(hdr, sizeof(hdr), "Tables_in_%s", eng->current_schema_name);
+    snprintf(hdr, sizeof(hdr), "Tables_in_%s", ectx->conn->current_schema_name);
 
     ResultBuf    rb(out, cap);
     TableBuilder tb;
     tb.set_headers({hdr});
 
     for (int i = 0; i < MAX_RELATIONS_PER_SCHEMA; i++) {
-        if (!eng->active_schema.relations[i].is_valid) continue;
-        tb.add_row({eng->active_schema.relations[i].relation_name});
+        if (!pctx_active_schema(ectx->partition)->relations[i].is_valid) continue;
+        tb.add_row({pctx_active_schema(ectx->partition)->relations[i].relation_name});
     }
 
     tb.render(rb);
@@ -541,20 +545,20 @@ int exec_show_tables(EngineState *eng,
  * SHOW DATABASES
  * ====================================================================== */
 
-int exec_show_databases(EngineState *eng,
+int exec_show_databases(ExecContext *ectx,
                         const ShowDatabasesStatement * /*s*/,
                         char *out, size_t cap)
 {
-    REQUIRE_LOGIN(eng);
-    REQUIRE_PARTITION(eng);
+    REQUIRE_LOGIN(ectx);
+    REQUIRE_PARTITION(ectx);
 
     ResultBuf    rb(out, cap);
     TableBuilder tb;
     tb.set_headers({"Database"});
 
     for (int i = 0; i < MAX_SCHEMAS_PER_PARTITION; i++) {
-        if (!eng->active_catalog.schemas[i].is_valid) continue;
-        tb.add_row({eng->active_catalog.schemas[i].schema_name});
+        if (!ectx->partition->catalog.schemas[i].is_valid) continue;
+        tb.add_row({ectx->partition->catalog.schemas[i].schema_name});
     }
 
     tb.render(rb);
@@ -567,16 +571,16 @@ static void fmt_datetime_ts(uint64_t dt, char *buf, size_t cap);
  * DATABASE
  * ====================================================================== */
 
-int exec_database(EngineState *eng,
+int exec_database(ExecContext *ectx,
                   const DatabaseStatement * /*s*/,
                   char *out, size_t cap)
 {
-    REQUIRE_LOGIN(eng);
+    REQUIRE_LOGIN(ectx);
 
-    if (!eng->schema_active)
+    if (!ectx->conn->schema_active)
         snprintf(out, cap, "No database selected");
     else
-        snprintf(out, cap, "%s", eng->current_schema_name);
+        snprintf(out, cap, "%s", ectx->conn->current_schema_name);
 
     return MYDB_OK;
 }
@@ -585,13 +589,13 @@ int exec_database(EngineState *eng,
  * SHOW USERS  (root only)
  * ====================================================================== */
 
-int exec_show_users(EngineState *eng,
+int exec_show_users(ExecContext *ectx,
                     const ShowUsersStatement * /*s*/,
                     char *out, size_t cap)
 {
-    REQUIRE_LOGIN(eng);
+    REQUIRE_LOGIN(ectx);
 
-    if (eng->current_user_id != 1) {
+    if (ectx->conn->user_id != 1) {
         snprintf(out, cap, "  Error: SHOW USERS requires root privileges");
         return MYDB_ERR_PERM;
     }
@@ -600,7 +604,7 @@ int exec_show_users(EngineState *eng,
     TableBuilder tb;
     tb.set_headers({"user_id", "username", "is_active", "created_at", "last_login"});
 
-    const UsersFile *uf = &eng->system_schema.users;
+    const UsersFile *uf = &ectx->engine->system_schema.users;
     for (int i = 0; i < USERS_MAX_SLOTS; i++) {
         const UserSlot *u = &uf->slots[i];
         if (!u->is_valid) continue;
@@ -626,15 +630,15 @@ int exec_show_users(EngineState *eng,
  * SHOW GRANTS [user_id]
  * ====================================================================== */
 
-int exec_show_grants(EngineState *eng,
+int exec_show_grants(ExecContext *ectx,
                      const ShowGrantsStatement *s,
                      char *out, size_t cap)
 {
-    REQUIRE_LOGIN(eng);
+    REQUIRE_LOGIN(ectx);
 
-    uint32_t target_id = (s->user_id == 0) ? eng->current_user_id : s->user_id;
+    uint32_t target_id = (s->user_id == 0) ? ectx->conn->user_id : s->user_id;
 
-    if (target_id != eng->current_user_id && eng->current_user_id != 1) {
+    if (target_id != ectx->conn->user_id && ectx->conn->user_id != 1) {
         snprintf(out, cap,
                  "  Error: SHOW GRANTS for another user requires root privileges");
         return MYDB_ERR_PERM;
@@ -642,7 +646,7 @@ int exec_show_grants(EngineState *eng,
 
     /* Resolve target username for display */
     UserSlot target_slot;
-    if (users_find_by_id(&eng->system_schema.users, target_id, &target_slot)
+    if (users_find_by_id(&ectx->engine->system_schema.users, target_id, &target_slot)
             != MYDB_OK) {
         snprintf(out, cap, "  Error: user_id %u does not exist", target_id);
         return MYDB_ERR_NOT_FOUND;
@@ -653,7 +657,7 @@ int exec_show_grants(EngineState *eng,
     tb.set_headers({"privilege_id", "grantee", "schema_name",
                     "partition_id", "granted_by", "granted_at"});
 
-    const PrivilegesFile *pf = &eng->system_schema.privileges;
+    const PrivilegesFile *pf = &ectx->engine->system_schema.privileges;
     for (int i = 0; i < PRIVILEGES_MAX_SLOTS; i++) {
         const PrivilegeSlot *p = &pf->slots[i];
         if (!p->is_valid) continue;
@@ -662,7 +666,7 @@ int exec_show_grants(EngineState *eng,
         /* Resolve granter username */
         UserSlot granter;
         char granter_name[MAX_USERNAME + 16];
-        if (users_find_by_id(&eng->system_schema.users,
+        if (users_find_by_id(&ectx->engine->system_schema.users,
                               p->granted_by, &granter) == MYDB_OK)
             snprintf(granter_name, sizeof(granter_name), "%s", granter.username);
         else
@@ -689,20 +693,47 @@ int exec_show_grants(EngineState *eng,
  * ANALYZE TABLE
  * ====================================================================== */
 
-int exec_analyze_table(EngineState *eng, const AnalyzeTableStatement *s,
+int exec_analyze_table(ExecContext *ectx, const AnalyzeTableStatement *s,
                        char *out, size_t cap)
 {
-    REQUIRE_LOGIN(eng);
-    REQUIRE_SCHEMA(eng);
+    REQUIRE_LOGIN(ectx);
+    REQUIRE_SCHEMA(ectx);
 
-    const RelationDef *rel = engine_find_relation(eng, s->table_name.c_str());
+    const RelationDef *rel = pm_find_relation_const(ectx->partition, s->table_name.c_str());
     if (!rel) {
         snprintf(out, cap, "  Error: table '%s' does not exist",
                  s->table_name.c_str());
         return MYDB_ERR_NOT_FOUND;
     }
 
-    int rc = storage_analyze_table((RelationDef *)rel);
+    /*
+     * Resolve the relation's slot in the active SchemaFile.  pm_analyze_table
+     * writes the computed stats into sf->pages[slot_idx]; the planner later
+     * reads the same slot.  pm_find_relation_const returns &defs[i], so the
+     * pointer difference gives i directly (parallel arrays).
+     */
+    SchemaFile *as       = pctx_active_schema(ectx->partition);
+    int         slot_idx = (int)(rel - as->defs);
+    if (slot_idx < 0 || slot_idx >= MAX_RELATIONS_PER_SCHEMA) {
+        snprintf(out, cap, "  Error: cannot locate '%s' in schema",
+                 s->table_name.c_str());
+        return MYDB_ERR;
+    }
+
+    /*
+     * The engine resolved this schema's StatsFile* (opened/created under
+     * system_schema/stats/) into ectx->stats before dispatch.  ANALYZE
+     * writes through that pooled handle; the planner reads it later.  The
+     * StatsBuffer owns the handle's lifecycle — we neither open nor close.
+     */
+    if (!ectx->stats) {
+        snprintf(out, cap,
+                 "  Error: statistics storage unavailable for this schema");
+        return MYDB_ERR;
+    }
+
+    int rc = pm_analyze_table(ectx->partition, (RelationDef *)rel,
+                              ectx->stats, slot_idx);
     if (rc != MYDB_OK) {
         format_error(rc, out, cap, s->table_name.c_str());
         return rc;
@@ -881,52 +912,41 @@ static void fmt_stat_numeric(int64_t v, const ColumnDef *col, char *buf, size_t 
     }
 }
 
-int exec_describe_table(EngineState *eng,
+int exec_describe_table(ExecContext *ectx,
                         const DescribeTableStatement *s,
                         char *out, size_t cap)
 {
-    REQUIRE_LOGIN(eng);
-    REQUIRE_SCHEMA(eng);
+    REQUIRE_LOGIN(ectx);
+    REQUIRE_SCHEMA(ectx);
 
-    const RelationDef *rel = engine_find_relation(eng, s->table_name.c_str());
+    const RelationDef *rel = pm_find_relation_const(ectx->partition, s->table_name.c_str());
     if (!rel) {
         snprintf(out, cap, "  Error: Table '%s' not found in schema '%s'",
-                 s->table_name.c_str(), eng->current_schema_name);
+                 s->table_name.c_str(), ectx->conn->current_schema_name);
         return MYDB_ERR;
     }
 
     /*
-     * FULL mode — open __stats.mydb and load this relation's stats page.
-     * stats_open returns MYDB_ERR_NOT_FOUND when ANALYZE has never run;
-     * stats_load_relation returns the same if the relation has no stats yet.
-     * In either case we fall back gracefully: stats columns show "N/A".
+     * FULL mode — load this relation's stats page from the engine-pooled
+     * StatsFile* (ectx->stats, under system_schema/stats/).  stats_load_relation
+     * returns MYDB_ERR_NOT_FOUND when ANALYZE has never run for this relation;
+     * we fall back gracefully: stats columns show "N/A".  The StatsBuffer owns
+     * the handle — we do not open or close it here.
      *
-     * slot_idx: engine_find_relation returns &active_schema.defs[i], so
+     * slot_idx: pm_find_relation_const returns &active_schema.defs[i], so
      * pointer arithmetic gives us i directly (parallel arrays).
      */
-    StatsFile sf;
-    bool      stats_ok = false;   /* true once the page is loaded */
-    int       slot_idx = -1;
+    StatsFile *sf       = ectx->stats;
+    bool       stats_ok = false;   /* true once the page is loaded */
+    int        slot_idx = -1;
 
-    if (s->full) {
-        /* Derive stats path from schema path: replace __schema.mydb */
-        char stats_path[512];
-        strncpy(stats_path, eng->active_schema.path, sizeof(stats_path) - 1);
-        stats_path[sizeof(stats_path) - 1] = '\0';
-        char *slash = strrchr(stats_path, '/');
-        if (slash)
-            strncpy(slash + 1, "__stats.mydb",
-                    sizeof(stats_path) - (size_t)(slash + 1 - stats_path));
-
-        if (stats_open(stats_path, &sf) == MYDB_OK) {
-            slot_idx = (int)(rel - eng->active_schema.defs);
-            if (slot_idx >= 0 && slot_idx < MAX_RELATIONS_PER_SCHEMA &&
-                stats_load_relation(&sf, slot_idx) == MYDB_OK) {
-                stats_ok = true;
-            } else {
-                stats_close(&sf);
-                slot_idx = -1;
-            }
+    if (s->full && sf) {
+        slot_idx = (int)(rel - pctx_active_schema(ectx->partition)->defs);
+        if (slot_idx >= 0 && slot_idx < MAX_RELATIONS_PER_SCHEMA &&
+            stats_load_relation(sf, slot_idx) == MYDB_OK) {
+            stats_ok = true;
+        } else {
+            slot_idx = -1;
         }
     }
 
@@ -992,7 +1012,7 @@ int exec_describe_table(EngineState *eng,
         if (stats_ok) {
             /* Use the schema's last_modified as a proxy (stats are refreshed then). */
             char ts[32];
-            fmt_datetime_ts(eng->active_schema.header.last_modified, ts, sizeof(ts));
+            fmt_datetime_ts(pctx_active_schema(ectx->partition)->header.last_modified, ts, sizeof(ts));
             snprintf(stats_hdr, sizeof(stats_hdr), "Statistics (Analyzed: %s)", ts);
         }
 
@@ -1014,7 +1034,7 @@ int exec_describe_table(EngineState *eng,
             char max_buf[64]      = "N/A";
 
             if (stats_ok) {
-                ColumnStats *cs = stats_get_column(&sf, slot_idx, i);
+                ColumnStats *cs = stats_get_column(sf, slot_idx, i);
                 if (cs && cs->has_stats) {
                     switch (cs->stats_type) {
                     case STATS_TYPE_MCV:       stype = "MCV";       break;
@@ -1036,8 +1056,7 @@ int exec_describe_table(EngineState *eng,
         }
 
         stb.render(rb);
-
-        if (stats_ok) stats_close(&sf);
+        /* sf is the engine-pooled handle — do not close it here. */
     }
 
     return MYDB_OK;
@@ -1065,15 +1084,15 @@ int exec_describe_table(EngineState *eng,
  *     ...
  * ====================================================================== */
 
-int exec_describe_schema(EngineState *eng,
+int exec_describe_schema(ExecContext *ectx,
                          const DescribeSchemaStatement * /*s*/,
                          char *out, size_t cap)
 {
-    REQUIRE_LOGIN(eng);
-    REQUIRE_PARTITION(eng);   /* analysts may not inspect schema metadata */
-    REQUIRE_SCHEMA(eng);
+    REQUIRE_LOGIN(ectx);
+    REQUIRE_PARTITION(ectx);   /* analysts may not inspect schema metadata */
+    REQUIRE_SCHEMA(ectx);
 
-    const SchemaFile   *sf  = &eng->active_schema;
+    const SchemaFile   *sf  = pctx_active_schema(ectx->partition);
     const SchemaHeader *hdr = &sf->header;
 
     ResultBuf rb(out, cap);
@@ -1157,14 +1176,14 @@ int exec_describe_schema(EngineState *eng,
  *     staging        0
  * ====================================================================== */
 
-int exec_describe_partition(EngineState *eng,
+int exec_describe_partition(ExecContext *ectx,
                             const DescribePartitionStatement * /*s*/,
                             char *out, size_t cap)
 {
-    REQUIRE_LOGIN(eng);
-    REQUIRE_PARTITION(eng);   /* analysts may not inspect partition metadata */
+    REQUIRE_LOGIN(ectx);
+    REQUIRE_PARTITION(ectx);   /* analysts may not inspect partition metadata */
 
-    const Catalog       *cat = &eng->active_catalog;
+    const Catalog       *cat = &ectx->partition->catalog;
     const CatalogHeader *hdr = &cat->header;
 
     ResultBuf rb(out, cap);
@@ -1190,8 +1209,8 @@ int exec_describe_partition(EngineState *eng,
         snprintf(ndb, sizeof(ndb), "%u", (unsigned)hdr->num_schemas);
 
         tb.add_row({"Partition ID",  pid});
-        tb.add_row({"Owner",         eng->current_username});
-        tb.add_row({"Path",          eng->current_partition_path});
+        tb.add_row({"Owner",         ectx->conn->username});
+        tb.add_row({"Path",          ectx->partition->partition_path});
         tb.add_row({"Quota",         quota_buf});
         tb.add_row({"Used",          used_buf});
         tb.add_row({"Free",          free_buf});
@@ -1264,11 +1283,11 @@ static int parse_quota_str(const std::string &s, uint64_t *out_bytes)
  * CREATE USER
  * ====================================================================== */
 
-int exec_create_user(EngineState *eng,
+int exec_create_user(ExecContext *ectx,
                      const CreateUserStatement *s,
                      char *out, size_t cap)
 {
-    REQUIRE_LOGIN(eng);
+    REQUIRE_LOGIN(ectx);
 
     /* Parse quota (empty → default). */
     uint64_t quota = 0;
@@ -1286,7 +1305,7 @@ int exec_create_user(EngineState *eng,
                             ? nullptr
                             : s->partition_name.c_str();
 
-    int rc = engine_create_user(eng,
+    int rc = engine_create_user(ectx->engine,
                                 s->username.c_str(),
                                 s->password.c_str(),
                                 part_name,
@@ -1318,13 +1337,13 @@ int exec_create_user(EngineState *eng,
  * DROP USER
  * ====================================================================== */
 
-int exec_drop_user(EngineState *eng,
+int exec_drop_user(ExecContext *ectx,
                    const DropUserStatement *s,
                    char *out, size_t cap)
 {
-    REQUIRE_LOGIN(eng);
+    REQUIRE_LOGIN(ectx);
 
-    int rc = engine_drop_user(eng, s->username.c_str());
+    int rc = engine_drop_user(ectx->engine, s->username.c_str());
     if (rc == MYDB_ERR_PERM) {
         snprintf(out, cap,
                  "  Error: only root may drop users, and root cannot be dropped");
@@ -1348,15 +1367,15 @@ int exec_drop_user(EngineState *eng,
  * ALTER USER
  * ====================================================================== */
 
-int exec_alter_user(EngineState *eng,
+int exec_alter_user(ExecContext *ectx,
                     const AlterUserStatement *s,
                     char *out, size_t cap)
 {
-    REQUIRE_LOGIN(eng);
+    REQUIRE_LOGIN(ectx);
 
     if (s->action == AlterUserStatement::Action::SET_PASSWORD) {
 
-        int rc = engine_alter_user_password(eng,
+        int rc = engine_alter_user_password(ectx->engine,
                                             s->username.c_str(),
                                             s->new_password.c_str());
         if (rc == MYDB_ERR_PERM) {
@@ -1383,7 +1402,7 @@ int exec_alter_user(EngineState *eng,
             return MYDB_ERR;
         }
 
-        int rc = engine_alter_user_quota(eng, s->username.c_str(), quota);
+        int rc = engine_alter_user_quota(ectx->engine, s->username.c_str(), quota);
         if (rc == MYDB_ERR_PERM) {
             snprintf(out, cap, "  Error: only root may alter quotas");
             return rc;

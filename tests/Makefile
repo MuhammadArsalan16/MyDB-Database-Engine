@@ -183,20 +183,6 @@ test_btree/fast:
 .PHONY : test_btree/fast
 
 # Convenience name for target.
-tests/CMakeFiles/test_transaction.dir/rule:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 tests/CMakeFiles/test_transaction.dir/rule
-.PHONY : tests/CMakeFiles/test_transaction.dir/rule
-
-# Convenience name for target.
-test_transaction: tests/CMakeFiles/test_transaction.dir/rule
-.PHONY : test_transaction
-
-# fast build rule for target.
-test_transaction/fast:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_transaction.dir/build.make tests/CMakeFiles/test_transaction.dir/build
-.PHONY : test_transaction/fast
-
-# Convenience name for target.
 tests/CMakeFiles/test_file_header.dir/rule:
 	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 tests/CMakeFiles/test_file_header.dir/rule
 .PHONY : tests/CMakeFiles/test_file_header.dir/rule
@@ -209,6 +195,34 @@ test_file_header: tests/CMakeFiles/test_file_header.dir/rule
 test_file_header/fast:
 	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_file_header.dir/build.make tests/CMakeFiles/test_file_header.dir/build
 .PHONY : test_file_header/fast
+
+# Convenience name for target.
+tests/CMakeFiles/test_relation_def.dir/rule:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 tests/CMakeFiles/test_relation_def.dir/rule
+.PHONY : tests/CMakeFiles/test_relation_def.dir/rule
+
+# Convenience name for target.
+test_relation_def: tests/CMakeFiles/test_relation_def.dir/rule
+.PHONY : test_relation_def
+
+# fast build rule for target.
+test_relation_def/fast:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_relation_def.dir/build.make tests/CMakeFiles/test_relation_def.dir/build
+.PHONY : test_relation_def/fast
+
+# Convenience name for target.
+tests/CMakeFiles/test_transaction.dir/rule:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 tests/CMakeFiles/test_transaction.dir/rule
+.PHONY : tests/CMakeFiles/test_transaction.dir/rule
+
+# Convenience name for target.
+test_transaction: tests/CMakeFiles/test_transaction.dir/rule
+.PHONY : test_transaction
+
+# fast build rule for target.
+test_transaction/fast:
+	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_transaction.dir/build.make tests/CMakeFiles/test_transaction.dir/build
+.PHONY : test_transaction/fast
 
 # Convenience name for target.
 tests/CMakeFiles/test_partition.dir/rule:
@@ -237,20 +251,6 @@ test_schema_file: tests/CMakeFiles/test_schema_file.dir/rule
 test_schema_file/fast:
 	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_schema_file.dir/build.make tests/CMakeFiles/test_schema_file.dir/build
 .PHONY : test_schema_file/fast
-
-# Convenience name for target.
-tests/CMakeFiles/test_relation_def.dir/rule:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 tests/CMakeFiles/test_relation_def.dir/rule
-.PHONY : tests/CMakeFiles/test_relation_def.dir/rule
-
-# Convenience name for target.
-test_relation_def: tests/CMakeFiles/test_relation_def.dir/rule
-.PHONY : test_relation_def
-
-# fast build rule for target.
-test_relation_def/fast:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_relation_def.dir/build.make tests/CMakeFiles/test_relation_def.dir/build
-.PHONY : test_relation_def/fast
 
 # Convenience name for target.
 tests/CMakeFiles/test_system_schema.dir/rule:
@@ -295,48 +295,6 @@ test_crypto/fast:
 .PHONY : test_crypto/fast
 
 # Convenience name for target.
-tests/CMakeFiles/test_engine.dir/rule:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 tests/CMakeFiles/test_engine.dir/rule
-.PHONY : tests/CMakeFiles/test_engine.dir/rule
-
-# Convenience name for target.
-test_engine: tests/CMakeFiles/test_engine.dir/rule
-.PHONY : test_engine
-
-# fast build rule for target.
-test_engine/fast:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_engine.dir/build.make tests/CMakeFiles/test_engine.dir/build
-.PHONY : test_engine/fast
-
-# Convenience name for target.
-tests/CMakeFiles/test_storage.dir/rule:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 tests/CMakeFiles/test_storage.dir/rule
-.PHONY : tests/CMakeFiles/test_storage.dir/rule
-
-# Convenience name for target.
-test_storage: tests/CMakeFiles/test_storage.dir/rule
-.PHONY : test_storage
-
-# fast build rule for target.
-test_storage/fast:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_storage.dir/build.make tests/CMakeFiles/test_storage.dir/build
-.PHONY : test_storage/fast
-
-# Convenience name for target.
-tests/CMakeFiles/test_integration.dir/rule:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 tests/CMakeFiles/test_integration.dir/rule
-.PHONY : tests/CMakeFiles/test_integration.dir/rule
-
-# Convenience name for target.
-test_integration: tests/CMakeFiles/test_integration.dir/rule
-.PHONY : test_integration
-
-# fast build rule for target.
-test_integration/fast:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_integration.dir/build.make tests/CMakeFiles/test_integration.dir/build
-.PHONY : test_integration/fast
-
-# Convenience name for target.
 tests/CMakeFiles/test_parser.dir/rule:
 	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 tests/CMakeFiles/test_parser.dir/rule
 .PHONY : tests/CMakeFiles/test_parser.dir/rule
@@ -349,20 +307,6 @@ test_parser: tests/CMakeFiles/test_parser.dir/rule
 test_parser/fast:
 	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_parser.dir/build.make tests/CMakeFiles/test_parser.dir/build
 .PHONY : test_parser/fast
-
-# Convenience name for target.
-tests/CMakeFiles/test_exec_engine.dir/rule:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 tests/CMakeFiles/test_exec_engine.dir/rule
-.PHONY : tests/CMakeFiles/test_exec_engine.dir/rule
-
-# Convenience name for target.
-test_exec_engine: tests/CMakeFiles/test_exec_engine.dir/rule
-.PHONY : test_exec_engine
-
-# fast build rule for target.
-test_exec_engine/fast:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_exec_engine.dir/build.make tests/CMakeFiles/test_exec_engine.dir/build
-.PHONY : test_exec_engine/fast
 
 engine/test_crypto.o: engine/test_crypto.c.o
 .PHONY : engine/test_crypto.o
@@ -411,102 +355,6 @@ engine/test_database_file.s: engine/test_database_file.c.s
 engine/test_database_file.c.s:
 	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_database_file.dir/build.make tests/CMakeFiles/test_database_file.dir/engine/test_database_file.c.s
 .PHONY : engine/test_database_file.c.s
-
-engine/test_engine.o: engine/test_engine.c.o
-.PHONY : engine/test_engine.o
-
-# target to build an object file
-engine/test_engine.c.o:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_engine.dir/build.make tests/CMakeFiles/test_engine.dir/engine/test_engine.c.o
-.PHONY : engine/test_engine.c.o
-
-engine/test_engine.i: engine/test_engine.c.i
-.PHONY : engine/test_engine.i
-
-# target to preprocess a source file
-engine/test_engine.c.i:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_engine.dir/build.make tests/CMakeFiles/test_engine.dir/engine/test_engine.c.i
-.PHONY : engine/test_engine.c.i
-
-engine/test_engine.s: engine/test_engine.c.s
-.PHONY : engine/test_engine.s
-
-# target to generate assembly for a file
-engine/test_engine.c.s:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_engine.dir/build.make tests/CMakeFiles/test_engine.dir/engine/test_engine.c.s
-.PHONY : engine/test_engine.c.s
-
-engine/test_storage.o: engine/test_storage.c.o
-.PHONY : engine/test_storage.o
-
-# target to build an object file
-engine/test_storage.c.o:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_storage.dir/build.make tests/CMakeFiles/test_storage.dir/engine/test_storage.c.o
-.PHONY : engine/test_storage.c.o
-
-engine/test_storage.i: engine/test_storage.c.i
-.PHONY : engine/test_storage.i
-
-# target to preprocess a source file
-engine/test_storage.c.i:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_storage.dir/build.make tests/CMakeFiles/test_storage.dir/engine/test_storage.c.i
-.PHONY : engine/test_storage.c.i
-
-engine/test_storage.s: engine/test_storage.c.s
-.PHONY : engine/test_storage.s
-
-# target to generate assembly for a file
-engine/test_storage.c.s:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_storage.dir/build.make tests/CMakeFiles/test_storage.dir/engine/test_storage.c.s
-.PHONY : engine/test_storage.c.s
-
-execution_engine/test_exec_engine.o: execution_engine/test_exec_engine.cpp.o
-.PHONY : execution_engine/test_exec_engine.o
-
-# target to build an object file
-execution_engine/test_exec_engine.cpp.o:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_exec_engine.dir/build.make tests/CMakeFiles/test_exec_engine.dir/execution_engine/test_exec_engine.cpp.o
-.PHONY : execution_engine/test_exec_engine.cpp.o
-
-execution_engine/test_exec_engine.i: execution_engine/test_exec_engine.cpp.i
-.PHONY : execution_engine/test_exec_engine.i
-
-# target to preprocess a source file
-execution_engine/test_exec_engine.cpp.i:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_exec_engine.dir/build.make tests/CMakeFiles/test_exec_engine.dir/execution_engine/test_exec_engine.cpp.i
-.PHONY : execution_engine/test_exec_engine.cpp.i
-
-execution_engine/test_exec_engine.s: execution_engine/test_exec_engine.cpp.s
-.PHONY : execution_engine/test_exec_engine.s
-
-# target to generate assembly for a file
-execution_engine/test_exec_engine.cpp.s:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_exec_engine.dir/build.make tests/CMakeFiles/test_exec_engine.dir/execution_engine/test_exec_engine.cpp.s
-.PHONY : execution_engine/test_exec_engine.cpp.s
-
-integration/test_integration.o: integration/test_integration.c.o
-.PHONY : integration/test_integration.o
-
-# target to build an object file
-integration/test_integration.c.o:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_integration.dir/build.make tests/CMakeFiles/test_integration.dir/integration/test_integration.c.o
-.PHONY : integration/test_integration.c.o
-
-integration/test_integration.i: integration/test_integration.c.i
-.PHONY : integration/test_integration.i
-
-# target to preprocess a source file
-integration/test_integration.c.i:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_integration.dir/build.make tests/CMakeFiles/test_integration.dir/integration/test_integration.c.i
-.PHONY : integration/test_integration.c.i
-
-integration/test_integration.s: integration/test_integration.c.s
-.PHONY : integration/test_integration.s
-
-# target to generate assembly for a file
-integration/test_integration.c.s:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f tests/CMakeFiles/test_integration.dir/build.make tests/CMakeFiles/test_integration.dir/integration/test_integration.c.s
-.PHONY : integration/test_integration.c.s
 
 query_parser/test_parser.o: query_parser/test_parser.cpp.o
 .PHONY : query_parser/test_parser.o
@@ -786,16 +634,12 @@ help:
 	@echo "... test_crypto"
 	@echo "... test_database_file"
 	@echo "... test_disk_manager"
-	@echo "... test_engine"
-	@echo "... test_exec_engine"
 	@echo "... test_file_header"
-	@echo "... test_integration"
 	@echo "... test_page"
 	@echo "... test_parser"
 	@echo "... test_partition"
 	@echo "... test_relation_def"
 	@echo "... test_schema_file"
-	@echo "... test_storage"
 	@echo "... test_system_schema"
 	@echo "... test_transaction"
 	@echo "... engine/test_crypto.o"
@@ -804,18 +648,6 @@ help:
 	@echo "... engine/test_database_file.o"
 	@echo "... engine/test_database_file.i"
 	@echo "... engine/test_database_file.s"
-	@echo "... engine/test_engine.o"
-	@echo "... engine/test_engine.i"
-	@echo "... engine/test_engine.s"
-	@echo "... engine/test_storage.o"
-	@echo "... engine/test_storage.i"
-	@echo "... engine/test_storage.s"
-	@echo "... execution_engine/test_exec_engine.o"
-	@echo "... execution_engine/test_exec_engine.i"
-	@echo "... execution_engine/test_exec_engine.s"
-	@echo "... integration/test_integration.o"
-	@echo "... integration/test_integration.i"
-	@echo "... integration/test_integration.s"
 	@echo "... query_parser/test_parser.o"
 	@echo "... query_parser/test_parser.i"
 	@echo "... query_parser/test_parser.s"

@@ -4,6 +4,7 @@
 #include "common.h"
 #include "relation_def.h"
 #include "stats.h"
+#include "schema_file.h"   /* SchemaFile — physical-size metadata source */
 
 #ifdef __cplusplus
 extern "C" {
@@ -119,7 +120,12 @@ float selectivity_estimate(const ColumnStats *cs,
 /*  Choose the cheapest access path for a query against `rel` given   */
 /*  the sargable predicates in sargs[0..n_sargs-1].                  */
 /*                                                                    */
-/*  eng is used only to locate __stats.mydb; it is never mutated.    */
+/*  The planner is engine-agnostic and does NO file I/O (v3): it       */
+/*  receives the partition's active SchemaFile (for physical-size      */
+/*  metadata) and a StatsFile* resolved by the engine's StatsBuffer    */
+/*  pool.  `sf` may be NULL (ANALYZE never run / stats unavailable),   */
+/*  in which case selectivity_estimate falls back to its defaults.     */
+/*  Neither argument is mutated (stats pages are loaded on demand).    */
 /*                                                                    */
 /*  Short-circuit rules (evaluated before any cost calculation):      */
 /*    R1. n_sargs == 0                   → FULL_SCAN immediately      */
@@ -129,9 +135,8 @@ float selectivity_estimate(const ColumnStats *cs,
 /*  CBO runs only when there is genuine ambiguity (range predicate or */
 /*  multiple index candidates).                                       */
 /* ------------------------------------------------------------------ */
-struct EngineState;   /* forward declaration; full def in engine.h    */
-
-PlanNode planner_choose_path(struct EngineState *eng,
+PlanNode planner_choose_path(const SchemaFile   *schema,
+                              StatsFile          *sf,
                               const RelationDef  *rel,
                               const Sarg         *sargs,
                               int                 n_sargs);

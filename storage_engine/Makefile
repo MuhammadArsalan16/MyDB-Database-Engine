@@ -284,30 +284,6 @@ src/page.c.s:
 	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f storage_engine/CMakeFiles/storage_engine.dir/build.make storage_engine/CMakeFiles/storage_engine.dir/src/page.c.s
 .PHONY : src/page.c.s
 
-src/partition.o: src/partition.c.o
-.PHONY : src/partition.o
-
-# target to build an object file
-src/partition.c.o:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f storage_engine/CMakeFiles/storage_engine.dir/build.make storage_engine/CMakeFiles/storage_engine.dir/src/partition.c.o
-.PHONY : src/partition.c.o
-
-src/partition.i: src/partition.c.i
-.PHONY : src/partition.i
-
-# target to preprocess a source file
-src/partition.c.i:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f storage_engine/CMakeFiles/storage_engine.dir/build.make storage_engine/CMakeFiles/storage_engine.dir/src/partition.c.i
-.PHONY : src/partition.c.i
-
-src/partition.s: src/partition.c.s
-.PHONY : src/partition.s
-
-# target to generate assembly for a file
-src/partition.c.s:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f storage_engine/CMakeFiles/storage_engine.dir/build.make storage_engine/CMakeFiles/storage_engine.dir/src/partition.c.s
-.PHONY : src/partition.c.s
-
 src/relation_def.o: src/relation_def.c.o
 .PHONY : src/relation_def.o
 
@@ -332,54 +308,6 @@ src/relation_def.c.s:
 	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f storage_engine/CMakeFiles/storage_engine.dir/build.make storage_engine/CMakeFiles/storage_engine.dir/src/relation_def.c.s
 .PHONY : src/relation_def.c.s
 
-src/schema_file.o: src/schema_file.c.o
-.PHONY : src/schema_file.o
-
-# target to build an object file
-src/schema_file.c.o:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f storage_engine/CMakeFiles/storage_engine.dir/build.make storage_engine/CMakeFiles/storage_engine.dir/src/schema_file.c.o
-.PHONY : src/schema_file.c.o
-
-src/schema_file.i: src/schema_file.c.i
-.PHONY : src/schema_file.i
-
-# target to preprocess a source file
-src/schema_file.c.i:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f storage_engine/CMakeFiles/storage_engine.dir/build.make storage_engine/CMakeFiles/storage_engine.dir/src/schema_file.c.i
-.PHONY : src/schema_file.c.i
-
-src/schema_file.s: src/schema_file.c.s
-.PHONY : src/schema_file.s
-
-# target to generate assembly for a file
-src/schema_file.c.s:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f storage_engine/CMakeFiles/storage_engine.dir/build.make storage_engine/CMakeFiles/storage_engine.dir/src/schema_file.c.s
-.PHONY : src/schema_file.c.s
-
-src/stats.o: src/stats.c.o
-.PHONY : src/stats.o
-
-# target to build an object file
-src/stats.c.o:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f storage_engine/CMakeFiles/storage_engine.dir/build.make storage_engine/CMakeFiles/storage_engine.dir/src/stats.c.o
-.PHONY : src/stats.c.o
-
-src/stats.i: src/stats.c.i
-.PHONY : src/stats.i
-
-# target to preprocess a source file
-src/stats.c.i:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f storage_engine/CMakeFiles/storage_engine.dir/build.make storage_engine/CMakeFiles/storage_engine.dir/src/stats.c.i
-.PHONY : src/stats.c.i
-
-src/stats.s: src/stats.c.s
-.PHONY : src/stats.s
-
-# target to generate assembly for a file
-src/stats.c.s:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f storage_engine/CMakeFiles/storage_engine.dir/build.make storage_engine/CMakeFiles/storage_engine.dir/src/stats.c.s
-.PHONY : src/stats.c.s
-
 src/storage.o: src/storage.c.o
 .PHONY : src/storage.o
 
@@ -403,30 +331,6 @@ src/storage.s: src/storage.c.s
 src/storage.c.s:
 	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f storage_engine/CMakeFiles/storage_engine.dir/build.make storage_engine/CMakeFiles/storage_engine.dir/src/storage.c.s
 .PHONY : src/storage.c.s
-
-src/transaction.o: src/transaction.c.o
-.PHONY : src/transaction.o
-
-# target to build an object file
-src/transaction.c.o:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f storage_engine/CMakeFiles/storage_engine.dir/build.make storage_engine/CMakeFiles/storage_engine.dir/src/transaction.c.o
-.PHONY : src/transaction.c.o
-
-src/transaction.i: src/transaction.c.i
-.PHONY : src/transaction.i
-
-# target to preprocess a source file
-src/transaction.c.i:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f storage_engine/CMakeFiles/storage_engine.dir/build.make storage_engine/CMakeFiles/storage_engine.dir/src/transaction.c.i
-.PHONY : src/transaction.c.i
-
-src/transaction.s: src/transaction.c.s
-.PHONY : src/transaction.s
-
-# target to generate assembly for a file
-src/transaction.c.s:
-	cd "/home/hasnat/Public/6th Semester/Advance DB/Project and Presentations/MyDB-Database-Engine" && $(MAKE) $(MAKESILENT) -f storage_engine/CMakeFiles/storage_engine.dir/build.make storage_engine/CMakeFiles/storage_engine.dir/src/transaction.c.s
-.PHONY : src/transaction.c.s
 
 # Help Target
 help:
@@ -456,24 +360,12 @@ help:
 	@echo "... src/page.o"
 	@echo "... src/page.i"
 	@echo "... src/page.s"
-	@echo "... src/partition.o"
-	@echo "... src/partition.i"
-	@echo "... src/partition.s"
 	@echo "... src/relation_def.o"
 	@echo "... src/relation_def.i"
 	@echo "... src/relation_def.s"
-	@echo "... src/schema_file.o"
-	@echo "... src/schema_file.i"
-	@echo "... src/schema_file.s"
-	@echo "... src/stats.o"
-	@echo "... src/stats.i"
-	@echo "... src/stats.s"
 	@echo "... src/storage.o"
 	@echo "... src/storage.i"
 	@echo "... src/storage.s"
-	@echo "... src/transaction.o"
-	@echo "... src/transaction.i"
-	@echo "... src/transaction.s"
 .PHONY : help
 
 

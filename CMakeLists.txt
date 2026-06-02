@@ -13,17 +13,22 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Export compile commands so clangd/IDE can find include paths
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Storage engine — pure C11 static library
+# Storage engine — stateless I/O layer (v3): BufferPool, BTree, Page,
+# DiskManager, RelationDef only.  No session state.
 add_subdirectory(storage_engine)
 # System schema (users + privileges) — engine-level metadata, lives outside
 # any partition. Depends on storage_engine for common.h / file_header / checksum.
 add_subdirectory(system_schema)
+# Partition manager — owns session state (Catalog, SchemaFile, TxnManager,
+# StatsFile, PartitionBuffer, PartitionCtx).  Wraps storage_engine and
+# provides the pm_* API consumed by the execution engine.
+# Depends on storage_engine + system_schema.
+add_subdirectory(partition_manager)
 # Query parser — Lexer/Parser plus parser_api C bridge. Built before
 # engine so engine can link it.
 add_subdirectory(query_parser)
-# Planner — cost-based access path selection.  Pure C, depends only on
-# storage_engine (for stats.h).  Built before execution_engine so the
-# executor can link against it.
+# Planner — cost-based access path selection.  Depends on partition_manager
+# (for stats.h which moved there in v3).  Built before execution_engine.
 add_subdirectory(planner)
 # Execution engine — AST walker. Built after query_parser, before engine.
 add_subdirectory(execution_engine)

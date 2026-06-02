@@ -5,31 +5,41 @@
 
 #include "common.h"
 #include "database_file.h"
-#include "partition.h"
 #include "relation_def.h"
-#include "schema_file.h"
 #include "system_schema.h"
+#include "connection.h"
+#include "stats_buffer.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+/* PartitionCtx is owned and defined by partition_manager.  The engine
+ * only holds a pointer to it, so a forward declaration is enough here.
+ * Files that dereference it (engine.c, the execution engine) include
+ * partition_ctx.h / pm_api.h directly. */
+struct PartitionCtx;
+
 /* ------------------------------------------------------------------ */
 /*  Engine orchestrator                                               */
 /*                                                                    */
-/*  Single point of entry above storage_engine and system_schema.     */
+/*  Single point of entry above partition_manager and system_schema.  */
 /*  Owns the engine-level metadata (`__database.mydb`,                */
-/*  `system_schema/users.mydb`, `system_schema/privileges.mydb`)      */
-/*  and the per-session active state (current user, active partition */
-/*  catalog, active schema).                                          */
+/*  `system_schema/users.mydb`, `system_schema/privileges.mydb`),     */
+/*  the master connection pool, and orchestration of the SQL pipeline.*/
+/*                                                                    */
+/*  v3 separation of concerns:                                        */
+/*    - engine          : connections, auth, engine-level metadata,   */
+/*                         query-flow orchestration.                  */
+/*    - partition_manager: everything from the partition catalog down */
+/*                         to schemas, tables, transactions, stats.   */
+/*                         The engine holds an opaque PartitionCtx*    */
+/*                         and never touches its internals.           */
 /*                                                                    */
 /*  Layering:                                                         */
 /*    bin/mydb         ─▶ engine_bootstrap                            */
 /*    parser+exec      ─▶ engine_init / engine_login / use_schema     */
-/*    storage layer    ─▶ reads validated identifiers from EngineState*/
-/*                                                                    */
-/*  Phase 8 owns ONLY the session lifecycle. DML, transactions, and   */
-/*  authorization checks land in phases 9-11.                         */
+/*    partition_manager ─▶ pctx_* / pm_* (called by engine + executor)*/
 /* ------------------------------------------------------------------ */
 
 
@@ -43,23 +53,31 @@ extern "C" {
 
 
 typedef struct EngineState {
-    /* Always-resident metadata, opened by engine_init. */
+    /* Always-resident engine-level metadata, opened by engine_init. */
     DatabaseFile   database;          /* __database.mydb */
     SystemSchema   system_schema;     /* users.mydb + privileges.mydb */
 
-    /* Per-session state. */
-    Catalog        active_catalog;    /* Cache 1 — current partition's __catalog.mydb */
-    SchemaFile     active_schema;     /* Cache 2 — current schema */
-    uint32_t       current_user_id;
-    uint32_t       current_partition_id;
-    char           current_partition_path[256];
-    char           current_schema_name[32];
+    /* Master connection pool.  All per-session state (logged_in, user id,
+     * active schema name, partition_open, schema_active) lives in the
+     * Connection slots — NOT on EngineState directly.  Phase 1 runs a
+     * single session at conns[0]. */
+    ConnectionPool conn_pool;
 
-    char           current_username[MAX_USERNAME]; /* set by engine_login */
+    /* The active partition's runtime context: Catalog (Cache 1), the
+     * PartitionBuffer (Cache 2), TransactionManager, and an embedded
+     * StorageEngine.  Heap-allocated by partition_manager (pctx_init) on
+     * login for partition-owning users; resolved lazily on USE for
+     * analyst sessions.  NULL when the current session owns/accesses no
+     * partition yet.  The engine never dereferences its internals — that
+     * is partition_manager's job, reached via pctx_* / pm_* calls. */
+    struct PartitionCtx *active_partition;
 
-    uint8_t        logged_in;
-    uint8_t        partition_open;    /* 0 if user owns no partition (analyst) */
-    uint8_t        schema_active;     /* 1 once USE has succeeded */
+    /* Engine-owned optimizer-statistics pool.  Lazily opens the stats file
+     * for each (partition_id, schema) under system_schema/stats/ and hands
+     * the StatsFile* to the executor via ExecContext.stats.  The planner
+     * reads it; ANALYZE writes through it.  Owned entirely by the engine —
+     * partition_manager has no visibility into it. */
+    StatsBuffer    stats_buf;
 
     char           root_dir[256];     /* engine root, e.g. ~/.mydb/ */
 } EngineState;
@@ -101,8 +119,8 @@ int engine_close(EngineState *eng);
  *
  * Internally it sequences:
  *   1. engine_init   (open __database.mydb + system_schema files)
- *   2. engine_login  (authenticate, open partition catalog)
- *   3. storage_init  (buffer pool + B+ tree layer, needs partition ctx)
+ *   2. engine_login  (authenticate, then pctx_init opens the partition
+ *                     catalog and its embedded StorageEngine)
  *
  * On any failure the partially-initialised state is cleaned up and
  * MYDB_ERR / MYDB_ERR_NOT_FOUND / MYDB_ERR_PERM is returned.

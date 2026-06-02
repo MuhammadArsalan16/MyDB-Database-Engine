@@ -65,21 +65,21 @@ static int is_now_sentinel(const ColumnDef *col)
     return 0;
 }
 
-int exec_insert(EngineState *eng, const InsertStatement *s,
+int exec_insert(ExecContext *ectx, const InsertStatement *s,
                 char *out, size_t cap)
 {
-    REQUIRE_LOGIN(eng);
-    REQUIRE_SCHEMA(eng);
+    REQUIRE_LOGIN(ectx);
+    REQUIRE_SCHEMA(ectx);
 
     /* write access check */
-    int rc = engine_check_access(eng, 1);
+    int rc = engine_check_access(ectx->engine, 1);
     if (rc != MYDB_OK) {
         format_error(rc, out, cap, s->table_name.c_str());
         return rc;
     }
 
     /* look up the table */
-    const RelationDef *rel_c = engine_find_relation(eng, s->table_name.c_str());
+    const RelationDef *rel_c = pm_find_relation_const(ectx->partition, s->table_name.c_str());
     if (!rel_c) {
         snprintf(out, cap, "  Error: table '%s' does not exist",
                  s->table_name.c_str());
@@ -173,7 +173,7 @@ int exec_insert(EngineState *eng, const InsertStatement *s,
      * ------------------------------------------------------------------ */
     struct timespec _ins_t_start, _ins_t_commit, _ins_t_end;
     clock_gettime(CLOCK_MONOTONIC, &_ins_t_start);
-    AUTOCOMMIT_BEGIN();
+    AUTOCOMMIT_BEGIN(ectx);
 
     size_t ninserted = 0;
 
@@ -194,7 +194,7 @@ int exec_insert(EngineState *eng, const InsertStatement *s,
                 const std::string &raw = vals[(size_t)col_src[ci]];
                 if (!validate_literal(raw, *col)) {
                     rc = MYDB_ERR;
-                    AUTOCOMMIT_END(rc);
+                    AUTOCOMMIT_END(ectx, rc);
                     if (col->type == TYPE_INT)
                         snprintf(out, cap,
                                  "  Error: value '%s' is out of range for column '%s'"
@@ -233,16 +233,16 @@ int exec_insert(EngineState *eng, const InsertStatement *s,
              */
             if (col->is_not_null && !col->is_auto_increment && v->is_null) {
                 rc = MYDB_ERR_NULL_VIOLATION;
-                AUTOCOMMIT_END(rc);
+                AUTOCOMMIT_END(ectx, rc);
                 snprintf(out, cap,
                          "  Error: column '%s' cannot be NULL", col->name);
                 return rc;
             }
         }
 
-        rc = storage_insert(rel, &row);
+        rc = pm_insert(ectx->partition, rel, &row);
         if (rc != MYDB_OK) {
-            AUTOCOMMIT_END(rc);
+            AUTOCOMMIT_END(ectx, rc);
             format_error(rc, out, cap, s->table_name.c_str());
             return rc;
         }
@@ -251,7 +251,7 @@ int exec_insert(EngineState *eng, const InsertStatement *s,
 
     rc = MYDB_OK;
     clock_gettime(CLOCK_MONOTONIC, &_ins_t_commit);
-    AUTOCOMMIT_END(rc);
+    AUTOCOMMIT_END(ectx, rc);
     clock_gettime(CLOCK_MONOTONIC, &_ins_t_end);
 
     {
@@ -275,22 +275,22 @@ int exec_insert(EngineState *eng, const InsertStatement *s,
  * UPDATE
  * ====================================================================== */
 
-int exec_update(EngineState *eng,
+int exec_update(ExecContext *ectx,
                 const UpdateStatement *s,
                 char *out, size_t cap)
 {
-    REQUIRE_LOGIN(eng);
-    REQUIRE_SCHEMA(eng);
+    REQUIRE_LOGIN(ectx);
+    REQUIRE_SCHEMA(ectx);
 
     /* write access check */
-    int rc = engine_check_access(eng, 1);
+    int rc = engine_check_access(ectx->engine, 1);
     if (rc != MYDB_OK) {
         format_error(rc, out, cap, s->table_name.c_str());
         return rc;
     }
 
     /* find the table */
-    const RelationDef *rel_c = engine_find_relation(eng, s->table_name.c_str());
+    const RelationDef *rel_c = pm_find_relation_const(ectx->partition, s->table_name.c_str());
     if (!rel_c) {
         snprintf(out, cap, "  Error: table '%s' does not exist",
                  s->table_name.c_str());
@@ -334,15 +334,15 @@ int exec_update(EngineState *eng,
     /* choose the cheapest access path via the planner */
     Sarg       sargs[32];
     int        n_sargs = extract_sargs(s->where_clause.get(), rel, sargs, 32);
-    PlanNode   plan    = planner_choose_path(eng, rel, sargs, n_sargs);
+    PlanNode   plan    = planner_choose_path(pctx_active_schema(ectx->partition), ectx->stats, rel, sargs, n_sargs);
     AccessPath ap      = plan_to_ap(plan, s->where_clause.get(), rel);
 
-    AUTOCOMMIT_BEGIN();
+    AUTOCOMMIT_BEGIN(ectx);
 
     size_t naffected = 0;
     rc = MYDB_OK;
 
-    /* apply SET values to one matching row and call storage_update */
+    /* apply SET values to one matching row and call pm_update */
     auto update_row = [&](Row *row) -> bool {
         if (!row) return true;
         if (!where_matches(s->where_clause.get(), rel, row)) return true;
@@ -366,7 +366,7 @@ int exec_update(EngineState *eng,
             }
         }
 
-        rc = storage_update(rel, rid, &new_row);
+        rc = pm_update(ectx->partition, rel, rid, &new_row);
         if (rc != MYDB_OK) {
             format_error(rc, out, cap, s->table_name.c_str());
             return false;   /* stop the scan */
@@ -380,17 +380,17 @@ int exec_update(EngineState *eng,
     switch (ap.kind) {
 
     case AP_GET_PK: {
-        Row *row = storage_get_by_pk(rel, &ap.key);
+        Row *row = pm_get_by_pk(ectx->partition, rel, &ap.key);
         update_row(row);
         break;
     }
     case AP_GET_INDEX: {
-        Row *row = storage_get_by_index(rel, ap.col_idx, &ap.key);
+        Row *row = pm_get_by_index(ectx->partition, rel, ap.col_idx, &ap.key);
         update_row(row);
         break;
     }
     case AP_SCAN_FROM: {
-        Cursor *cur = storage_scan_from(rel, &ap.key);
+        Cursor *cur = pm_scan_from(ectx->partition, rel, &ap.key);
         if (cur) {
             Row *row;
             while ((row = cursor_next(cur)) != NULL)
@@ -400,7 +400,7 @@ int exec_update(EngineState *eng,
         break;
     }
     case AP_SCAN_BY_INDEX: {
-        Cursor *cur = storage_scan_by_index(rel, ap.col_idx, &ap.key);
+        Cursor *cur = pm_scan_by_index(ectx->partition, rel, ap.col_idx, &ap.key);
         if (cur) {
             Row *row;
             while ((row = cursor_next(cur)) != NULL)
@@ -410,7 +410,7 @@ int exec_update(EngineState *eng,
         break;
     }
     default: {
-        Cursor *cur = storage_scan(rel);
+        Cursor *cur = pm_scan(ectx->partition, rel);
         if (cur) {
             Row *row;
             while ((row = cursor_next(cur)) != NULL)
@@ -421,7 +421,7 @@ int exec_update(EngineState *eng,
     }
     }
 
-    AUTOCOMMIT_END(rc);
+    AUTOCOMMIT_END(ectx, rc);
 
     if (rc != MYDB_OK) return rc;
 
@@ -434,22 +434,22 @@ int exec_update(EngineState *eng,
  * DELETE
  * ====================================================================== */
 
-int exec_delete(EngineState *eng,
+int exec_delete(ExecContext *ectx,
                 const DeleteStatement *s,
                 char *out, size_t cap)
 {
-    REQUIRE_LOGIN(eng);
-    REQUIRE_SCHEMA(eng);
+    REQUIRE_LOGIN(ectx);
+    REQUIRE_SCHEMA(ectx);
 
     /* write access check */
-    int rc = engine_check_access(eng, 1);
+    int rc = engine_check_access(ectx->engine, 1);
     if (rc != MYDB_OK) {
         format_error(rc, out, cap, s->table_name.c_str());
         return rc;
     }
 
     /* find the table */
-    const RelationDef *rel_c = engine_find_relation(eng, s->table_name.c_str());
+    const RelationDef *rel_c = pm_find_relation_const(ectx->partition, s->table_name.c_str());
     if (!rel_c) {
         snprintf(out, cap, "  Error: table '%s' does not exist",
                  s->table_name.c_str());
@@ -471,10 +471,10 @@ int exec_delete(EngineState *eng,
     /* choose the cheapest access path via the planner */
     Sarg       sargs[32];
     int        n_sargs = extract_sargs(s->where_clause.get(), rel, sargs, 32);
-    PlanNode   plan    = planner_choose_path(eng, rel, sargs, n_sargs);
+    PlanNode   plan    = planner_choose_path(pctx_active_schema(ectx->partition), ectx->stats, rel, sargs, n_sargs);
     AccessPath ap      = plan_to_ap(plan, s->where_clause.get(), rel);
 
-    AUTOCOMMIT_BEGIN();
+    AUTOCOMMIT_BEGIN(ectx);
 
     size_t naffected = 0;
     rc = MYDB_OK;
@@ -482,10 +482,10 @@ int exec_delete(EngineState *eng,
     switch (ap.kind) {
 
     case AP_GET_PK: {
-        Row *row = storage_get_by_pk(rel, &ap.key);
+        Row *row = pm_get_by_pk(ectx->partition, rel, &ap.key);
         if (row && where_matches(s->where_clause.get(), rel, row)) {
             RID rid = row->rid;
-            rc = storage_delete(rel, rid);
+            rc = pm_delete(ectx->partition, rel, rid);
             if (rc == MYDB_OK) naffected++;
             else format_error(rc, out, cap, s->table_name.c_str());
         }
@@ -493,10 +493,10 @@ int exec_delete(EngineState *eng,
     }
 
     case AP_GET_INDEX: {
-        Row *row = storage_get_by_index(rel, ap.col_idx, &ap.key);
+        Row *row = pm_get_by_index(ectx->partition, rel, ap.col_idx, &ap.key);
         if (row && where_matches(s->where_clause.get(), rel, row)) {
             RID rid = row->rid;
-            rc = storage_delete(rel, rid);
+            rc = pm_delete(ectx->partition, rel, rid);
             if (rc == MYDB_OK) naffected++;
             else format_error(rc, out, cap, s->table_name.c_str());
         }
@@ -504,13 +504,13 @@ int exec_delete(EngineState *eng,
     }
 
     case AP_SCAN_FROM: {
-        Cursor *cur = storage_scan_from(rel, &ap.key);
+        Cursor *cur = pm_scan_from(ectx->partition, rel, &ap.key);
         if (cur) {
             Row *row;
             while ((row = cursor_next(cur)) != NULL) {
                 if (!where_matches(s->where_clause.get(), rel, row)) continue;
                 RID rid = row->rid;
-                rc = storage_delete(rel, rid);
+                rc = pm_delete(ectx->partition, rel, rid);
                 if (rc != MYDB_OK) {
                     format_error(rc, out, cap, s->table_name.c_str());
                     break;
@@ -523,13 +523,13 @@ int exec_delete(EngineState *eng,
     }
 
     case AP_SCAN_BY_INDEX: {
-        Cursor *cur = storage_scan_by_index(rel, ap.col_idx, &ap.key);
+        Cursor *cur = pm_scan_by_index(ectx->partition, rel, ap.col_idx, &ap.key);
         if (cur) {
             Row *row;
             while ((row = cursor_next(cur)) != NULL) {
                 if (!where_matches(s->where_clause.get(), rel, row)) continue;
                 RID rid = row->rid;
-                rc = storage_delete(rel, rid);
+                rc = pm_delete(ectx->partition, rel, rid);
                 if (rc != MYDB_OK) {
                     format_error(rc, out, cap, s->table_name.c_str());
                     break;
@@ -542,13 +542,13 @@ int exec_delete(EngineState *eng,
     }
 
     default: {
-        Cursor *cur = storage_scan(rel);
+        Cursor *cur = pm_scan(ectx->partition, rel);
         if (cur) {
             Row *row;
             while ((row = cursor_next(cur)) != NULL) {
                 if (!where_matches(s->where_clause.get(), rel, row)) continue;
                 RID rid = row->rid;
-                rc = storage_delete(rel, rid);
+                rc = pm_delete(ectx->partition, rel, rid);
                 if (rc != MYDB_OK) {
                     format_error(rc, out, cap, s->table_name.c_str());
                     break;
@@ -561,7 +561,7 @@ int exec_delete(EngineState *eng,
     }
     }
 
-    AUTOCOMMIT_END(rc);
+    AUTOCOMMIT_END(ectx, rc);
 
     if (rc != MYDB_OK) return rc;
 

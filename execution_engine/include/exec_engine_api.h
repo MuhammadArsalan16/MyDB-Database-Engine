@@ -4,10 +4,10 @@
 /* C-callable entry point into the execution engine.
  *
  * Sole caller: engine_execute_sql() in engine.c. After parsing, engine
- * hands the AST here to be walked. The execution engine dispatches AST
- * nodes to:
- *   - storage_*       (table DDL/DML/DQL, transactions)
- *   - engine_check_access, engine_find_relation, engine_use_schema, etc.
+ * builds an ExecContext and hands it plus the AST here to be walked. The
+ * execution engine dispatches AST nodes to:
+ *   - pm_*            (table DDL/DML/DQL, transactions — partition_manager)
+ *   - engine_check_access, engine_use_schema, user management, etc.
  *
  * No other module calls this. Bin never sees it.
  *
@@ -29,17 +29,13 @@
 #include <stddef.h>
 
 #include "parser_api.h"   /* ParserAST opaque type */
+#include "exec_context.h" /* ExecContext — built by the engine per query */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/* Forward declaration — full definition is in engine.h. Including
- * engine.h here would create a header cycle (engine.h → exec_engine_api.h
- * → engine.h). Implementation files include engine.h directly. */
-struct EngineState;
-
-int exec_engine_execute(struct EngineState *eng,
+int exec_engine_execute(ExecContext *ectx,
                         ParserAST *ast,
                         char *result_out, size_t result_cap);
 

@@ -3,40 +3,74 @@
 
 #include "common.h"
 #include "relation_def.h"
-#include "transaction.h"
 #include "btree.h"
+#include "disk_manager.h"
+#include "buffer_pool.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /*
- * storage.h — public interface for the execution engine
+ * storage.h — stateless storage engine (v3).
  *
- * Phase 9 rewrite: storage is now session-aware. All DDL / DML / DQL
- * functions take a `RelationDef *` instead of a table-name string;
- * the parser is responsible for validating the identifier at parse
- * time (looking it up via engine_find_relation) and handing storage
- * a validated pointer.
+ * StorageEngine is a plain struct: one instance per PartitionCtx, owned
+ * by PartitionCtx (partition_manager).  There is NO global singleton.
  *
- * Usage:
- *   storage_init(&eng);          // once after engine_login + engine_use_schema
- *   storage_begin();
- *   storage_insert(rel, &row);
- *   storage_commit();
- *   storage_shutdown();          // once before engine_close
+ * Responsibilities (storage_engine only):
+ *   - Buffer pool (LRU frame cache)
+ *   - Open-table cache (DiskManager + BTree handles)
+ *   - Raw B+ tree insert / delete / search
+ *   - Path building from the filesystem context stored in the struct
  *
- * All functions return MYDB_OK (0) on success, negative error codes on failure.
- * storage_get_by_pk and cursor_next return NULL on miss / end-of-scan.
+ * NOT in storage_engine (moved to partition_manager):
+ *   - Catalog (quota, schema registry)
+ *   - SchemaFile (RelationDef persistence)
+ *   - TransactionManager (begin / commit / rollback)
+ *   - StatsFile (optimizer statistics)
+ *   - FK constraint checks
+ *   - NOT NULL / UNIQUE validation
+ *   - Schema-stat updates (num_rows, num_pages, auto_incr_counter)
+ *
+ * Usage (called by partition_manager):
+ *   StorageEngine se;
+ *   storage_init(&se);
+ *   storage_set_context(&se, partition_path, schema_name);
+ *   storage_insert(&se, rel, row, trx_id, &rid);
+ *   storage_shutdown(&se);
  */
 
-/* Forward declaration — full definition lives in engine.h. Storage
- * keeps a pointer to the engine session for filesystem paths, the
- * active SchemaFile (Cache 2) and the active partition catalog. */
-struct EngineState;
+/* ------------------------------------------------------------------ */
+/*  One entry in the open-table cache                                   */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    char        name[MAX_TABLE_NAME];
+    int         id;             /* table_id used with the buffer pool */
+    DiskManager dm;
+    BTree       clustered;
+    BTree       secondary[MAX_SECONDARY_IDX];
+    int         is_open;
+} OpenTable;
 
 /* ------------------------------------------------------------------ */
-/*  Row — one table row (forward-declared in common.h)                  */
+/*  StorageEngine — one per PartitionCtx, no global singleton          */
+/* ------------------------------------------------------------------ */
+typedef struct StorageEngine {
+    /* Filesystem context — set by storage_set_context() when the
+     * active schema changes.  partition_manager owns these strings. */
+    char        partition_path[256];
+    char        current_schema_name[32];
+
+    BufferPool  bp;
+    OpenTable   open_tables[MAX_TABLES];
+    int         num_open;
+    int         next_table_id;   /* monotonic counter for buffer-pool table IDs */
+    int         initialized;
+    DiskManager *last_written_dm; /* track for fsync on commit */
+} StorageEngine;
+
+/* ------------------------------------------------------------------ */
+/*  Row — one table row                                                 */
 /* ------------------------------------------------------------------ */
 struct Row {
     uint8_t  num_cols;
@@ -45,194 +79,115 @@ struct Row {
 };
 
 /* ------------------------------------------------------------------ */
-/*  Engine lifecycle                                                     */
+/*  Lifecycle                                                           */
 /* ------------------------------------------------------------------ */
 
-/* Initialise the storage runtime against an open engine session.
- * The caller must already have called engine_init + engine_login.
- * `engine_use_schema` may be called before OR after storage_init —
- * storage resolves the active schema lazily on each call. */
-int storage_init(struct EngineState *eng);
+/* Initialise the storage engine: zero state, init buffer pool.
+ * Call once per PartitionCtx after allocating it. */
+int storage_init(StorageEngine *se);
 
-/* Commit any open transaction, flush everything, close all files. */
-int storage_shutdown(void);
+/* Flush all dirty pages and close all open table handles.
+ * Call before freeing the PartitionCtx. */
+int storage_shutdown(StorageEngine *se);
 
-/* Flush every dirty page in the buffer pool to disk without closing any
- * table or tearing down the runtime. Called by engine_use_schema before
- * swapping the active schema so the old schema's pages are durable. */
-int storage_flush_all_dirty(void);
+/* Flush every dirty page without closing tables.
+ * Called by partition_manager before evicting a schema from Cache 2. */
+int storage_flush_all_dirty(StorageEngine *se);
+
+/* Evict all pages from the buffer pool without flushing (used on ROLLBACK). */
+int storage_evict_all(StorageEngine *se);
 
 /* ------------------------------------------------------------------ */
-/*  DDL                                                                 */
+/*  Context management                                                  */
+/* ------------------------------------------------------------------ */
+
+/* Set the active filesystem context.  Called by partition_manager after
+ * opening a schema (pctx_open_schema) so that path-building inside
+ * storage.c uses the correct partition + schema directories. */
+void storage_set_context(StorageEngine *se,
+                         const char *partition_path,
+                         const char *schema_name);
+
+/* Clear the active schema name (called on deactivate / schema switch). */
+void storage_clear_schema(StorageEngine *se);
+
+/* ------------------------------------------------------------------ */
+/*  DDL — pure I/O, no schema/catalog side-effects                     */
 /* ------------------------------------------------------------------ */
 
 /*
- * Create a new schema in the current partition.
- *   1. Owner check: caller must own the active partition.
- *   2. Reject duplicates against the partition catalog.
- *   3. mkdir <partition>/<name>/, write its __schema.mydb, register in
- *      __catalog.mydb.
+ * Create a new relation file and allocate its B+ tree root page(s).
+ * Fills in rel->root_page_no and rel->secondary_root_page_no[].
+ * Does NOT register in SchemaFile or update Catalog — that is the
+ * caller's (partition_manager's) responsibility.
  *
- * Returns MYDB_ERR_PERM      if the caller does not own a partition.
- *         MYDB_ERR_DUPLICATE if a schema with that name already exists.
- *         MYDB_ERR_FULL      if the catalog has no free schema slots.
+ * Returns MYDB_ERR_FULL if the page allocation fails (disk full).
  */
-int storage_create_schema(const char *name);
+int storage_create_table(StorageEngine *se, RelationDef *rel);
 
 /*
- * Drop a schema from the current partition.
- *   1. Rejects if name is the currently active schema (USE another first).
- *   2. Opens __schema.mydb to enumerate all relation files.
- *   3. unlinks each <relation>.mydb and __stats.mydb (if present).
- *   4. unlinks __schema.mydb, then rmdir the schema directory.
- *   5. Credits freed bytes back via cat_track_alloc (quota update).
- *   6. Removes the slot from __catalog.mydb via cat_remove_schema.
- *
- * Returns MYDB_ERR_NOT_FOUND if no such schema exists.
- *         MYDB_ERR           if the schema is currently active.
+ * Close the open handle for table_name (if cached) and unlink its file.
+ * Does NOT touch SchemaFile or Catalog.
  */
-int storage_drop_schema(const char *name);
+int storage_drop_table(StorageEngine *se, const char *table_name);
 
 /*
- * Create a new relation in the active schema. `rel` is mutated:
- *   rel->root_page_no and rel->secondary_root_page_no[] are filled in
- *   by this function.
- * Persists the RelationDef into __schema.mydb and creates the
- * <relation>.mydb data file under the active partition.
- *
- * Returns MYDB_ERR_DUPLICATE if a relation with that name already exists.
+ * Allocate a secondary-index root page, initialise its B+ tree, and
+ * backfill all existing clustered rows into it.
+ * Fills in rel->secondary_root_page_no[rel->num_secondary_indexes - 1].
+ * Caller must have already incremented rel->num_secondary_indexes and
+ * set rel->secondary_col_idx[new_slot] before calling.
+ * Does NOT flush/persist the updated RelationDef — caller does that.
  */
-int storage_create_table(RelationDef *rel);
-
-/* Drop the relation: deletes its data file and removes its slot from
- * __schema.mydb. */
-int storage_drop_table(RelationDef *rel);
-
-/*
- * Add a secondary index on column col_idx of an existing table.
- * Works for both UNIQUE (is_secondary=1) and non-unique (is_secondary=2)
- * columns — the B-tree type is derived from rel->columns[col_idx].is_unique.
- *
- * Allocates a new root page, backfills all existing rows, then persists
- * the updated RelationDef into __schema.mydb.
- *
- * Returns MYDB_ERR_DUPLICATE if col_idx is already indexed.
- * Returns MYDB_ERR_FULL      if MAX_SECONDARY_IDX is reached or quota exceeded.
- */
-int storage_add_index(RelationDef *rel, int col_idx);
+int storage_add_index(StorageEngine *se, RelationDef *rel, int col_idx);
 
 /* ------------------------------------------------------------------ */
-/*  DML                                                                 */
+/*  DML — pure B+ tree operations, no FK/schema/catalog side-effects   */
+/*                                                                      */
+/*  trx_id is stamped into DB_TRX_ID of every affected record.         */
+/*  All constraint checking (FK, NOT NULL, UNIQUE) is the caller's job.*/
 /* ------------------------------------------------------------------ */
 
-/*
- * Insert a row.
- * - NOT NULL columns must have non-null values in row->cols[].
- * - AUTO_INCREMENT PK: set row->cols[pk_idx] to is_null=1 or int_val=0
- *   and the engine fills in the next counter value.
- * - UNIQUE columns: returns MYDB_ERR_DUPLICATE on violation.
- */
-int storage_insert(RelationDef *rel, Row *row);
+int storage_insert(StorageEngine *se, RelationDef *rel,
+                   Row *row, uint64_t trx_id, RID *rid_out);
 
-/*
- * Update the row identified by rid with the values in new_row.
- * Internally: delete old record + insert new record.
- * rid is obtained from row->rid returned by storage_get_by_pk / cursor_next.
- */
-int storage_update(RelationDef *rel, RID rid, Row *new_row);
+int storage_delete(StorageEngine *se, RelationDef *rel, RID rid);
 
-/* Delete the row identified by rid. */
-int storage_delete(RelationDef *rel, RID rid);
+int storage_update(StorageEngine *se, RelationDef *rel,
+                   RID rid, Row *new_row, uint64_t trx_id);
 
 /* ------------------------------------------------------------------ */
-/*  DQL                                                                 */
+/*  DQL — pure B+ tree lookups and scans                               */
 /* ------------------------------------------------------------------ */
 
-/*
- * Fetch a single row by primary key.
- * Returns a pointer to an internal static Row, or NULL if not found.
- * The pointer is valid until the next storage_get_by_pk call.
- */
-Row *storage_get_by_pk(RelationDef *rel, Value *pk);
+Row    *storage_get_by_pk(StorageEngine *se, RelationDef *rel, Value *pk);
 
-/*
- * Fetch a single row by a secondary (UNIQUE) index.
- * col_idx is the column position in rel->columns[] that has is_unique=1.
- * Descends the secondary B+ tree to get the RID, then fetches the full
- * row from the clustered tree in one page read.
- * Returns a pointer to an internal static Row, or NULL if not found /
- * col_idx has no secondary index / permission denied.
- * The pointer is valid until the next storage_get_by_index call.
- */
-Row *storage_get_by_index(RelationDef *rel, int col_idx, Value *key);
+Row    *storage_get_by_index(StorageEngine *se, RelationDef *rel,
+                              int col_idx, Value *key);
 
-/*
- * Open a scan cursor on a secondary (UNIQUE) index, positioned at the
- * first key >= lo.  Pass lo = NULL to start from the leftmost key.
- *
- * cursor_next() returns full rows fetched from the clustered index
- * (same Row * as a clustered scan — RID, all columns present).
- * The caller applies any upper bound by comparing the indexed column
- * value from each returned row and breaking when it exceeds the
- * desired range — the same pattern as storage_scan_from() for PK ranges.
- *
- * Returns NULL if col_idx has no secondary index, on permission
- * failure, or on internal error. Close with cursor_close().
- */
-Cursor *storage_scan_by_index(RelationDef *rel, int col_idx, Value *lo);
+Cursor *storage_scan(StorageEngine *se, RelationDef *rel);
 
-/*
- * Open a full-table scan cursor. NULL on error.
- * The cursor must be closed with cursor_close().
- */
-Cursor *storage_scan(RelationDef *rel);
+Cursor *storage_scan_from(StorageEngine *se, RelationDef *rel, Value *lo);
 
-/*
- * Open a scan cursor positioned at the first row whose primary key is >= lo.
- * The cursor walks forward in key order from there; the caller applies any
- * upper bound by comparing each row's PK and stopping when it exceeds the
- * desired range. NULL on error. Close with cursor_close().
- */
-Cursor *storage_scan_from(RelationDef *rel, Value *lo);
+Cursor *storage_scan_by_index(StorageEngine *se, RelationDef *rel,
+                               int col_idx, Value *lo);
 
-/* Advance the cursor and return a pointer to the next row, or NULL at
- * end-of-scan. The pointed-to Row is owned by the cursor. */
-Row *cursor_next(Cursor *cursor);
+Row  *cursor_next(Cursor *cursor);
+void  cursor_close(Cursor *cursor);
 
-/* Close a scan cursor and free its resources. */
-void cursor_close(Cursor *cursor);
+/* Fetch a full row by its Record ID.
+ * Used by partition_manager for FK constraint resolution (reading the
+ * old row before update/delete to check referencing rows).
+ * Returns a pointer to an internal static Row, or NULL on error. */
+Row *storage_get_by_rid(StorageEngine *se, RelationDef *rel, RID rid);
 
 /* ------------------------------------------------------------------ */
-/*  TCL                                                                 */
+/*  Page-count query (used by partition_manager to track quota delta)  */
 /* ------------------------------------------------------------------ */
 
-int storage_begin(void);
-int storage_commit(void);
-int storage_rollback(void);
-
-/* ------------------------------------------------------------------ */
-/*  Statistics collection (for the cost-based planner)                */
-/* ------------------------------------------------------------------ */
-
-/*
- * Scan the entire clustered B+ tree and recompute per-column statistics
- * for the CBO.  Writes the results to __stats.mydb in the active schema
- * directory (creates the file if it does not exist yet).
- *
- * Called by the execution engine when the user issues:
- *   ANALYZE TABLE <table_name>;
- *
- * Column statistics collected:
- *   - total_rows, num_nulls, num_distinct (NDV), min, max
- *   - MCV (Most Common Values) when num_distinct ≤ STATS_MAX_ENTRIES,
- *     or when the column is BOOL/ENUM regardless of cardinality.
- *   - Equi-height histogram (STATS_MAX_ENTRIES buckets) otherwise.
- *   - VARCHAR columns get only scalar stats (no MCV/histogram).
- *
- * Returns MYDB_OK on success.  Returns MYDB_ERR_PERM if the caller
- * does not have read access to the active schema.
- */
-int storage_analyze_table(RelationDef *rel);
+/* Return the current on-disk page count for the named table, or 0 if
+ * the table is not open (caller should open it first). */
+uint32_t storage_table_page_count(StorageEngine *se, const char *table_name);
 
 #ifdef __cplusplus
 }
