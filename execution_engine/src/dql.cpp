@@ -6,7 +6,10 @@
  * Sub-phase 5.2 : ORDER BY — materialise + sort; PK-ASC stream optimisation.
  * Sub-phase 5.3 : scalar aggregates.
  * Sub-phase 5.4 : GROUP BY + aggregates, HAVING (GROUP BY columns only).
- * Sub-phase 5.5 : JOINs                              (TODO)
+ * Sub-phase 5.5 : JOINs — INNER / LEFT / RIGHT / FULL OUTER, implicit comma
+ *                 joins, and chained multi-table joins.  Per-step access path
+ *                 (sort-merge / index-NLJ / hash) chosen from column indexes.
+ *                 Ported to the v3 ExecContext / pm_* partition API.
  */
 
 #include "ast_executor.hpp"
@@ -20,6 +23,9 @@
 #include <algorithm>
 #include <map>
 #include <vector>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <cstring>
 #include <cstdio>
 
@@ -634,6 +640,727 @@ static int exec_group_by(ExecContext           *ectx,
 
 
 /* ======================================================================
+ * JOIN execution  (sub-phase 5.5)
+ *
+ * Supports INNER / LEFT / RIGHT / FULL OUTER joins, implicit comma joins
+ * (FROM a, b WHERE a.x = b.y), and chained joins over 2+ tables.
+ *
+ * Model — a left-deep join: start with the first FROM table, then fold in
+ * each additional table one step at a time, accumulating a set of
+ * "combined rows" (one storage Row per participating table).
+ *
+ * Per-step access path (planner-style, driven by indexes):
+ *   - both join columns indexed (2-table case)  -> SORT_MERGE   (O(n+m))
+ *   - inner table join column indexed           -> INDEX_NLJ    (O(n log m))
+ *   - neither indexed                           -> HASH_JOIN    (O(n+m))
+ *
+ * v3: all storage access goes through the pm_* wrappers on the partition
+ * context (ectx->partition); the ON condition pairs rows, the WHERE clause
+ * is applied once at the end over the fully combined row.
+ * ====================================================================== */
+
+/* One table participating in the join. */
+struct JoinSeg {
+    const RelationDef *rel;
+    std::string        label;   /* alias if given, else relation_name */
+};
+
+/* One fold step: add segs[right_seg] to the accumulated result. */
+struct JoinStep {
+    int      right_seg;          /* segment being added */
+    JoinType type;               /* INNER / LEFT / RIGHT / FULL */
+    bool     cross;              /* true = no ON condition (cartesian) */
+    int      prev_seg, prev_col; /* earlier-table column in the ON equality */
+    int      new_col;            /* right_seg-table column in the ON equality */
+};
+
+/* One combined row spanning all segments. cells[i] holds segment i's row;
+ * isnull[i] == 1 means segment i is NULL-padded (outer-join fill). */
+struct JoinedRow {
+    std::vector<Row>  cells;
+    std::vector<char> isnull;
+};
+
+/* Split "table.col" into prefix + column ("col" alone leaves prefix empty). */
+static void split_qual(const std::string &q, std::string &tbl, std::string &col)
+{
+    size_t dot = q.find('.');
+    if (dot == std::string::npos) { tbl.clear(); col = q; }
+    else { tbl = q.substr(0, dot); col = q.substr(dot + 1); }
+}
+
+/* Resolve (prefix, column) against the segment list.
+ * prefix may match a segment's alias or its real table name; empty prefix
+ * searches every segment. Returns true and writes seg/col index on success. */
+static bool seg_resolve(const std::vector<JoinSeg> &segs,
+                        const std::string &prefix, const std::string &col,
+                        int &seg_out, int &col_out)
+{
+    for (size_t i = 0; i < segs.size(); i++) {
+        if (!prefix.empty() &&
+            prefix != segs[i].label &&
+            strcmp(prefix.c_str(), segs[i].rel->relation_name) != 0)
+            continue;
+        for (int c = 0; c < segs[i].rel->num_columns; c++) {
+            if (col == segs[i].rel->columns[c].name) {
+                seg_out = (int)i; col_out = c; return true;
+            }
+        }
+    }
+    return false;
+}
+
+/* Index classification of a column: 0 = none, 1 = unique (PK or UNIQUE
+ * secondary, at most one match), 2 = non-unique secondary (many matches). */
+static int seg_index_kind(const RelationDef *rel, int col)
+{
+    if (col == (int)rel->pk_col_idx) return 1;
+    for (int j = 0; j < rel->num_secondary_indexes; j++)
+        if ((int)rel->secondary_col_idx[j] == col)
+            return rel->columns[col].is_unique ? 1 : 2;
+    return 0;
+}
+
+/* Canonical hash/equality key for a Value (consistent with compare_values). */
+static std::string vkey(const Value &v)
+{
+    char b[64];
+    switch (v.type) {
+    case TYPE_INT:      snprintf(b, sizeof b, "i%d",   v.v.int_val);                 return b;
+    case TYPE_DECIMAL:  snprintf(b, sizeof b, "d%lld", (long long)v.v.decimal_val);  return b;
+    case TYPE_DATE:     snprintf(b, sizeof b, "D%d",   v.v.date_val);                return b;
+    case TYPE_DATETIME: snprintf(b, sizeof b, "T%lld", (long long)v.v.datetime_val); return b;
+    case TYPE_BOOL:     snprintf(b, sizeof b, "b%d",   v.v.bool_val);                return b;
+    case TYPE_ENUM:     snprintf(b, sizeof b, "e%d",   v.v.enum_val);                return b;
+    case TYPE_VARCHAR:  return std::string("s") +
+                               std::string(v.v.varchar_val.data, v.v.varchar_val.len);
+    }
+    return "";
+}
+
+/* Open a cursor that returns rows sorted by `col` (PK scan or index scan). */
+static Cursor *open_sorted_cursor(PartitionCtx *pc, RelationDef *rel, int col)
+{
+    if (col == (int)rel->pk_col_idx) return pm_scan(pc, rel);
+    return pm_scan_by_index(pc, rel, col, nullptr);
+}
+
+/* Fetch all inner rows whose `col` equals key. rk is the index kind. */
+static std::vector<Row> lookup_right(PartitionCtx *pc, RelationDef *rrel,
+                                     int col, const Value &key, int rk)
+{
+    std::vector<Row> res;
+    Value k = key;   /* pm API takes non-const */
+
+    if (col == (int)rrel->pk_col_idx) {
+        Row *r = pm_get_by_pk(pc, rrel, &k);
+        if (r) res.push_back(*r);
+    } else if (rk == 1) {
+        Row *r = pm_get_by_index(pc, rrel, col, &k);
+        if (r) res.push_back(*r);
+    } else {
+        Cursor *c = pm_scan_by_index(pc, rrel, col, &k);
+        if (c) {
+            Row *r;
+            while ((r = cursor_next(c)) != NULL) {
+                if (compare_values(&r->cols[col], &k) == 0) res.push_back(*r);
+                else break;   /* index is sorted — past the key */
+            }
+            cursor_close(c);
+        }
+    }
+    return res;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Join-aware WHERE evaluation (resolves columns across all segments) */
+/* ------------------------------------------------------------------ */
+
+static int j_like_match(const char *str, const char *pat)
+{
+    while (*pat) {
+        if (*pat == '%') {
+            pat++;
+            do { if (j_like_match(str, pat)) return 1; } while (*str++);
+            return 0;
+        }
+        if (*pat == '_') { if (!*str) return 0; str++; pat++; }
+        else { if (*str != *pat) return 0; str++; pat++; }
+    }
+    return *str == '\0';
+}
+
+/* Column definition behind a ColumnRef expr (for literal type hints). */
+static const ColumnDef *j_coldef(const Expr *e, const std::vector<JoinSeg> &segs)
+{
+    if (e && e->kind == Expr::Kind::ColumnRef) {
+        const ColumnRefExpr *cr = static_cast<const ColumnRefExpr *>(e);
+        int sg, ci;
+        if (seg_resolve(segs, cr->table, cr->column, sg, ci))
+            return &segs[sg].rel->columns[ci];
+    }
+    return nullptr;
+}
+
+/* Value of an expression (ColumnRef or Literal) within a combined row. */
+static Value j_eval_value(const Expr *e, const std::vector<JoinSeg> &segs,
+                          const JoinedRow &jr, const ColumnDef *hint)
+{
+    Value v; memset(&v, 0, sizeof(v)); v.is_null = 1;
+    if (!e) return v;
+
+    if (e->kind == Expr::Kind::ColumnRef) {
+        const ColumnRefExpr *cr = static_cast<const ColumnRefExpr *>(e);
+        int sg, ci;
+        if (!seg_resolve(segs, cr->table, cr->column, sg, ci)) return v;
+        if (jr.isnull[sg]) return v;        /* NULL-padded segment */
+        return jr.cells[sg].cols[ci];
+    }
+    if (e->kind == Expr::Kind::Literal) {
+        const LiteralExpr *lit = static_cast<const LiteralExpr *>(e);
+        if (hint) return cast_literal(lit->raw, *hint);
+        /* no hint: best-guess as VARCHAR text */
+        v.is_null = 0; v.type = TYPE_VARCHAR;
+        size_t n = lit->raw.size(); if (n > MAX_VARCHAR_LEN) n = MAX_VARCHAR_LEN;
+        v.v.varchar_val.len = (uint16_t)n;
+        memcpy(v.v.varchar_val.data, lit->raw.c_str(), n);
+        return v;
+    }
+    return v;
+}
+
+/* Evaluate a WHERE expression against a combined row. */
+static bool j_eval(const Expr *e, const std::vector<JoinSeg> &segs,
+                   const JoinedRow &jr)
+{
+    if (!e) return true;
+
+    switch (e->kind) {
+
+    case Expr::Kind::Binary: {
+        const BinaryExpr *b = static_cast<const BinaryExpr *>(e);
+        const char *op = b->op.c_str();
+
+        if (strcmp(op, "AND") == 0)
+            return j_eval(b->lhs.get(), segs, jr) && j_eval(b->rhs.get(), segs, jr);
+        if (strcmp(op, "OR") == 0)
+            return j_eval(b->lhs.get(), segs, jr) || j_eval(b->rhs.get(), segs, jr);
+
+        /* comparison: a literal on one side takes its type from the column
+         * on the other side. */
+        const ColumnDef *lhs_hint = j_coldef(b->rhs.get(), segs);  /* from rhs column */
+        const ColumnDef *rhs_hint = j_coldef(b->lhs.get(), segs);  /* from lhs column */
+        Value lv = j_eval_value(b->lhs.get(), segs, jr, lhs_hint);
+        Value rv = j_eval_value(b->rhs.get(), segs, jr, rhs_hint);
+        if (lv.is_null || rv.is_null) return false;
+
+        int cmp = compare_values(&lv, &rv);
+        if (strcmp(op, "=")  == 0) return cmp == 0;
+        if (strcmp(op, "!=") == 0 || strcmp(op, "<>") == 0) return cmp != 0;
+        if (strcmp(op, "<")  == 0) return cmp <  0;
+        if (strcmp(op, ">")  == 0) return cmp >  0;
+        if (strcmp(op, "<=") == 0) return cmp <= 0;
+        if (strcmp(op, ">=") == 0) return cmp >= 0;
+        return false;
+    }
+
+    case Expr::Kind::Unary: {
+        const UnaryExpr *u = static_cast<const UnaryExpr *>(e);
+        if (strcmp(u->op.c_str(), "NOT") == 0)
+            return !j_eval(u->child.get(), segs, jr);
+        return false;
+    }
+
+    case Expr::Kind::IsNull: {
+        const IsNullExpr *isn = static_cast<const IsNullExpr *>(e);
+        Value v = j_eval_value(isn->child.get(), segs, jr, nullptr);
+        bool is_null = (v.is_null != 0);
+        return isn->negated ? !is_null : is_null;
+    }
+
+    case Expr::Kind::Between: {
+        const BetweenExpr *bw = static_cast<const BetweenExpr *>(e);
+        const ColumnDef *hint = j_coldef(bw->v.get(), segs);
+        Value v  = j_eval_value(bw->v.get(),  segs, jr, nullptr);
+        Value lo = j_eval_value(bw->lo.get(), segs, jr, hint);
+        Value hi = j_eval_value(bw->hi.get(), segs, jr, hint);
+        if (v.is_null || lo.is_null || hi.is_null) return false;
+        bool r = compare_values(&v, &lo) >= 0 && compare_values(&v, &hi) <= 0;
+        return bw->negated ? !r : r;
+    }
+
+    case Expr::Kind::In: {
+        const InExpr *in = static_cast<const InExpr *>(e);
+        const ColumnDef *hint = j_coldef(in->v.get(), segs);
+        Value v = j_eval_value(in->v.get(), segs, jr, nullptr);
+        if (v.is_null) return false;
+        bool found = false;
+        for (const auto &lit : in->list) {
+            Value lv = hint ? cast_literal(lit->raw, *hint)
+                            : j_eval_value(lit.get(), segs, jr, nullptr);
+            if (compare_values(&v, &lv) == 0) { found = true; break; }
+        }
+        return in->negated ? !found : found;
+    }
+
+    case Expr::Kind::Like: {
+        const LikeExpr *lk = static_cast<const LikeExpr *>(e);
+        Value v = j_eval_value(lk->v.get(), segs, jr, nullptr);
+        if (v.is_null || v.type != TYPE_VARCHAR) return false;
+        bool r = j_like_match(v.v.varchar_val.data, lk->pattern.c_str()) != 0;
+        return lk->negated ? !r : r;
+    }
+
+    case Expr::Kind::ColumnRef:
+    case Expr::Kind::Literal: {
+        Value v = j_eval_value(e, segs, jr, nullptr);
+        if (v.is_null) return false;
+        if (v.type == TYPE_BOOL) return v.v.bool_val != 0;
+        if (v.type == TYPE_INT)  return v.v.int_val  != 0;
+        return false;
+    }
+    default:
+        return true;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Sort-merge join (2-table fast path, both join columns indexed)     */
+/* ------------------------------------------------------------------ */
+static std::vector<JoinedRow>
+sort_merge_two(PartitionCtx *pc, RelationDef *L, int lc,
+               RelationDef *R, int rc, JoinType type)
+{
+    std::vector<JoinedRow> out;
+    bool keepL = (type == JoinType::LEFT  || type == JoinType::FULL);
+    bool keepR = (type == JoinType::RIGHT || type == JoinType::FULL);
+
+    Cursor *lcur = open_sorted_cursor(pc, L, lc);
+    Cursor *rcur = open_sorted_cursor(pc, R, rc);
+
+    Row lrow, rrow;
+    Row *lp = lcur ? cursor_next(lcur) : nullptr; bool lhave = lp; if (lp) lrow = *lp;
+    Row *rp = rcur ? cursor_next(rcur) : nullptr; bool rhave = rp; if (rp) rrow = *rp;
+
+    auto emit = [&](const Row *a, const Row *b) {
+        JoinedRow jr; jr.cells.resize(2); jr.isnull.assign(2, 1);
+        if (a) { jr.cells[0] = *a; jr.isnull[0] = 0; }
+        if (b) { jr.cells[1] = *b; jr.isnull[1] = 0; }
+        out.push_back(jr);
+    };
+
+    while (lhave && rhave) {
+        int c = compare_values(&lrow.cols[lc], &rrow.cols[rc]);
+        if (c < 0) {
+            if (keepL) emit(&lrow, nullptr);
+            lp = cursor_next(lcur); lhave = lp; if (lp) lrow = *lp;
+        } else if (c > 0) {
+            if (keepR) emit(nullptr, &rrow);
+            rp = cursor_next(rcur); rhave = rp; if (rp) rrow = *rp;
+        } else {
+            Value key = lrow.cols[lc];
+            std::vector<Row> lg, rg;
+            while (lhave && compare_values(&lrow.cols[lc], &key) == 0) {
+                lg.push_back(lrow);
+                lp = cursor_next(lcur); lhave = lp; if (lp) lrow = *lp;
+            }
+            while (rhave && compare_values(&rrow.cols[rc], &key) == 0) {
+                rg.push_back(rrow);
+                rp = cursor_next(rcur); rhave = rp; if (rp) rrow = *rp;
+            }
+            for (auto &a : lg) for (auto &b : rg) emit(&a, &b);
+        }
+    }
+    while (lhave) { if (keepL) emit(&lrow, nullptr);
+                    lp = cursor_next(lcur); lhave = lp; if (lp) lrow = *lp; }
+    while (rhave) { if (keepR) emit(nullptr, &rrow);
+                    rp = cursor_next(rcur); rhave = rp; if (rp) rrow = *rp; }
+
+    if (lcur) cursor_close(lcur);
+    if (rcur) cursor_close(rcur);
+    return out;
+}
+
+/* ------------------------------------------------------------------ */
+/*  One fold step: accumulated `left` ⋈ segs[step.right_seg]           */
+/* ------------------------------------------------------------------ */
+static void join_step(PartitionCtx *pc, const std::vector<JoinSeg> &segs,
+                      std::vector<JoinedRow> &left, const JoinStep &st)
+{
+    RelationDef *rrel  = (RelationDef *)segs[st.right_seg].rel;
+    size_t       total = segs.size();
+    bool keepL = (st.type == JoinType::LEFT  || st.type == JoinType::FULL);
+    bool keepR = (st.type == JoinType::RIGHT || st.type == JoinType::FULL);
+    std::vector<JoinedRow> out;
+
+    /* Cartesian product (implicit join with no linking equality). */
+    if (st.cross) {
+        std::vector<Row> rrows;
+        Cursor *c = pm_scan(pc, rrel);
+        if (c) { Row *r; while ((r = cursor_next(c)) != NULL) rrows.push_back(*r);
+                 cursor_close(c); }
+        for (auto &lr : left)
+            for (auto &R : rrows) {
+                JoinedRow nr = lr;
+                nr.cells[st.right_seg] = R; nr.isnull[st.right_seg] = 0;
+                out.push_back(nr);
+            }
+        left.swap(out);
+        return;
+    }
+
+    /* For RIGHT/FULL we must later emit unmatched right rows — remember
+     * every left-side join key so we know which right rows never matched. */
+    std::unordered_set<std::string> left_keys;
+    if (keepR) {
+        for (auto &lr : left) {
+            if (lr.isnull[st.prev_seg]) continue;
+            const Value &v = lr.cells[st.prev_seg].cols[st.prev_col];
+            if (!v.is_null) left_keys.insert(vkey(v));
+        }
+    }
+
+    int rk = seg_index_kind(rrel, st.new_col);
+
+    if (rk != 0) {
+        /* INDEX_NLJ — inner join column is indexed. */
+        for (auto &lr : left) {
+            if (lr.isnull[st.prev_seg]) { if (keepL) out.push_back(lr); continue; }
+            Value key = lr.cells[st.prev_seg].cols[st.prev_col];
+            if (key.is_null) { if (keepL) out.push_back(lr); continue; }
+
+            std::vector<Row> ms = lookup_right(pc, rrel, st.new_col, key, rk);
+            if (!ms.empty())
+                for (auto &R : ms) {
+                    JoinedRow nr = lr;
+                    nr.cells[st.right_seg] = R; nr.isnull[st.right_seg] = 0;
+                    out.push_back(nr);
+                }
+            else if (keepL) out.push_back(lr);
+        }
+    } else {
+        /* HASH_JOIN — build a hash table on the inner (right) table. */
+        std::unordered_map<std::string, std::vector<Row>> hm;
+        Cursor *c = pm_scan(pc, rrel);
+        if (c) {
+            Row *r;
+            while ((r = cursor_next(c)) != NULL) {
+                const Value &v = r->cols[st.new_col];
+                if (!v.is_null) hm[vkey(v)].push_back(*r);
+            }
+            cursor_close(c);
+        }
+        for (auto &lr : left) {
+            if (lr.isnull[st.prev_seg]) { if (keepL) out.push_back(lr); continue; }
+            Value key = lr.cells[st.prev_seg].cols[st.prev_col];
+            if (key.is_null) { if (keepL) out.push_back(lr); continue; }
+
+            auto it = hm.find(vkey(key));
+            if (it != hm.end())
+                for (auto &R : it->second) {
+                    JoinedRow nr = lr;
+                    nr.cells[st.right_seg] = R; nr.isnull[st.right_seg] = 0;
+                    out.push_back(nr);
+                }
+            else if (keepL) out.push_back(lr);
+        }
+    }
+
+    /* RIGHT / FULL — append inner rows that never matched any left row. */
+    if (keepR) {
+        Cursor *c = pm_scan(pc, rrel);
+        if (c) {
+            Row *r;
+            while ((r = cursor_next(c)) != NULL) {
+                const Value &v = r->cols[st.new_col];
+                if (v.is_null) continue;
+                if (left_keys.find(vkey(v)) == left_keys.end()) {
+                    JoinedRow nr;
+                    nr.cells.assign(total, Row{});
+                    nr.isnull.assign(total, 1);
+                    nr.cells[st.right_seg] = *r; nr.isnull[st.right_seg] = 0;
+                    out.push_back(nr);
+                }
+            }
+            cursor_close(c);
+        }
+    }
+
+    left.swap(out);
+}
+
+/* Collect col=col equalities (under AND) for implicit-join condition mining. */
+struct EqLink { int sa, ca, sb, cb; };
+static void collect_eq(const Expr *e, const std::vector<JoinSeg> &segs,
+                       std::vector<EqLink> &links)
+{
+    if (!e || e->kind != Expr::Kind::Binary) return;
+    const BinaryExpr *b = static_cast<const BinaryExpr *>(e);
+    if (b->op == "AND") {
+        collect_eq(b->lhs.get(), segs, links);
+        collect_eq(b->rhs.get(), segs, links);
+        return;
+    }
+    if (b->op == "=" &&
+        b->lhs && b->lhs->kind == Expr::Kind::ColumnRef &&
+        b->rhs && b->rhs->kind == Expr::Kind::ColumnRef) {
+        const ColumnRefExpr *l = static_cast<const ColumnRefExpr *>(b->lhs.get());
+        const ColumnRefExpr *r = static_cast<const ColumnRefExpr *>(b->rhs.get());
+        EqLink lk;
+        if (seg_resolve(segs, l->table, l->column, lk.sa, lk.ca) &&
+            seg_resolve(segs, r->table, r->column, lk.sb, lk.cb))
+            links.push_back(lk);
+    }
+}
+
+/* ====================================================================== */
+/*  exec_join_select — top-level JOIN handler                            */
+/* ====================================================================== */
+static int exec_join_select(ExecContext *ectx, const SelectStatement *s,
+                            char *out, size_t cap)
+{
+    PartitionCtx *pc = ectx->partition;
+
+    int rc = engine_check_access(ectx->engine, 0);
+    if (rc != MYDB_OK) {
+        format_error(rc, out, cap, s->from_list[0].table_name.c_str());
+        return rc;
+    }
+
+    /* Aggregates / GROUP BY across joins are out of scope for Phase 1. */
+    if (!s->group_by.empty()) {
+        snprintf(out, cap, "  Error: GROUP BY with JOIN is not supported");
+        return MYDB_ERR;
+    }
+    for (const auto &it : s->select_list)
+        if (it.kind == SelectItem::Kind::Aggregate) {
+            snprintf(out, cap, "  Error: aggregates with JOIN are not supported");
+            return MYDB_ERR;
+        }
+
+    /* ---- Build the segment list (FROM tables, then JOIN tables) ---- */
+    std::vector<JoinSeg> segs;
+    for (const auto &fi : s->from_list) {
+        const RelationDef *r = pm_find_relation_const(pc, fi.table_name.c_str());
+        if (!r) {
+            snprintf(out, cap, "  Error: table '%s' does not exist",
+                     fi.table_name.c_str());
+            return MYDB_ERR_NOT_FOUND;
+        }
+        segs.push_back({ r, fi.alias.empty() ? std::string(r->relation_name) : fi.alias });
+    }
+    int first_join_seg = (int)segs.size();
+    for (const auto &jc : s->join_list) {
+        const RelationDef *r = pm_find_relation_const(pc, jc.join_table.c_str());
+        if (!r) {
+            snprintf(out, cap, "  Error: table '%s' does not exist",
+                     jc.join_table.c_str());
+            return MYDB_ERR_NOT_FOUND;
+        }
+        segs.push_back({ r, jc.join_table_alias.empty()
+                            ? std::string(r->relation_name) : jc.join_table_alias });
+    }
+
+    /* ---- Build the fold steps ---- */
+    std::vector<JoinStep> steps;
+
+    /* Implicit comma joins: link each extra FROM table to an earlier one. */
+    std::vector<EqLink> links;
+    if (s->where_clause) collect_eq(s->where_clause->root.get(), segs, links);
+
+    for (int i = 1; i < first_join_seg; i++) {
+        JoinStep st; st.right_seg = i; st.type = JoinType::INNER; st.cross = true;
+        st.prev_seg = st.prev_col = st.new_col = 0;
+        for (const auto &lk : links) {
+            if (lk.sa == i && lk.sb < i) {
+                st.cross = false; st.prev_seg = lk.sb; st.prev_col = lk.cb; st.new_col = lk.ca; break;
+            }
+            if (lk.sb == i && lk.sa < i) {
+                st.cross = false; st.prev_seg = lk.sa; st.prev_col = lk.ca; st.new_col = lk.cb; break;
+            }
+        }
+        steps.push_back(st);
+    }
+
+    /* Explicit joins: ON condition gives the pairing columns. */
+    for (size_t j = 0; j < s->join_list.size(); j++) {
+        const JoinClause &jc = s->join_list[j];
+        JoinStep st; st.right_seg = first_join_seg + (int)j;
+        st.type = jc.join_type; st.cross = false;
+
+        std::string lt, lcn, rt, rcn;
+        split_qual(jc.left_condition,  lt, lcn);
+        split_qual(jc.right_condition, rt, rcn);
+
+        int s1, c1, s2, c2;
+        if (!seg_resolve(segs, lt, lcn, s1, c1) ||
+            !seg_resolve(segs, rt, rcn, s2, c2)) {
+            snprintf(out, cap, "  Error: JOIN ON column does not exist");
+            return MYDB_ERR;
+        }
+        /* One side must reference the table being added (right_seg). */
+        if (s1 == st.right_seg) { st.new_col = c1; st.prev_seg = s2; st.prev_col = c2; }
+        else if (s2 == st.right_seg) { st.new_col = c2; st.prev_seg = s1; st.prev_col = c1; }
+        else {
+            snprintf(out, cap,
+                     "  Error: JOIN ON must reference the joined table '%s'",
+                     jc.join_table.c_str());
+            return MYDB_ERR;
+        }
+        steps.push_back(st);
+    }
+
+    /* ---- Build the projection column list ---- */
+    struct ProjCol { int seg; int col; std::string label; };
+    std::vector<ProjCol> proj;
+
+    auto add_all_seg_cols = [&](int sg) {
+        for (int c = 0; c < segs[sg].rel->num_columns; c++)
+            proj.push_back({ sg, c,
+                segs[sg].label + "." + segs[sg].rel->columns[c].name });
+    };
+
+    if (s->is_select_all) {
+        for (int sg = 0; sg < (int)segs.size(); sg++) add_all_seg_cols(sg);
+    } else {
+        for (const auto &it : s->select_list) {
+            if (it.kind == SelectItem::Kind::Star) {
+                if (!it.table.empty()) {
+                    int sg = -1;
+                    for (int i = 0; i < (int)segs.size(); i++)
+                        if (it.table == segs[i].label ||
+                            strcmp(it.table.c_str(), segs[i].rel->relation_name) == 0)
+                            { sg = i; break; }
+                    if (sg < 0) { snprintf(out, cap,
+                        "  Error: unknown table '%s' in SELECT", it.table.c_str());
+                        return MYDB_ERR; }
+                    add_all_seg_cols(sg);
+                } else {
+                    for (int sg = 0; sg < (int)segs.size(); sg++) add_all_seg_cols(sg);
+                }
+            } else { /* Column */
+                int sg, ci;
+                if (!seg_resolve(segs, it.table, it.column, sg, ci)) {
+                    snprintf(out, cap, "  Error: column '%s' does not exist",
+                             it.column.c_str());
+                    return MYDB_ERR;
+                }
+                std::string label = !it.alias.empty() ? it.alias
+                                  : (it.table.empty() ? it.column
+                                                      : it.table + "." + it.column);
+                proj.push_back({ sg, ci, label });
+            }
+        }
+    }
+
+    /* ---- Execute the join ---- */
+    std::vector<JoinedRow> acc;
+    bool done = false;
+
+    /* Sort-merge fast path: exactly two tables, single keyed step, both
+     * join columns indexed. */
+    if (segs.size() == 2 && steps.size() == 1 && !steps[0].cross) {
+        const JoinStep &st = steps[0];
+        int lk = seg_index_kind(segs[st.prev_seg].rel,  st.prev_col);
+        int rk = seg_index_kind(segs[st.right_seg].rel, st.new_col);
+        if (lk != 0 && rk != 0) {
+            acc = sort_merge_two(pc,
+                                 (RelationDef *)segs[st.prev_seg].rel,  st.prev_col,
+                                 (RelationDef *)segs[st.right_seg].rel, st.new_col,
+                                 st.type);
+            done = true;
+        }
+    }
+
+    if (!done) {
+        /* General path: scan the first table, then fold each step. */
+        Cursor *c = pm_scan(pc, (RelationDef *)segs[0].rel);
+        if (c) {
+            Row *r;
+            while ((r = cursor_next(c)) != NULL) {
+                JoinedRow jr;
+                jr.cells.assign(segs.size(), Row{});
+                jr.isnull.assign(segs.size(), 1);
+                jr.cells[0] = *r; jr.isnull[0] = 0;
+                acc.push_back(jr);
+            }
+            cursor_close(c);
+        }
+        for (const auto &st : steps) join_step(pc, segs, acc, st);
+    }
+
+    /* ---- Final WHERE filter over the combined rows ---- */
+    if (s->where_clause) {
+        std::vector<JoinedRow> kept;
+        kept.reserve(acc.size());
+        for (auto &jr : acc)
+            if (j_eval(s->where_clause->root.get(), segs, jr))
+                kept.push_back(std::move(jr));
+        acc.swap(kept);
+    }
+
+    /* ---- ORDER BY ---- */
+    if (!s->order_by.empty()) {
+        std::vector<std::pair<int,int>> obcols;
+        std::vector<char>               obdesc;
+        for (const auto &ob : s->order_by) {
+            int sg, ci;
+            if (!seg_resolve(segs, ob.table, ob.column, sg, ci)) {
+                snprintf(out, cap, "  Error: ORDER BY column '%s' does not exist",
+                         ob.column.c_str());
+                return MYDB_ERR;
+            }
+            obcols.push_back({ sg, ci });
+            obdesc.push_back(ob.descending ? 1 : 0);
+        }
+        std::stable_sort(acc.begin(), acc.end(),
+            [&](const JoinedRow &a, const JoinedRow &b) -> bool {
+                for (size_t k = 0; k < obcols.size(); k++) {
+                    int sg = obcols[k].first, ci = obcols[k].second;
+                    bool desc = obdesc[k] != 0;
+                    bool an = a.isnull[sg] || a.cells[sg].cols[ci].is_null;
+                    bool bn = b.isnull[sg] || b.cells[sg].cols[ci].is_null;
+                    if (an && bn) continue;
+                    if (an) return !desc;   /* NULL sorts first for ASC */
+                    if (bn) return  desc;
+                    int cmp = compare_values(&a.cells[sg].cols[ci],
+                                             &b.cells[sg].cols[ci]);
+                    if (cmp != 0) return desc ? cmp > 0 : cmp < 0;
+                }
+                return false;
+            });
+    }
+
+    /* ---- LIMIT / OFFSET ---- */
+    size_t total = acc.size();
+    size_t start = ((size_t)s->offset < total) ? (size_t)s->offset : total;
+    size_t end   = (s->limit >= 0)
+                   ? std::min(start + (size_t)s->limit, total) : total;
+
+    /* ---- Render ---- */
+    ResultBuf rb(out, cap);
+    TableBuilder tb;
+    std::vector<std::string> headers;
+    headers.reserve(proj.size());
+    for (auto &p : proj) headers.push_back(p.label);
+    tb.set_headers(headers);
+
+    for (size_t i = start; i < end; i++) {
+        const JoinedRow &jr = acc[i];
+        std::vector<std::string> cells;
+        cells.reserve(proj.size());
+        for (auto &p : proj) {
+            if (jr.isnull[p.seg]) cells.push_back("NULL");
+            else cells.push_back(value_to_str(jr.cells[p.seg].cols[p.col],
+                                              segs[p.seg].rel->columns[p.col]));
+        }
+        tb.add_row(cells);
+    }
+    tb.render(rb);
+    return MYDB_OK;
+}
+
+/* ======================================================================
  * exec_select — entry point
  * ====================================================================== */
 
@@ -654,12 +1381,11 @@ int exec_select(ExecContext *ectx, const SelectStatement *s,
     }
 
     /* ------------------------------------------------------------------
-     * Defer unimplemented sub-phases gracefully.
+     * Multi-table query (explicit JOIN or implicit comma join) → dedicated
+     * join handler.  Single-table SELECT continues below.
      * ------------------------------------------------------------------ */
-    if (!s->join_list.empty() || s->from_list.size() > 1) {
-        snprintf(out, cap, "  Error: JOIN is not yet implemented");
-        return MYDB_ERR;
-    }
+    if (!s->join_list.empty() || s->from_list.size() > 1)
+        return exec_join_select(ectx, s, out, cap);
 
     /* Without GROUP BY: mixing aggregate and non-aggregate columns is
      * undefined (which non-aggregate value would appear in the result?).
