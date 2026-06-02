@@ -63,14 +63,17 @@ typedef struct EngineState {
      * single session at conns[0]. */
     ConnectionPool conn_pool;
 
-    /* The active partition's runtime context: Catalog (Cache 1), the
-     * PartitionBuffer (Cache 2), TransactionManager, and an embedded
-     * StorageEngine.  Heap-allocated by partition_manager (pctx_init) on
-     * login for partition-owning users; resolved lazily on USE for
-     * analyst sessions.  NULL when the current session owns/accesses no
-     * partition yet.  The engine never dereferences its internals — that
-     * is partition_manager's job, reached via pctx_* / pm_* calls. */
-    struct PartitionCtx *active_partition;
+    /* Table of loaded partition runtime contexts — one PartitionCtx per
+     * active partition (Catalog, Cache 2, TransactionManager, embedded
+     * StorageEngine), heap-allocated by partition_manager (pctx_init).
+     * The engine owns connection→partition routing: each Connection carries
+     * a partition_id, and the engine resolves it to a slot here, lazily
+     * loading on login / USE and evicting (flush + close) when the last
+     * referencing connection leaves (PartitionCtx.n_refs hits 0).  A
+     * PartitionCtx is shared by all connections on the same partition.
+     * Empty slots are NULL.  The engine never dereferences a PartitionCtx's
+     * internals — that is partition_manager's job (pctx_* / pm_* calls). */
+    struct PartitionCtx *partitions[MAX_PARTITIONS];
 
     /* Engine-owned optimizer-statistics pool.  Lazily opens the stats file
      * for each (partition_id, schema) under system_schema/stats/ and hands

@@ -53,24 +53,30 @@ typedef struct {
 /* Build the on-disk path for a relation file:
  *   <partition_path>/<schema_name>/<relation>.mydb
  *
- * v3: uses se->partition_path and se->current_schema_name, which are
- * set by storage_set_context() when the active schema changes. */
+ * v3: uses se->partition_path (set once at init) and the schema_name the
+ * caller passes — which comes from rel->owner_schema, never from any
+ * active-schema state on the engine. */
 static int build_path(StorageEngine *se, char *out, size_t outlen,
-                      const char *relation_name)
+                      const char *schema_name, const char *relation_name)
 {
+    if (!schema_name || schema_name[0] == '\0') return MYDB_ERR;
     int n = snprintf(out, outlen, "%s/%s/%s.mydb",
                      se->partition_path,
-                     se->current_schema_name,
+                     schema_name,
                      relation_name);
     return (n < 0 || (size_t)n >= outlen) ? MYDB_ERR : MYDB_OK;
 }
 
-/* Find an already-open table by relation name; NULL if not open. */
-static OpenTable *find_open(StorageEngine *se, const char *name)
+/* Find an already-open table by (schema_name, relation name); NULL if not
+ * open.  Both must match — two schemas may hold same-named tables. */
+static OpenTable *find_open(StorageEngine *se,
+                            const char *schema_name, const char *name)
 {
+    if (!schema_name) return NULL;
     for (int i = 0; i < MAX_TABLES; i++) {
         if (se->open_tables[i].is_open &&
-            strcmp(se->open_tables[i].name, name) == 0)
+            strcmp(se->open_tables[i].name, name) == 0 &&
+            strcmp(se->open_tables[i].schema_name, schema_name) == 0)
             return &se->open_tables[i];
     }
     return NULL;
@@ -84,7 +90,7 @@ static OpenTable *find_open(StorageEngine *se, const char *name)
  * responsibility. */
 static OpenTable *open_table(StorageEngine *se, const RelationDef *rel)
 {
-    OpenTable *ot = find_open(se, rel->relation_name);
+    OpenTable *ot = find_open(se, rel->owner_schema, rel->relation_name);
     if (ot) return ot;
 
     int slot = -1;
@@ -97,12 +103,14 @@ static OpenTable *open_table(StorageEngine *se, const RelationDef *rel)
     memset(ot, 0, sizeof(OpenTable));
 
     char path[512];
-    if (build_path(se, path, sizeof(path), rel->relation_name) != MYDB_OK)
+    if (build_path(se, path, sizeof(path),
+                   rel->owner_schema, rel->relation_name) != MYDB_OK)
         return NULL;
 
     if (disk_open(&ot->dm, path) != MYDB_OK) return NULL;
 
     strncpy(ot->name, rel->relation_name, MAX_TABLE_NAME - 1);
+    strncpy(ot->schema_name, rel->owner_schema, sizeof(ot->schema_name) - 1);
     ot->id = se->next_table_id++;
 
     /* clustered B+ tree */
@@ -365,28 +373,15 @@ int storage_evict_all(StorageEngine *se)
 /*  Context management                                                  */
 /* ------------------------------------------------------------------ */
 
-/* Set the active filesystem context.
- * Called by partition_manager (pctx_open_schema) when the active schema
- * changes, so that build_path() inside storage.c produces correct paths
- * without the storage layer knowing about PartitionCtx. */
+/* Set the partition root path.  Called once by partition_manager at
+ * PartitionCtx init.  The per-relation schema comes from rel->owner_schema
+ * on each call, so the storage layer holds no active-schema state. */
 void storage_set_context(StorageEngine *se,
-                         const char *partition_path,
-                         const char *schema_name)
+                         const char *partition_path)
 {
-    if (!se) return;
+    if (!se || !partition_path) return;
     strncpy(se->partition_path, partition_path,
             sizeof(se->partition_path) - 1);
-    strncpy(se->current_schema_name, schema_name,
-            sizeof(se->current_schema_name) - 1);
-}
-
-/* Clear the active schema name (called on deactivate / schema switch).
- * build_path() will return MYDB_ERR for any call that arrives after
- * deactivation, guarding against stale-path table opens. */
-void storage_clear_schema(StorageEngine *se)
-{
-    if (!se) return;
-    se->current_schema_name[0] = '\0';
 }
 
 /* ------------------------------------------------------------------ */
@@ -408,12 +403,13 @@ void storage_clear_schema(StorageEngine *se)
 int storage_create_table(StorageEngine *se, RelationDef *rel)
 {
     if (!se || !se->initialized || !rel) return MYDB_ERR;
-    if (se->current_schema_name[0] == '\0') return MYDB_ERR_PERM;
+    if (rel->owner_schema[0] == '\0') return MYDB_ERR_PERM;
 
     rel->root_page_no = INVALID_PAGE;
 
     char path[512];
-    if (build_path(se, path, sizeof(path), rel->relation_name) != MYDB_OK)
+    if (build_path(se, path, sizeof(path),
+                   rel->owner_schema, rel->relation_name) != MYDB_OK)
         return MYDB_ERR;
 
     DiskManager dm;
@@ -455,20 +451,23 @@ int storage_create_table(StorageEngine *se, RelationDef *rel)
 }
 
 /*
- * Close the open handle for table_name (if cached) and unlink its file.
+ * Close the open handle for (schema_name, table_name) if cached and unlink
+ * its file.
  *
  * v3: no SchemaFile or Catalog side-effects.  partition_manager calls
  * schema_remove_relation() and cat_track_alloc() around this call.
  */
-int storage_drop_table(StorageEngine *se, const char *table_name)
+int storage_drop_table(StorageEngine *se,
+                       const char *schema_name, const char *table_name)
 {
-    if (!se || !se->initialized || !table_name) return MYDB_ERR;
+    if (!se || !se->initialized || !schema_name || !table_name)
+        return MYDB_ERR;
 
-    OpenTable *ot = find_open(se, table_name);
+    OpenTable *ot = find_open(se, schema_name, table_name);
     if (ot) close_table(se, ot);
 
     char path[512];
-    if (build_path(se, path, sizeof(path), table_name) != MYDB_OK)
+    if (build_path(se, path, sizeof(path), schema_name, table_name) != MYDB_OK)
         return MYDB_ERR;
     disk_destroy(path);
     return MYDB_OK;
@@ -491,7 +490,7 @@ int storage_drop_table(StorageEngine *se, const char *table_name)
 int storage_add_index(StorageEngine *se, RelationDef *rel, int col_idx)
 {
     if (!se || !se->initialized || !rel) return MYDB_ERR;
-    if (se->current_schema_name[0] == '\0') return MYDB_ERR_PERM;
+    if (rel->owner_schema[0] == '\0') return MYDB_ERR_PERM;
 
     if (col_idx < 0 || col_idx >= rel->num_columns) return MYDB_ERR;
 
@@ -1054,10 +1053,12 @@ Row *storage_get_by_rid(StorageEngine *se, RelationDef *rel, RID rid)
 /*    cat_track_alloc(catalog, delta * PAGE_SIZE);                     */
 /* ------------------------------------------------------------------ */
 
-uint32_t storage_table_page_count(StorageEngine *se, const char *table_name)
+uint32_t storage_table_page_count(StorageEngine *se,
+                                  const char *schema_name,
+                                  const char *table_name)
 {
-    if (!se || !table_name) return 0;
-    OpenTable *ot = find_open(se, table_name);
+    if (!se || !schema_name || !table_name) return 0;
+    OpenTable *ot = find_open(se, schema_name, table_name);
     if (!ot) return 0;
     return ot->dm.num_pages;
 }

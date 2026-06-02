@@ -77,6 +77,76 @@ static Connection *cur_conn(EngineState *eng)
 
 
 /* ====================================================================
+ *  Partition table — the engine owns connection→partition routing.
+ *
+ *  Each Connection carries a partition_id (>0 when it has a partition);
+ *  the engine resolves it to a loaded PartitionCtx here, lazily loading
+ *  on login / USE and evicting when the last referencing connection
+ *  detaches (n_refs → 0).  One PartitionCtx is shared by all connections
+ *  on the same partition.
+ * ==================================================================== */
+
+/* Loaded PartitionCtx for partition_id, or NULL.  pid == 0 means "none". */
+static PartitionCtx *engine_find_partition(EngineState *eng, uint32_t pid)
+{
+    if (pid == 0) return NULL;
+    for (int i = 0; i < MAX_PARTITIONS; i++)
+        if (eng->partitions[i] && eng->partitions[i]->partition_id == pid)
+            return eng->partitions[i];
+    return NULL;
+}
+
+/* The PartitionCtx for the current connection, or NULL if it has none. */
+static PartitionCtx *cur_partition(EngineState *eng)
+{
+    return engine_find_partition(eng, cur_conn(eng)->partition_id);
+}
+
+/* Get-or-load the PartitionCtx for (pid, path) and add one reference.
+ * On a miss, loads into a free slot (pctx_init + pctx_open_catalog).
+ * Returns the context, or NULL on error / table full. */
+static PartitionCtx *engine_acquire_partition(EngineState *eng, uint32_t pid,
+                                              const char *path)
+{
+    PartitionCtx *ctx = engine_find_partition(eng, pid);
+    if (ctx) { ctx->n_refs++; return ctx; }
+
+    int slot = -1;
+    for (int i = 0; i < MAX_PARTITIONS; i++)
+        if (eng->partitions[i] == NULL) { slot = i; break; }
+    if (slot < 0) return NULL;   /* partition table full */
+
+    ctx = pctx_init(pid, path);
+    if (!ctx) return NULL;
+    if (pctx_open_catalog(ctx) != MYDB_OK) {
+        pctx_close(ctx);
+        free(ctx);
+        return NULL;
+    }
+    ctx->n_refs = 1;
+    eng->partitions[slot] = ctx;
+    return ctx;
+}
+
+/* Drop one reference to partition_id; flush + close + free at zero. */
+static void engine_release_partition(EngineState *eng, uint32_t pid)
+{
+    if (pid == 0) return;
+    for (int i = 0; i < MAX_PARTITIONS; i++) {
+        PartitionCtx *ctx = eng->partitions[i];
+        if (ctx && ctx->partition_id == pid) {
+            if (--ctx->n_refs <= 0) {
+                pctx_close(ctx);
+                free(ctx);
+                eng->partitions[i] = NULL;
+            }
+            return;
+        }
+    }
+}
+
+
+/* ====================================================================
  *  Bootstrap
  * ==================================================================== */
 
@@ -189,7 +259,7 @@ int engine_init(const char *root_dir, EngineState *out)
     out->database.fd                  = -1;
     out->system_schema.users.fd       = -1;
     out->system_schema.privileges.fd  = -1;
-    out->active_partition             = NULL;  /* opened on login */
+    /* partitions[] already NULL from memset; loaded lazily on login / USE. */
     out->conn_pool.n_active           = 0;
 
     char db_path[256];
@@ -223,14 +293,16 @@ int engine_close(EngineState *eng)
     if (!eng) return MYDB_ERR;
     int rc = MYDB_OK;
 
-    /* Tear down the active partition: pctx_close flushes dirty pages,
+    /* Tear down every loaded partition: pctx_close flushes dirty pages,
      * shuts down the embedded StorageEngine, closes Cache 2 and the
      * catalog.  partition_manager owns all of that — the engine just
      * frees the heap handle afterward. */
-    if (eng->active_partition) {
-        if (pctx_close(eng->active_partition) != MYDB_OK) rc = MYDB_ERR;
-        free(eng->active_partition);
-        eng->active_partition = NULL;
+    for (int i = 0; i < MAX_PARTITIONS; i++) {
+        if (eng->partitions[i]) {
+            if (pctx_close(eng->partitions[i]) != MYDB_OK) rc = MYDB_ERR;
+            free(eng->partitions[i]);
+            eng->partitions[i] = NULL;
+        }
     }
 
     /* Close every open stats handle (does not unlink the files). */
@@ -302,26 +374,18 @@ int engine_login(EngineState *eng,
     if (memcmp(computed, u.password_hash, SHA256_DIGEST_LEN) != 0)
         return MYDB_ERR_PERM;
 
-    /* Create the partition runtime context — only if the user owns one.
+    /* Acquire the partition runtime context — only if the user owns one.
      * Users without a partition (analyst accounts) can still log in; their
-     * conn->partition_open stays 0 and active_partition stays NULL until
+     * conn->partition_open stays 0 and conn->partition_id stays 0 until
      * USE resolves a target partition through their privileges. */
     uint8_t  partition_open = 0;
     uint32_t partition_id   = 0;
     PartitionEntry *p = db_find_by_owner(&eng->database, u.user_id);
     if (p) {
-        /* pctx_init heap-allocates the PartitionCtx and initialises its
-         * embedded StorageEngine + TransactionManager + Cache 2. */
-        eng->active_partition = pctx_init(p->partition_id, p->path);
-        if (!eng->active_partition) return MYDB_ERR;
-
-        rc = pctx_open_catalog(eng->active_partition);
-        if (rc != MYDB_OK) {
-            pctx_close(eng->active_partition);
-            free(eng->active_partition);
-            eng->active_partition = NULL;
-            return rc;
-        }
+        /* Acquire the owner's partition into the engine table (loads it via
+         * pctx_init + pctx_open_catalog and takes one reference). */
+        if (engine_acquire_partition(eng, p->partition_id, p->path) == NULL)
+            return MYDB_ERR;
         partition_open = 1;
         partition_id   = p->partition_id;
     }
@@ -330,11 +394,7 @@ int engine_login(EngineState *eng,
     u.last_login = now_yyyymmddhhmmss();
     rc = users_update(&eng->system_schema.users, &u);
     if (rc != MYDB_OK) {
-        if (eng->active_partition) {
-            pctx_close(eng->active_partition);
-            free(eng->active_partition);
-            eng->active_partition = NULL;
-        }
+        engine_release_partition(eng, partition_id);
         return rc;
     }
 
@@ -370,10 +430,11 @@ int engine_deactivate_schema(EngineState *eng)
     Connection *c = cur_conn(eng);
     if (!c->schema_active) return MYDB_OK;             /* nothing to do */
 
-    /* partition_manager flushes dirty pages and closes the schema's
-     * Cache 2 slot.  Partition state (logged_in, partition_open) is left
+    /* Clear the active-schema marker on the connection's partition.  Cache 2
+     * entries stay open; partition state (logged_in, partition_open) is left
      * intact — the user stays logged in. */
-    if (pctx_deactivate_schema(eng->active_partition) != MYDB_OK)
+    PartitionCtx *part = cur_partition(eng);
+    if (part && pctx_deactivate_schema(part) != MYDB_OK)
         return MYDB_ERR;
 
     c->schema_active = 0;
@@ -393,26 +454,29 @@ int engine_use_schema(EngineState *eng, const char *schema_name)
     if (!c->logged_in)          return MYDB_ERR_PERM;
     if (schema_name[0] == '\0') return MYDB_ERR;
 
-    /* Deactivate any currently active schema (partition_manager flushes
-     * dirty pages and closes the Cache 2 slot).
-     * TODO phase: implicit COMMIT of any open transaction. */
+    /* Deactivate any currently active schema on the connection's partition
+     * (clears the active marker; Cache 2 entries stay open). */
     if (c->schema_active) {
-        if (pctx_deactivate_schema(eng->active_partition) != MYDB_OK)
-            return MYDB_ERR;
+        PartitionCtx *old = cur_partition(eng);
+        if (old) pctx_deactivate_schema(old);
         c->schema_active = 0;
         c->current_schema_name[0] = '\0';
     }
 
     char schema_path[256];
+    PartitionCtx *part;
 
     if (c->partition_open) {
-        /* Owner path: schema must exist in the user's own catalog. */
-        if (cat_find_schema(&eng->active_partition->catalog, schema_name) == NULL)
+        /* Owner path: the partition was acquired at login. */
+        part = cur_partition(eng);
+        if (!part) return MYDB_ERR;
+
+        /* Schema must exist in the user's own catalog. */
+        if (cat_find_schema(&part->catalog, schema_name) == NULL)
             return MYDB_ERR_NOT_FOUND;
 
         if (join2(schema_path, sizeof(schema_path),
-                  eng->active_partition->partition_path,
-                  schema_name, "__schema.mydb") < 0)
+                  part->partition_path, schema_name, "__schema.mydb") < 0)
             return MYDB_ERR;
     } else {
         /* Analyst path: find a privilege grant for this user + schema. */
@@ -438,36 +502,26 @@ int engine_use_schema(EngineState *eng, const char *schema_name)
         PartitionEntry *pe = db_find_by_id(&eng->database, priv.partition_id);
         if (!pe) return MYDB_ERR;
 
-        /* Open (or switch to) the target partition's runtime context.
-         * An analyst starts with active_partition == NULL; if they pivot
-         * to a schema in a different partition we tear the old one down
-         * first (Phase 1 holds one PartitionCtx per session). */
-        if (eng->active_partition &&
-            eng->active_partition->partition_id != priv.partition_id) {
-            pctx_close(eng->active_partition);
-            free(eng->active_partition);
-            eng->active_partition = NULL;
+        /* Switch this connection to the target partition: release the old one
+         * (if different) and acquire the target from the engine table.  The
+         * PartitionCtx is shared with any other connection on that partition. */
+        if (c->partition_id != priv.partition_id) {
+            engine_release_partition(eng, c->partition_id);
+            part = engine_acquire_partition(eng, priv.partition_id, pe->path);
+            if (!part) return MYDB_ERR;
+            c->partition_id = priv.partition_id;
+        } else {
+            part = engine_find_partition(eng, c->partition_id);
+            if (!part) return MYDB_ERR;
         }
-        if (!eng->active_partition) {
-            eng->active_partition = pctx_init(priv.partition_id, pe->path);
-            if (!eng->active_partition) return MYDB_ERR;
-            if (pctx_open_catalog(eng->active_partition) != MYDB_OK) {
-                pctx_close(eng->active_partition);
-                free(eng->active_partition);
-                eng->active_partition = NULL;
-                return MYDB_ERR;
-            }
-        }
-        c->partition_id = priv.partition_id;
 
         if (join2(schema_path, sizeof(schema_path),
                   pe->path, schema_name, "__schema.mydb") < 0)
             return MYDB_ERR;
     }
 
-    /* partition_manager opens the schema into Cache 2 and points the
-     * embedded StorageEngine at the new filesystem context. */
-    if (pctx_open_schema(eng->active_partition, schema_name, schema_path) == NULL)
+    /* partition_manager loads the schema into Cache 2 and makes it active. */
+    if (pctx_open_schema(part, schema_name, schema_path) == NULL)
         return MYDB_ERR;
 
     strncpy(c->current_schema_name, schema_name,
@@ -517,7 +571,7 @@ const RelationDef *engine_find_relation(EngineState *eng,
     Connection *c = cur_conn(eng);
     if (!c->schema_active)            return NULL;
     /* Delegate to partition_manager — it owns the active SchemaFile. */
-    return pm_find_relation_const(eng->active_partition, relation_name);
+    return pm_find_relation_const(cur_partition(eng), relation_name);
 }
 
 
@@ -779,9 +833,10 @@ int engine_alter_user_quota(EngineState *eng,
     cat_close(&cat);
 
     /* If this is the currently logged-in user's own catalog, keep the
-     * in-memory copy (inside the active PartitionCtx) consistent. */
-    if (u.user_id == c->user_id && c->partition_open && eng->active_partition)
-        eng->active_partition->catalog.header.quota_bytes = new_quota_bytes;
+     * in-memory copy (inside its PartitionCtx) consistent. */
+    PartitionCtx *self_part = cur_partition(eng);
+    if (u.user_id == c->user_id && c->partition_open && self_part)
+        self_part->catalog.header.quota_bytes = new_quota_bytes;
 
     return rc;
 }
@@ -825,13 +880,33 @@ int engine_execute_sql(EngineState *eng, const char *sql,
      * opened/created under system_schema/stats/).  The planner reads it and
      * ANALYZE writes through it; NULL means no schema active. */
     ExecContext ectx;
+    PartitionCtx *part = cur_partition(eng);
     ectx.engine    = eng;
-    ectx.partition = eng->active_partition;
+    ectx.partition = part;
     ectx.conn      = c;
     ectx.stats     = c->schema_active
                      ? sb_get(&eng->stats_buf, c->partition_id,
                               c->current_schema_name)
                      : NULL;
+
+    /* Project this connection's active schema onto the shared partition for
+     * the duration of the statement.  The connection owns its current schema
+     * (set by USE); the partition is shared by all of a partition's
+     * connections, so the active schema must be (re)established per statement
+     * from the executing connection.  pctx_open_schema is a cache-hit bump in
+     * the common case (and reloads if the schema was evicted), and keeps the
+     * active schema most-recently-used so it cannot be evicted mid-use. */
+    if (part) {
+        if (c->schema_active && c->current_schema_name[0] != '\0') {
+            char schema_path[512];
+            if (join2(schema_path, sizeof(schema_path),
+                      part->partition_path,
+                      c->current_schema_name, "__schema.mydb") == 0)
+                pctx_open_schema(part, c->current_schema_name, schema_path);
+        } else {
+            pctx_deactivate_schema(part);
+        }
+    }
 
     /* --- Time the execution pipeline --- */
     struct timespec t0, t1;

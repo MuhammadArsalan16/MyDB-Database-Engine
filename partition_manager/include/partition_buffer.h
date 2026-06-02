@@ -61,14 +61,22 @@ int pb_flush_all(PartitionBuffer *pb, StorageEngine *se);
  * no-op). */
 void pb_destroy(PartitionBuffer *pb);
 
-/* Full LRU get — Phase 3.
- * Returns the cached or newly-opened SchemaFile for schema_name.
+/* Full LRU get.
+ * Returns the cached or newly-opened SchemaFile for schema_name, marked MRU.
  * Evicts the LRU slot (calling storage_flush_all_dirty + schema_close) if
  * all PARTITION_BUFFER_SLOTS are occupied. */
 SchemaFile *pb_get(PartitionBuffer *pb,
                    const char *schema_name,
                    const char *schema_path,
                    StorageEngine *se);
+
+/* Return the cached SchemaFile for schema_name (no load, no LRU bump),
+ * or NULL if it is not currently cached. */
+SchemaFile *pb_find(PartitionBuffer *pb, const char *schema_name);
+
+/* Evict schema_name from the cache if present (close handle + free + compact).
+ * No-op if not cached.  Used when a schema is dropped. */
+int pb_remove(PartitionBuffer *pb, const char *schema_name);
 
 #ifdef __cplusplus
 }

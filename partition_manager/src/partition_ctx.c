@@ -31,6 +31,10 @@ PartitionCtx *pctx_init(uint32_t partition_id, const char *partition_path)
         return NULL;
     }
 
+    /* Storage only needs the partition root once — the per-relation schema
+     * travels in rel->owner_schema, so there is no active-schema context. */
+    storage_set_context(&ctx->storage, partition_path);
+
     /* Initialise the TransactionManager with the storage engine's BufferPool.
      * storage_init must run first so ctx->storage.bp is ready. */
     trx_init(&ctx->txn_mgr, &ctx->storage.bp);
@@ -80,95 +84,64 @@ int pctx_close(PartitionCtx *ctx)
     return MYDB_OK;
 }
 
-int pctx_add_conn(PartitionCtx *ctx, struct Connection *conn)
-{
-    if (!ctx || !conn) return MYDB_ERR;
-    if (ctx->sub_pool.n_active >= MAX_SUBCONN) return MYDB_ERR_FULL;
-    ctx->sub_pool.conns[ctx->sub_pool.n_active++] = conn;
-    return MYDB_OK;
-}
-
-int pctx_remove_conn(PartitionCtx *ctx, struct Connection *conn)
-{
-    if (!ctx || !conn) return MYDB_ERR;
-    for (int i = 0; i < ctx->sub_pool.n_active; i++) {
-        if (ctx->sub_pool.conns[i] == conn) {
-            ctx->sub_pool.conns[i] =
-                ctx->sub_pool.conns[--ctx->sub_pool.n_active];
-            ctx->sub_pool.conns[ctx->sub_pool.n_active] = NULL;
-            return MYDB_OK;
-        }
-    }
-    return MYDB_ERR_NOT_FOUND;
-}
-
 /* ------------------------------------------------------------------ */
 /*  Schema cache accessors                                              */
 /* ------------------------------------------------------------------ */
 
+/* The active schema is the one named by ctx->current_schema_name, looked up
+ * in Cache 2.  It is NOT simply the MRU slot — switching active schema does
+ * not require it to be most-recently-used. */
 SchemaFile *pctx_active_schema(PartitionCtx *ctx)
 {
     if (!ctx || !ctx->schema_cache) return NULL;
-    return pb_active_schema(ctx->schema_cache);
+    if (ctx->current_schema_name[0] == '\0') return NULL;
+    return pb_find(ctx->schema_cache, ctx->current_schema_name);
 }
 
 const char *pctx_active_schema_name(const PartitionCtx *ctx)
 {
-    if (!ctx || !ctx->schema_cache) return NULL;
-    return pb_active_schema_name(ctx->schema_cache);
+    if (!ctx || ctx->current_schema_name[0] == '\0') return NULL;
+    return ctx->current_schema_name;
 }
 
+/* Make schema_name the active schema, loading it into Cache 2 if needed.
+ * Multiple schemas stay open simultaneously (LRU); a switch is a cache
+ * bump, not a close/reopen.  Storage holds no schema state — each storage
+ * call carries its schema in rel->owner_schema. */
 SchemaFile *pctx_open_schema(PartitionCtx *ctx,
                               const char *schema_name,
                               const char *schema_path)
 {
     if (!ctx || !schema_name || !schema_path) return NULL;
 
-    /* Close any currently active schema (Phase 2: single slot). */
-    pctx_deactivate_schema(ctx);
-
-    /* Allocate a SchemaFile on the heap and open it. */
-    SchemaFile *sf = (SchemaFile *)calloc(1, sizeof(SchemaFile));
+    SchemaFile *sf = pb_get(ctx->schema_cache, schema_name,
+                            schema_path, &ctx->storage);
     if (!sf) return NULL;
-
-    if (schema_open(schema_path, sf) != MYDB_OK) {
-        free(sf);
-        return NULL;
-    }
-
-    /* Place in slot 0 of the PartitionBuffer.
-     * Phase 3 replaces this with pb_get() and full LRU eviction. */
-    ctx->schema_cache->slots[0]     = sf;
-    ctx->schema_cache->lru_order[0] = 0;
-    ctx->schema_cache->n_loaded     = 1;
 
     strncpy(ctx->current_schema_name, schema_name,
             sizeof(ctx->current_schema_name) - 1);
     ctx->current_schema_name[sizeof(ctx->current_schema_name) - 1] = '\0';
 
-    /* Notify the storage engine of the new filesystem context so that
-     * build_path() inside storage.c produces correct table file paths. */
-    storage_set_context(&ctx->storage, ctx->partition_path, schema_name);
-
     return sf;
 }
 
+/* Mark "no schema active" for this partition.  Does NOT evict from Cache 2 —
+ * the schema stays open for fast re-activation.  (Eviction happens via LRU
+ * pressure, pctx_evict_schema on DROP, or pctx_close on shutdown.) */
 int pctx_deactivate_schema(PartitionCtx *ctx)
 {
-    if (!ctx || !ctx->schema_cache) return MYDB_OK;
-
-    PartitionBuffer *pb = ctx->schema_cache;
-    if (pb->n_loaded == 0) return MYDB_OK;
-
-    SchemaFile *sf = pb->slots[pb->lru_order[0]];
-    if (sf) {
-        if (sf->fd > 0) schema_close(sf);
-        free(sf);
-        pb->slots[pb->lru_order[0]] = NULL;
-    }
-    pb->n_loaded = 0;
-
+    if (!ctx) return MYDB_OK;
     ctx->current_schema_name[0] = '\0';
-    storage_clear_schema(&ctx->storage);
     return MYDB_OK;
+}
+
+/* Evict a dropped schema from Cache 2 so no stale handle to a deleted file
+ * lingers.  Clears the active marker if it named that schema. */
+int pctx_evict_schema(PartitionCtx *ctx, const char *schema_name)
+{
+    if (!ctx || !ctx->schema_cache || !schema_name) return MYDB_ERR;
+    if (strncmp(ctx->current_schema_name, schema_name,
+                sizeof(ctx->current_schema_name)) == 0)
+        ctx->current_schema_name[0] = '\0';
+    return pb_remove(ctx->schema_cache, schema_name);
 }

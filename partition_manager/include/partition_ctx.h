@@ -38,37 +38,23 @@ extern "C" {
  */
 
 /* ------------------------------------------------------------------
- * SubConnPool — slice of the engine's master ConnectionPool.
- *
- * Holds Connection* pointers into EngineState.conn_pool.conns[].
- * The Connection objects live in the master pool; this sub-pool only
- * holds references.  A connection is registered here on login and
- * removed on logout / connection close.
- *
- * Phase 1: capacity = 1.
- * ------------------------------------------------------------------ */
-#define MAX_SUBCONN  1   /* Phase 1 */
-
-/* Forward declaration — full definition in engine/include/connection.h.
- * partition_ctx.h does not include connection.h to avoid a header cycle
- * (engine.h includes both).  Implementation files include both. */
-struct Connection;
-
-typedef struct {
-    struct Connection  *conns[MAX_SUBCONN];
-    int                 n_active;
-} SubConnPool;
-
-
-/* ------------------------------------------------------------------
  * PartitionCtx
+ *
+ * The partition is connection-agnostic: it does NOT track which
+ * connections use it.  The engine owns connection→partition routing and
+ * maintains n_refs (incremented when a connection attaches to this
+ * partition, decremented when it detaches); the engine evicts the
+ * PartitionCtx when n_refs reaches 0.
  * ------------------------------------------------------------------ */
 typedef struct PartitionCtx {
     uint32_t         partition_id;
     char             partition_path[256];
 
-    /* Temporary bridge field — removed in Phase 3 when
-     * pctx_active_schema_name() replaces all direct reads. */
+    /* Active schema for the currently-executing statement.  The connection
+     * owns its current schema; the engine projects it here per statement
+     * (via pctx_open_schema) because one partition is shared by all of its
+     * connections.  Read only through pctx_active_schema[_name]() — pm code
+     * never touches this field directly. */
     char             current_schema_name[32];
 
     /* v3: StorageEngine is embedded here (one per partition, no global singleton).
@@ -84,7 +70,10 @@ typedef struct PartitionCtx {
 
     TransactionManager txn_mgr;    /* promoted from StorageState; WAL owner post-WAL */
 
-    SubConnPool      sub_pool;     /* references into engine's master pool */
+    /* Number of connections currently attached to this partition.  Owned and
+     * maintained by the engine; the partition itself never reads it.  When it
+     * reaches 0 the engine flushes + closes + frees this PartitionCtx. */
+    int              n_refs;
 } PartitionCtx;
 
 
@@ -109,10 +98,6 @@ int pctx_open_catalog(PartitionCtx *ctx);
  * Safe to call on a partially-initialised ctx. */
 int pctx_close(PartitionCtx *ctx);
 
-/* Register / remove a Connection* in the sub-pool. */
-int pctx_add_conn(PartitionCtx *ctx, struct Connection *conn);
-int pctx_remove_conn(PartitionCtx *ctx, struct Connection *conn);
-
 
 /* ------------------------------------------------------------------
  * Schema cache accessors (Cache 2)
@@ -128,9 +113,13 @@ SchemaFile *pctx_open_schema(PartitionCtx *ctx,
                               const char *schema_name,
                               const char *schema_path);
 
-/* Flush dirty pages and close the currently active schema (if any).
- * Clears current_schema_name and calls storage_clear_schema(). */
+/* Mark "no schema active" for this partition.  Does NOT evict from Cache 2;
+ * the schema stays open for fast re-activation. */
 int pctx_deactivate_schema(PartitionCtx *ctx);
+
+/* Evict a dropped schema from Cache 2 (close handle + free).  Clears the
+ * active marker if it named that schema.  No-op if not cached. */
+int pctx_evict_schema(PartitionCtx *ctx, const char *schema_name);
 
 /* Return the active SchemaFile*, or NULL if no schema is open. */
 SchemaFile *pctx_active_schema(PartitionCtx *ctx);

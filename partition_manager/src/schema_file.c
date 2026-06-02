@@ -537,6 +537,12 @@ int schema_open(const char *path, SchemaFile *out)
             close(fd);
             return MYDB_ERR;
         }
+        /* Stamp the owning schema (in-memory only, not serialized) so the
+         * storage engine can build the table's path and key its open-table
+         * cache by (owner_schema, relation_name) without holding any
+         * active-schema state of its own. */
+        strncpy(out->defs[i].owner_schema, out->header.schema_name,
+                sizeof(out->defs[i].owner_schema) - 1);
     }
 
     out->fd = fd;
@@ -595,6 +601,9 @@ int schema_add_relation(SchemaFile *sf, const RelationDef *def)
     e->reserved    = 0;
 
     sf->defs[slot] = *def;
+    /* Stamp the owning schema on the in-memory def (not serialized). */
+    strncpy(sf->defs[slot].owner_schema, sf->header.schema_name,
+            sizeof(sf->defs[slot].owner_schema) - 1);
     sf->header.num_relations++;
     sf->header.size_bytes = schema_compute_size_bytes(sf);
 

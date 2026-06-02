@@ -72,6 +72,15 @@ typedef struct {
 struct RelationDef {
     char       relation_name[MAX_TABLE_NAME];
 
+    /* Owning schema name (v3). In-memory only — NOT serialized to the
+     * __schema.mydb def page (the codec is field-by-field, see
+     * relation_def_serialize/deserialize). Stamped from the owning
+     * SchemaFile's header.schema_name when a def is loaded or added, so
+     * the storage engine can build the table's file path and key its
+     * open-table cache by (owner_schema, relation_name) without holding
+     * any active-schema state of its own. */
+    char       owner_schema[32];
+
     uint8_t    num_columns;
     ColumnDef  columns[MAX_COLUMNS];
     uint8_t    pk_col_idx;          /* index into columns[] for the primary key */

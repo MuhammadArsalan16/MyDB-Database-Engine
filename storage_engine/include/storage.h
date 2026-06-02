@@ -35,8 +35,8 @@ extern "C" {
  * Usage (called by partition_manager):
  *   StorageEngine se;
  *   storage_init(&se);
- *   storage_set_context(&se, partition_path, schema_name);
- *   storage_insert(&se, rel, row, trx_id, &rid);
+ *   storage_set_context(&se, partition_path);   // once, at partition init
+ *   storage_insert(&se, rel, row, trx_id, &rid);  // schema rides in rel
  *   storage_shutdown(&se);
  */
 
@@ -45,6 +45,7 @@ extern "C" {
 /* ------------------------------------------------------------------ */
 typedef struct {
     char        name[MAX_TABLE_NAME];
+    char        schema_name[32]; /* owning schema — cache is keyed by (schema,name) */
     int         id;             /* table_id used with the buffer pool */
     DiskManager dm;
     BTree       clustered;
@@ -56,10 +57,13 @@ typedef struct {
 /*  StorageEngine — one per PartitionCtx, no global singleton          */
 /* ------------------------------------------------------------------ */
 typedef struct StorageEngine {
-    /* Filesystem context — set by storage_set_context() when the
-     * active schema changes.  partition_manager owns these strings. */
+    /* Filesystem context — the partition root, set once by
+     * storage_set_context() at PartitionCtx init.  It never changes for
+     * the life of the engine (one StorageEngine per partition).  There is
+     * deliberately NO active-schema field: the schema for every operation
+     * travels in the RelationDef (rel->owner_schema), so one engine
+     * instance is safely shared by all of a partition's connections. */
     char        partition_path[256];
-    char        current_schema_name[32];
 
     BufferPool  bp;
     OpenTable   open_tables[MAX_TABLES];
@@ -101,15 +105,11 @@ int storage_evict_all(StorageEngine *se);
 /*  Context management                                                  */
 /* ------------------------------------------------------------------ */
 
-/* Set the active filesystem context.  Called by partition_manager after
- * opening a schema (pctx_open_schema) so that path-building inside
- * storage.c uses the correct partition + schema directories. */
+/* Set the partition root path.  Called once by partition_manager at
+ * PartitionCtx init.  Path-building inside storage.c combines this with
+ * each relation's owner_schema, so there is no per-schema context to set. */
 void storage_set_context(StorageEngine *se,
-                         const char *partition_path,
-                         const char *schema_name);
-
-/* Clear the active schema name (called on deactivate / schema switch). */
-void storage_clear_schema(StorageEngine *se);
+                         const char *partition_path);
 
 /* ------------------------------------------------------------------ */
 /*  DDL — pure I/O, no schema/catalog side-effects                     */
@@ -126,10 +126,11 @@ void storage_clear_schema(StorageEngine *se);
 int storage_create_table(StorageEngine *se, RelationDef *rel);
 
 /*
- * Close the open handle for table_name (if cached) and unlink its file.
- * Does NOT touch SchemaFile or Catalog.
+ * Close the open handle for (schema_name, table_name) if cached and unlink
+ * its file.  Does NOT touch SchemaFile or Catalog.
  */
-int storage_drop_table(StorageEngine *se, const char *table_name);
+int storage_drop_table(StorageEngine *se,
+                       const char *schema_name, const char *table_name);
 
 /*
  * Allocate a secondary-index root page, initialise its B+ tree, and
@@ -185,9 +186,11 @@ Row *storage_get_by_rid(StorageEngine *se, RelationDef *rel, RID rid);
 /*  Page-count query (used by partition_manager to track quota delta)  */
 /* ------------------------------------------------------------------ */
 
-/* Return the current on-disk page count for the named table, or 0 if
- * the table is not open (caller should open it first). */
-uint32_t storage_table_page_count(StorageEngine *se, const char *table_name);
+/* Return the current on-disk page count for (schema_name, table_name), or
+ * 0 if the table is not open (caller should open it first). */
+uint32_t storage_table_page_count(StorageEngine *se,
+                                  const char *schema_name,
+                                  const char *table_name);
 
 #ifdef __cplusplus
 }

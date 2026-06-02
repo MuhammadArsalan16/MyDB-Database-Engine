@@ -414,6 +414,9 @@ static void test_full_relation_def_round_trip(void)
     RelationDef *got = schema_find_relation(&sf2, "kitchen_sink");
     CHECK(got != NULL, "RelationDef recovered");
 
+    /* owner_schema is stamped from the schema header on load (v3, in-memory only) */
+    strncpy(r.owner_schema, TEST_NAME, sizeof(r.owner_schema) - 1);
+
     /* deep equality — memcmp because both structs are zeroed in their padding */
     CHECK(memcmp(got, &r, sizeof(RelationDef)) == 0,
           "full RelationDef byte-equal after round-trip");

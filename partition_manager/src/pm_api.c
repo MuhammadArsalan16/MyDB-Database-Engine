@@ -99,7 +99,9 @@ static int quota_headroom(PartitionCtx *ctx, uint32_t headroom_pages)
 static void reconcile_growth(PartitionCtx *ctx, const char *relation_name,
                               uint32_t pages_before)
 {
-    uint32_t pages_after = storage_table_page_count(&ctx->storage, relation_name);
+    const char *schema = pctx_active_schema_name(ctx);
+    uint32_t pages_after =
+        storage_table_page_count(&ctx->storage, schema, relation_name);
     if (pages_after == pages_before) return;
     int32_t delta = (int32_t)(pages_after - pages_before);
 
@@ -404,13 +406,17 @@ int pm_drop_schema(PartitionCtx *ctx, const char *name)
 
     /* Reject dropping the currently active schema — caller must USE
      * another database (or none) before dropping this one. */
-    if (ctx->current_schema_name[0] != '\0' &&
-        strncmp(ctx->current_schema_name, name, 32) == 0)
+    const char *active = pctx_active_schema_name(ctx);
+    if (active && strncmp(active, name, 32) == 0)
         return MYDB_ERR;   /* exec_drop_database checks and surfaces a message */
 
     /* Schema must be registered in the partition catalog. */
     if (cat_find_schema(&ctx->catalog, name) == NULL)
         return MYDB_ERR_NOT_FOUND;
+
+    /* If the schema is cached in Cache 2, evict it now so we don't leave a
+     * stale SchemaFile handle pointing at files we're about to delete. */
+    pctx_evict_schema(ctx, name);
 
     /* Build schema directory path. */
     char schema_dir[512], schema_file_path[512];
@@ -437,7 +443,7 @@ int pm_drop_schema(PartitionCtx *ctx, const char *name)
         if (!sf.relations[i].is_valid) continue;
 
         /* Close the table handle if open (storage_drop_table closes + unlinks). */
-        storage_drop_table(&ctx->storage, sf.relations[i].relation_name);
+        storage_drop_table(&ctx->storage, name, sf.relations[i].relation_name);
     }
 
     schema_close(&sf);
@@ -468,7 +474,7 @@ int pm_drop_schema(PartitionCtx *ctx, const char *name)
 int pm_create_table(PartitionCtx *ctx, RelationDef *rel)
 {
     if (!ctx || !rel) return MYDB_ERR;
-    if (ctx->current_schema_name[0] == '\0') return MYDB_ERR_PERM;
+    if (!pctx_active_schema_name(ctx)) return MYDB_ERR_PERM;
 
     SchemaFile *sf = pctx_active_schema(ctx);
     if (!sf) return MYDB_ERR_PERM;
@@ -479,6 +485,12 @@ int pm_create_table(PartitionCtx *ctx, RelationDef *rel)
     /* Pre-check quota: clustered root + one root per secondary index. */
     uint32_t need_pages = 1u + rel->num_secondary_indexes;
     if (quota_headroom(ctx, need_pages) != MYDB_OK) return MYDB_ERR_FULL;
+
+    /* Stamp the owning schema on the freshly-built rel so storage can build
+     * its path (this rel is not yet in the SchemaFile, so it was not stamped
+     * at load time).  schema_add_relation re-stamps the persisted copy. */
+    strncpy(rel->owner_schema, sf->header.schema_name,
+            sizeof(rel->owner_schema) - 1);
 
     /* Create the relation file and allocate its B+ tree root pages.
      * storage_create_table fills in rel->root_page_no. */
@@ -500,7 +512,7 @@ int pm_create_table(PartitionCtx *ctx, RelationDef *rel)
 
     /* Keep the partition catalog's SchemaEntry.num_relations in sync so
      * DESCRIBE PARTITION shows the correct table count. */
-    SchemaEntry *se = cat_find_schema(&ctx->catalog, ctx->current_schema_name);
+    SchemaEntry *se = cat_find_schema(&ctx->catalog, pctx_active_schema_name(ctx));
     if (se) {
         se->num_relations++;
         cat_save(&ctx->catalog);
@@ -512,7 +524,7 @@ int pm_create_table(PartitionCtx *ctx, RelationDef *rel)
 int pm_drop_table(PartitionCtx *ctx, RelationDef *rel)
 {
     if (!ctx || !rel) return MYDB_ERR;
-    if (ctx->current_schema_name[0] == '\0') return MYDB_ERR_PERM;
+    if (!pctx_active_schema_name(ctx)) return MYDB_ERR_PERM;
 
     SchemaFile *sf = pctx_active_schema(ctx);
     if (!sf) return MYDB_ERR_PERM;
@@ -522,14 +534,15 @@ int pm_drop_table(PartitionCtx *ctx, RelationDef *rel)
     if (e && e->num_pages > 0)
         cat_track_alloc(&ctx->catalog, -(int64_t)e->num_pages * PAGE_SIZE);
 
-    int rc = storage_drop_table(&ctx->storage, rel->relation_name);
+    int rc = storage_drop_table(&ctx->storage, sf->header.schema_name,
+                                rel->relation_name);
     if (rc != MYDB_OK) return rc;
 
     rc = schema_remove_relation(sf, rel->relation_name);
     if (rc != MYDB_OK) return rc;
 
     /* Keep the partition catalog's SchemaEntry.num_relations in sync. */
-    SchemaEntry *se = cat_find_schema(&ctx->catalog, ctx->current_schema_name);
+    SchemaEntry *se = cat_find_schema(&ctx->catalog, pctx_active_schema_name(ctx));
     if (se && se->num_relations > 0) {
         se->num_relations--;
         cat_save(&ctx->catalog);
@@ -541,7 +554,7 @@ int pm_drop_table(PartitionCtx *ctx, RelationDef *rel)
 int pm_add_index(PartitionCtx *ctx, RelationDef *rel, int col_idx)
 {
     if (!ctx || !rel) return MYDB_ERR;
-    if (ctx->current_schema_name[0] == '\0') return MYDB_ERR_PERM;
+    if (!pctx_active_schema_name(ctx)) return MYDB_ERR_PERM;
 
     SchemaFile *sf = pctx_active_schema(ctx);
     if (!sf) return MYDB_ERR_PERM;
@@ -656,7 +669,8 @@ int pm_insert(PartitionCtx *ctx, RelationDef *rel, Row *row)
     }
 
     uint32_t pages_before = storage_table_page_count(&ctx->storage,
-                                                       rel->relation_name);
+                                                       r->owner_schema,
+                                                       r->relation_name);
 
     RID rid;
     int rc = storage_insert(&ctx->storage, r, row,
@@ -773,7 +787,8 @@ int pm_update(PartitionCtx *ctx, RelationDef *rel, RID rid, Row *new_row)
     }
 
     uint32_t pages_before = storage_table_page_count(&ctx->storage,
-                                                       rel->relation_name);
+                                                       r->owner_schema,
+                                                       r->relation_name);
 
     int rc = storage_update(&ctx->storage, r, rid, new_row,
                              trx_current_id(&ctx->txn_mgr));
