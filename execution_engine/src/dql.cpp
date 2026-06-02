@@ -6,7 +6,10 @@
  * Sub-phase 5.2 : ORDER BY — materialise + sort; PK-ASC stream optimisation.
  * Sub-phase 5.3 : scalar aggregates.
  * Sub-phase 5.4 : GROUP BY + aggregates, HAVING (GROUP BY columns only).
- * Sub-phase 5.5 : JOINs                              (TODO)
+ * Sub-phase 5.5 : JOINs — INNER / LEFT / RIGHT / FULL OUTER, implicit comma
+ *                 joins, and chained multi-table joins.  Per-step access path
+ *                 (sort-merge / index-NLJ / hash) chosen from column indexes.
+ *                 Ported to the v3 ExecContext / pm_* partition API.
  */
 
 #include "ast_executor.hpp"
