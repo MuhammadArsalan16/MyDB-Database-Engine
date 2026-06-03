@@ -13,10 +13,15 @@ RestartSec=5
 User=mydb
 Group=mydb
 
+# Data home is private (0750). The socket lives in /run/mydb instead, so
+# clients can reach it without entering the private data dir.
 Environment=MYDB_HOME=/var/lib/mydb
+Environment=MYDB_SOCKET=/run/mydb/mydb.sock
 
+# 0755 so clients can traverse /run/mydb to reach the socket; the data dir
+# /var/lib/mydb stays 0750 (private to the mydb user).
 RuntimeDirectory=mydb
-RuntimeDirectoryMode=0750
+RuntimeDirectoryMode=0755
 
 StandardOutput=journal
 StandardError=journal

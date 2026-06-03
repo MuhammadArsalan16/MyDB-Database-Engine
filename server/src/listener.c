@@ -3,6 +3,7 @@
 
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/stat.h>   /* chmod */
 #include <unistd.h>
 #include <string.h>
 #include <stdio.h>
@@ -40,6 +41,13 @@ int listener_init(Listener *l)
         unlink(l->socket_path);
         return -1;
     }
+
+    /* Let clients running as a different user connect: the daemon runs as
+     * 'mydb', clients run as the invoking user. Connecting to an AF_UNIX
+     * socket needs write permission on the socket file, which the default
+     * umask denies to non-owners. DB auth (challenge-response) still gates
+     * access. Best-effort: a failed chmod leaves a same-user-only socket. */
+    (void)chmod(l->socket_path, 0666);
 
     l->fd = fd;
     return 0;

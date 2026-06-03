@@ -95,9 +95,21 @@ int proto_recv(int fd, PacketHeader *hdr, void *payload, uint32_t max_len,
 int proto_socket_path(char *buf, size_t cap)
 {
     if (!buf || cap == 0) return -1;
+    /* Socket location, highest priority first:
+     *   1. $MYDB_SOCKET — explicit full path. Decouples the socket from the
+     *      data dir so a deployment can place it in a world-traversable
+     *      runtime dir while $MYDB_HOME stays private. The system service
+     *      sets this to /run/mydb/mydb.sock.
+     *   2. $MYDB_HOME/mydb.sock — dev mode keeps the socket in its data home.
+     *   3. /run/mydb/mydb.sock — default when neither is set. */
+    const char *sock = getenv("MYDB_SOCKET");
     const char *home = getenv("MYDB_HOME");
-    int n = (home && home[0] != '\0')
-            ? snprintf(buf, cap, "%s/mydb.sock", home)
-            : snprintf(buf, cap, "/run/mydb/mydb.sock");
+    int n;
+    if (sock && sock[0] != '\0')
+        n = snprintf(buf, cap, "%s", sock);
+    else if (home && home[0] != '\0')
+        n = snprintf(buf, cap, "%s/mydb.sock", home);
+    else
+        n = snprintf(buf, cap, "/run/mydb/mydb.sock");
     return (n < 0 || (size_t)n >= cap) ? -1 : 0;
 }

@@ -861,7 +861,7 @@ std::unique_ptr<ASTNode> Parser::parse_show() {
     } else if (t.value == "GRANTS") {
         auto s = std::make_unique<ShowGrantsStatement>();
         /* optional user_id — if next token is a number, consume it */
-        if (current_token_idx < (int)tokens.size()
+        if (current_token_idx < tokens.size()
                 && tokens[current_token_idx].type == TokenType::NUMBER) {
             s->user_id = (uint32_t)std::stoul(tokens[current_token_idx].value);
             current_token_idx++;
