@@ -44,7 +44,7 @@ static void test_create_and_open(void)
     CHECK(fh.magic == MYDB_MAGIC, "magic number matches");
     CHECK(fh.version == MYDB_FORMAT_VERSION, "version == MYDB_FORMAT_VERSION");
     CHECK(fh.root_page_no == INVALID_PAGE, "root_page_no is INVALID_PAGE");
-    CHECK(fh.auto_incr == 1, "auto_incr starts at 1");
+    CHECK(fh.flags == 0, "flags start clear (no AUTO_INCREMENT column yet)");
 
     disk_close(&dm);
 
@@ -102,7 +102,7 @@ static void test_header_update(void)
     FileHeader fh;
     disk_read_header(&dm, &fh);
     fh.root_page_no = 1;
-    fh.auto_incr    = 42;
+    fh.flags       |= FILEHDR_FLAG_AUTO_INCREMENT;
     disk_write_header(&dm, &fh);
     disk_close(&dm);
 
@@ -110,7 +110,7 @@ static void test_header_update(void)
     disk_open(&dm, TEST_FILE);
     disk_read_header(&dm, &fh);
     CHECK(fh.root_page_no == 1, "root_page_no persisted");
-    CHECK(fh.auto_incr == 42, "auto_incr persisted");
+    CHECK(fh.flags & FILEHDR_FLAG_AUTO_INCREMENT, "AUTO_INCREMENT flag persisted");
     disk_close(&dm);
 }
 

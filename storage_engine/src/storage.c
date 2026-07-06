@@ -415,6 +415,13 @@ int storage_create_table(StorageEngine *se, RelationDef *rel)
     DiskManager dm;
     if (disk_create(&dm, path) != MYDB_OK) return MYDB_ERR;
 
+    if (rel->columns[rel->pk_col_idx].is_auto_increment) {
+        FileHeader fh;
+        disk_read_header(&dm, &fh);
+        fh.flags |= FILEHDR_FLAG_AUTO_INCREMENT;
+        disk_write_header(&dm, &fh);
+    }
+
     /* Allocate the clustered root page via disk_alloc_page (raw allocator,
      * no quota tracking — partition_manager tracks the quota delta).
      * bp_fetch_page brings the new page into a frame so we can initialise it. */

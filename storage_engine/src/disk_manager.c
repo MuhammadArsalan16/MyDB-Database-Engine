@@ -42,7 +42,7 @@ int disk_create(DiskManager *dm, const char *path)
     fh.version      = MYDB_FORMAT_VERSION;
     fh.num_pages    = 1;             /* only page 0 exists right now */
     fh.root_page_no = INVALID_PAGE;  /* no B+ Tree yet */
-    fh.auto_incr    = 1;             /* AUTO_INCREMENT starts at 1 */
+    fh.flags        = 0;             /* caller sets FILEHDR_FLAG_AUTO_INCREMENT if applicable */
 
     if (pwrite_all(fd, &fh, sizeof(fh), 0) != MYDB_OK) {
         close(fd);

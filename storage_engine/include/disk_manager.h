@@ -19,14 +19,17 @@
 /* ------------------------------------------------------------------ */
 /*  File header — stored in the first PAGE_SIZE bytes (page 0)         */
 /* ------------------------------------------------------------------ */
+/* FileHeader.flags bits */
+#define FILEHDR_FLAG_AUTO_INCREMENT 0x01  /* table has an AUTO_INCREMENT column */
+
 typedef struct {
     uint32_t magic;         /* MYDB_MAGIC (0x4D594442) — sanity check on open */
     uint32_t version;       /* file format version, currently 1 */
     uint32_t num_pages;     /* total pages in file including page 0 */
     uint32_t root_page_no;  /* root page of the clustered B+ Tree */
-    uint32_t auto_incr;     /* AUTO_INCREMENT counter for the table */
+    uint8_t  flags;         /* FILEHDR_FLAG_* bits — see above */
     /* remaining bytes padded to PAGE_SIZE so page 1 starts at the right offset */
-    uint8_t  _pad[PAGE_SIZE - 20];
+    uint8_t  _pad[PAGE_SIZE - 17];
 } FileHeader;
 
 /* ------------------------------------------------------------------ */
