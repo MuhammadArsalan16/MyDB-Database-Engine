@@ -141,6 +141,75 @@ PlanNode planner_choose_path(const SchemaFile   *schema,
                               const Sarg         *sargs,
                               int                 n_sargs);
 
+/* ------------------------------------------------------------------ */
+/*  Join ordering and algorithm selection                              */
+/* ------------------------------------------------------------------ */
+
+/* Hard cap on relations in one DP group.  Groups larger than this fall
+ * back to lexical order for ORDERING; algorithm selection still applies
+ * per-step via planner_choose_join_algo. */
+#define PLANNER_MAX_JOIN_GROUP 12
+
+typedef enum {
+    JOIN_ALGO_NLJ,        /* indexed nested-loop: probe right's index per left row */
+    JOIN_ALGO_HASH,       /* build in-memory hash table on right, probe with left   */
+    JOIN_ALGO_SORT_MERGE  /* both join columns indexed; only legal as first step of
+                           * the 2-table legacy fast path in exec_join_select        */
+} JoinAlgoType;
+
+/* One equi-join predicate between two relations.  Indices are group-local
+ * (positions in the rels[] array passed to planner_plan_join_order), not
+ * the global seg indices used in dql.cpp. */
+typedef struct {
+    int a_rel_idx, a_col_idx;
+    int b_rel_idx, b_col_idx;
+} JoinEdgeDef;
+
+/* One resolved step of the chosen left-deep order.
+ * steps[0] is the seed (via_rel_idx == -1); steps[1..n-1] are the folds. */
+typedef struct {
+    int          rel_idx;
+    int          via_rel_idx;   /* -1 for the first step (the seed) */
+    int          via_col_idx;   /* -1 for the first step */
+    int          join_col_idx;  /* -1 for the first step */
+    int          is_cross;      /* 1 if no edge links rel_idx to the accumulated set */
+    JoinAlgoType algo;
+    float        step_cost;     /* incremental cost of this step (for future EXPLAIN) */
+    float        card_after;    /* estimated output cardinality after this step */
+} JoinPlanStep;
+
+typedef struct {
+    int          n_steps;       /* == n_rels */
+    JoinPlanStep steps[PLANNER_MAX_JOIN_GROUP];
+    float        total_cost;
+} JoinPlanResult;
+
+/* Bitmask DP over an INNER-only group.
+ * schema/sf follow planner_choose_path's contract: schema gives
+ * num_pages/num_rows/tree_height; sf gives column NDV (may be NULL).
+ * n_rels must be in [1, PLANNER_MAX_JOIN_GROUP]. */
+JoinPlanResult planner_plan_join_order(const SchemaFile         *schema,
+                                        StatsFile                *sf,
+                                        const RelationDef *const  rels[],
+                                        int                       n_rels,
+                                        const JoinEdgeDef         edges[],
+                                        int                       n_edges);
+
+/* Single-step algorithm chooser for barrier steps (LEFT/RIGHT/FULL) whose
+ * ORDER is already fixed.  is_first_step enables SORT_MERGE candidacy
+ * (true only when this is the engine's very first join step — both sides
+ * are still base tables, mirroring sort_merge_two's precondition). */
+typedef struct { JoinAlgoType algo; float cost; } JoinAlgoChoice;
+
+JoinAlgoChoice planner_choose_join_algo(const SchemaFile  *schema,
+                                         StatsFile         *sf,
+                                         const RelationDef *left_rel,
+                                         int                left_col,
+                                         float              left_card,
+                                         const RelationDef *right_rel,
+                                         int                right_col,
+                                         int                is_first_step);
+
 #ifdef __cplusplus
 }
 #endif

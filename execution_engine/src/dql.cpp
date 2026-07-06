@@ -667,11 +667,12 @@ struct JoinSeg {
 
 /* One fold step: add segs[right_seg] to the accumulated result. */
 struct JoinStep {
-    int      right_seg;          /* segment being added */
-    JoinType type;               /* INNER / LEFT / RIGHT / FULL */
-    bool     cross;              /* true = no ON condition (cartesian) */
-    int      prev_seg, prev_col; /* earlier-table column in the ON equality */
-    int      new_col;            /* right_seg-table column in the ON equality */
+    int          right_seg;          /* segment being added */
+    JoinType     type;               /* INNER / LEFT / RIGHT / FULL */
+    bool         cross;              /* true = no ON condition (cartesian) */
+    int          prev_seg, prev_col; /* earlier-table column in the ON equality */
+    int          new_col;            /* right_seg-table column in the ON equality */
+    JoinAlgoType forced_algo = JOIN_ALGO_HASH; /* planner-chosen algorithm; HASH is always safe */
 };
 
 /* One combined row spanning all segments. cells[i] holds segment i's row;
@@ -1020,9 +1021,11 @@ static void join_step(PartitionCtx *pc, const std::vector<JoinSeg> &segs,
         }
     }
 
+    /* rk is still needed inside the NLJ branch for lookup_right's unique-vs-multi
+     * micro-decision; the NLJ-vs-HASH choice itself is now planner-driven. */
     int rk = seg_index_kind(rrel, st.new_col);
 
-    if (rk != 0) {
+    if (st.forced_algo == JOIN_ALGO_NLJ) {
         /* INDEX_NLJ — inner join column is indexed. */
         for (auto &lr : left) {
             if (lr.isnull[st.prev_seg]) { if (keepL) out.push_back(lr); continue; }
@@ -1111,6 +1114,24 @@ static void collect_eq(const Expr *e, const std::vector<JoinSeg> &segs,
             seg_resolve(segs, r->table, r->column, lk.sb, lk.cb))
             links.push_back(lk);
     }
+}
+
+/* Half-open index range into steps[] covering a run of INNER-only steps.
+ * Groups with fewer than 2 steps (< 3 relations) are not worth DP-ing. */
+struct DPGroup { int start, end; };
+
+static std::vector<DPGroup> find_dp_groups(const std::vector<JoinStep> &steps)
+{
+    std::vector<DPGroup> groups;
+    size_t i = 0;
+    while (i < steps.size()) {
+        if (steps[i].type != JoinType::INNER) { i++; continue; }
+        size_t j = i;
+        while (j < steps.size() && steps[j].type == JoinType::INNER) j++;
+        if (j - i >= 2) groups.push_back({(int)i, (int)j});
+        i = j;
+    }
+    return groups;
 }
 
 /* ====================================================================== */
@@ -1253,35 +1274,119 @@ static int exec_join_select(ExecContext *ectx, const SelectStatement *s,
         }
     }
 
+    /* ---- Cost-based join ordering and algorithm selection ---- */
+    int leading_group_first_seg = 0;
+    {
+        std::vector<bool> algo_set(steps.size(), false);
+        SchemaFile *schema = pctx_active_schema(pc);
+
+        /* 1. DP: reorder each maximal run of 2+ consecutive INNER steps. */
+        for (const auto &grp : find_dp_groups(steps)) {
+            int gstart = grp.start, gend = grp.end;
+            int anchor_seg = (gstart == 0) ? 0 : steps[gstart - 1].right_seg;
+
+            std::vector<int> group_segs;
+            group_segs.push_back(anchor_seg);
+            for (int k = gstart; k < gend; k++)
+                group_segs.push_back(steps[k].right_seg);
+
+            std::unordered_map<int,int> seg_to_local;
+            std::vector<const RelationDef*> rels;
+            for (size_t li = 0; li < group_segs.size(); li++) {
+                seg_to_local[group_segs[li]] = (int)li;
+                rels.push_back(segs[group_segs[li]].rel);
+            }
+
+            std::vector<JoinEdgeDef> dp_edges;
+            for (int k = gstart; k < gend; k++) {
+                if (steps[k].cross) continue;
+                JoinEdgeDef e;
+                e.a_rel_idx = seg_to_local[steps[k].prev_seg];
+                e.a_col_idx = steps[k].prev_col;
+                e.b_rel_idx = seg_to_local[steps[k].right_seg];
+                e.b_col_idx = steps[k].new_col;
+                dp_edges.push_back(e);
+            }
+
+            if ((int)rels.size() > PLANNER_MAX_JOIN_GROUP) continue;
+
+            /* Pre-load stats pages for each relation in the group. */
+            for (auto *r : rels) {
+                RelationEntry *ent = schema_find_relation_stat(schema, r->relation_name);
+                if (ent && ectx->stats)
+                    stats_load_relation(ectx->stats, (int)(ent - schema->relations));
+            }
+
+            JoinPlanResult plan = planner_plan_join_order(
+                schema, ectx->stats,
+                rels.data(), (int)rels.size(),
+                dp_edges.data(), (int)dp_edges.size());
+
+            /* Splice the DP-chosen order back into steps[gstart..gend). */
+            for (int p = 1; p < plan.n_steps; p++) {
+                JoinStep ns;
+                ns.right_seg   = group_segs[plan.steps[p].rel_idx];
+                ns.type        = JoinType::INNER;
+                ns.cross       = plan.steps[p].is_cross;
+                ns.prev_seg    = group_segs[plan.steps[p].via_rel_idx];
+                ns.prev_col    = plan.steps[p].via_col_idx;
+                ns.new_col     = plan.steps[p].join_col_idx;
+                ns.forced_algo = plan.steps[p].algo;
+                steps[gstart + (p - 1)] = ns;
+                algo_set[gstart + (p - 1)] = true;
+            }
+
+            if (gstart == 0)
+                leading_group_first_seg = group_segs[plan.steps[0].rel_idx];
+        }
+
+        /* 2. Algorithm selection for all other steps (barrier LEFT/RIGHT/FULL
+         *    and any group that exceeded PLANNER_MAX_JOIN_GROUP). */
+        for (size_t k = 0; k < steps.size(); k++) {
+            if (algo_set[k]) continue;
+            JoinStep &st = steps[k];
+            if (st.cross) { st.forced_algo = JOIN_ALGO_HASH; continue; }
+            float left_card = 1.0f;
+            RelationEntry *ent = schema_find_relation_stat(
+                schema, segs[st.prev_seg].rel->relation_name);
+            if (ent && ent->num_rows > 0) left_card = (float)ent->num_rows;
+            st.forced_algo = planner_choose_join_algo(
+                schema, ectx->stats,
+                segs[st.prev_seg].rel, st.prev_col, left_card,
+                segs[st.right_seg].rel, st.new_col,
+                /*is_first_step=*/ k == 0).algo;
+        }
+    }
+
     /* ---- Execute the join ---- */
     std::vector<JoinedRow> acc;
     bool done = false;
 
-    /* Sort-merge fast path: exactly two tables, single keyed step, both
-     * join columns indexed. */
-    if (segs.size() == 2 && steps.size() == 1 && !steps[0].cross) {
+    /* Sort-merge fast path: exactly two tables, single keyed step, and the
+     * planner chose SORT_MERGE (both join columns are indexed). */
+    if (segs.size() == 2 && steps.size() == 1 && !steps[0].cross &&
+        steps[0].forced_algo == JOIN_ALGO_SORT_MERGE) {
         const JoinStep &st = steps[0];
-        int lk = seg_index_kind(segs[st.prev_seg].rel,  st.prev_col);
-        int rk = seg_index_kind(segs[st.right_seg].rel, st.new_col);
-        if (lk != 0 && rk != 0) {
-            acc = sort_merge_two(pc,
-                                 (RelationDef *)segs[st.prev_seg].rel,  st.prev_col,
-                                 (RelationDef *)segs[st.right_seg].rel, st.new_col,
-                                 st.type);
-            done = true;
-        }
+        acc = sort_merge_two(pc,
+                             (RelationDef *)segs[st.prev_seg].rel,  st.prev_col,
+                             (RelationDef *)segs[st.right_seg].rel, st.new_col,
+                             st.type);
+        done = true;
     }
 
     if (!done) {
-        /* General path: scan the first table, then fold each step. */
-        Cursor *c = pm_scan(pc, (RelationDef *)segs[0].rel);
+        /* General path: seed from the planner-chosen first relation, then
+         * fold each step.  leading_group_first_seg == 0 when no DP reordering
+         * happened, preserving the original behaviour. */
+        int first_seg = leading_group_first_seg;
+        Cursor *c = pm_scan(pc, (RelationDef *)segs[first_seg].rel);
         if (c) {
             Row *r;
             while ((r = cursor_next(c)) != NULL) {
                 JoinedRow jr;
                 jr.cells.assign(segs.size(), Row{});
                 jr.isnull.assign(segs.size(), 1);
-                jr.cells[0] = *r; jr.isnull[0] = 0;
+                jr.cells[first_seg] = *r; jr.isnull[first_seg] = 0;
                 acc.push_back(jr);
             }
             cursor_close(c);

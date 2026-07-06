@@ -42,7 +42,7 @@ static void test_create_and_open(void)
     FileHeader fh;
     disk_read_header(&dm, &fh);
     CHECK(fh.magic == MYDB_MAGIC, "magic number matches");
-    CHECK(fh.version == 1, "version == 1");
+    CHECK(fh.version == MYDB_FORMAT_VERSION, "version == MYDB_FORMAT_VERSION");
     CHECK(fh.root_page_no == INVALID_PAGE, "root_page_no is INVALID_PAGE");
     CHECK(fh.auto_incr == 1, "auto_incr starts at 1");
 
