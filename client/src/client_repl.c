@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <errno.h>
 #include <readline/readline.h>
 #include <readline/history.h>
 
@@ -32,6 +34,47 @@ static int is_exit_command(const char *buf)
     return *p == '\0';
 }
 
+static void run_file(ClientConn *c, const char *path)
+{
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        fprintf(stderr, "mydb: cannot open '%s': %s\n", path, strerror(errno));
+        return;
+    }
+
+    char   query[REPL_QUERY_CAP];
+    char   result[REPL_RESULT_CAP];
+    char   line[1024];
+    size_t qlen = 0;
+    query[0] = '\0';
+
+    while (fgets(line, sizeof(line), fp)) {
+        size_t llen = strlen(line);
+        if (qlen + llen + 1 >= sizeof(query)) {
+            fprintf(stderr, "mydb: statement too long, discarded\n");
+            qlen = 0; query[0] = '\0';
+            continue;
+        }
+        memcpy(query + qlen, line, llen);
+        qlen += llen;
+        query[qlen] = '\0';
+
+        const char *end = query + qlen;
+        while (end > query && (end[-1] == '\n' || end[-1] == '\r' ||
+                               end[-1] == ' '  || end[-1] == '\t')) end--;
+        if (end == query || end[-1] != ';') continue;
+
+        if (client_conn_query(c, query, result, sizeof(result)) != 0) {
+            fprintf(stderr, "mydb: connection lost\n");
+            fclose(fp);
+            return;
+        }
+        printf("%s\n", result);
+        qlen = 0; query[0] = '\0';
+    }
+    fclose(fp);
+}
+
 void client_repl_run(ClientConn *c)
 {
     char   query[REPL_QUERY_CAP];
@@ -55,6 +98,27 @@ void client_repl_run(ClientConn *c)
         }
         if (qlen == 0 && is_blank(line)) { free(line); continue; }
         if (qlen == 0 && is_exit_command(line)) { free(line); break; }
+
+        /* SOURCE <file> or \. <file> — client-side meta-command, never sent to server */
+        if (qlen == 0) {
+            const char *p = line;
+            while (*p == ' ' || *p == '\t') p++;
+            const char *filename = NULL;
+            if (strncasecmp(p, "source ", 7) == 0) filename = p + 7;
+            else if (strncmp(p, "\\. ", 3) == 0)   filename = p + 3;
+            if (filename) {
+                while (*filename == ' ' || *filename == '\t') filename++;
+                char path[512];
+                strncpy(path, filename, sizeof(path) - 1);
+                path[sizeof(path) - 1] = '\0';
+                char *e = path + strlen(path) - 1;
+                while (e >= path && (*e == '\n' || *e == '\r' || *e == ' ' ||
+                                     *e == '\t' || *e == ';')) *e-- = '\0';
+                if (path[0] != '\0') run_file(c, path);
+                free(line);
+                continue;
+            }
+        }
 
         size_t llen = strlen(line);
         if (qlen + llen + 2 >= sizeof(query)) {
