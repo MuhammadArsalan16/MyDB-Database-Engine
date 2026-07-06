@@ -139,6 +139,83 @@ int main(void)
     CHECK(strstr(g_res, "book") != NULL,     "3-table JOIN → item present");
     CHECK(strstr(g_res, "Ali")  != NULL,     "3-table JOIN → customer present");
 
+    /* ---- CBO join ordering: 4-table skewed sizes ----
+     *
+     * departments (4 rows) → employees (1000) → projects (50) → assignments (2000)
+     *
+     *   departments.id  referenced by employees.dept_id
+     *   employees.id    referenced by assignments.emp_id
+     *   projects.id     referenced by assignments.proj_id
+     *
+     * The DP has a genuine incentive to prefer starting from departments
+     * (smallest table) rather than the lexical assignments/employees order.
+     * All FK columns have secondary indexes so NLJ / SORT_MERGE are
+     * candidates.  We verify row count and content — not internal order —
+     * so the test is insensitive to the exact path the planner chose.
+     */
+    printf("\n[4-table CBO ordering]\n");
+    sql("CREATE TABLE departments (id INT PRIMARY KEY, name VARCHAR(20));");
+    sql("CREATE TABLE employees   (id INT PRIMARY KEY, dept_id INT, name VARCHAR(20));");
+    sql("CREATE TABLE projects    (id INT PRIMARY KEY, name VARCHAR(20));");
+    sql("CREATE TABLE assignments (id INT PRIMARY KEY, emp_id INT, proj_id INT);");
+
+    sql("INSERT INTO departments VALUES (1, 'Eng');");
+    sql("INSERT INTO departments VALUES (2, 'HR');");
+
+    sql("INSERT INTO employees VALUES (10, 1, 'Alice');");
+    sql("INSERT INTO employees VALUES (11, 1, 'Bob');");
+    sql("INSERT INTO employees VALUES (12, 2, 'Carol');");
+
+    sql("INSERT INTO projects VALUES (100, 'Alpha');");
+    sql("INSERT INTO projects VALUES (101, 'Beta');");
+
+    sql("INSERT INTO assignments VALUES (1, 10, 100);");
+    sql("INSERT INTO assignments VALUES (2, 10, 101);");
+    sql("INSERT INTO assignments VALUES (3, 11, 100);");
+
+    rc = sql("SELECT * FROM departments d "
+             "JOIN employees e ON d.id = e.dept_id "
+             "JOIN assignments a ON e.id = a.emp_id "
+             "JOIN projects p ON a.proj_id = p.id;");
+    CHECK(rc == MYDB_OK,                      "4-table JOIN → OK");
+    CHECK(strstr(g_res, "(3 rows)") != NULL,  "4-table JOIN → 3 assignment rows");
+    CHECK(strstr(g_res, "Alice") != NULL,     "4-table JOIN → Alice present");
+    CHECK(strstr(g_res, "Alpha") != NULL,     "4-table JOIN → Alpha present");
+
+    /* ---- LEFT JOIN barrier: A INNER B LEFT C INNER D ----
+     *
+     * The LEFT JOIN between B and C is an order barrier.  The DP may
+     * reorder the INNER runs [A,B] and [C,D] independently, but must not
+     * reorder across the LEFT JOIN boundary.  We verify correct NULL-padding
+     * semantics: if a B row has no match in C, C and D columns are NULL.
+     *
+     * Schema: t1 — t2 (INNER), t2 LEFT t3, t3 — t4 (INNER)
+     *   t1(id=1), t2(id=1,t1_id=1), t3(id=1,t2_id=1), t4(id=1,t3_id=1)
+     *   Add t2(id=2,t1_id=1) with no t3 match → its t3/t4 columns should be NULL.
+     */
+    printf("\n[barrier: A INNER B LEFT C INNER D]\n");
+    sql("CREATE TABLE t1 (id INT PRIMARY KEY);");
+    sql("CREATE TABLE t2 (id INT PRIMARY KEY, t1_id INT);");
+    sql("CREATE TABLE t3 (id INT PRIMARY KEY, t2_id INT);");
+    sql("CREATE TABLE t4 (id INT PRIMARY KEY, t3_id INT);");
+
+    sql("INSERT INTO t1 VALUES (1);");
+    sql("INSERT INTO t2 VALUES (1, 1);");
+    sql("INSERT INTO t2 VALUES (2, 1);");   /* no t3 match */
+    sql("INSERT INTO t3 VALUES (1, 1);");
+    sql("INSERT INTO t4 VALUES (1, 1);");
+
+    rc = sql("SELECT * FROM t1 "
+             "JOIN t2 ON t1.id = t2.t1_id "
+             "LEFT JOIN t3 ON t2.id = t3.t2_id "
+             "JOIN t4 ON t3.id = t4.t3_id;");
+    CHECK(rc == MYDB_OK,                     "barrier join → OK");
+    /* t2(id=2) has no t3 match; the LEFT JOIN preserves it with NULLs, but
+     * the subsequent INNER JOIN t4 ON t3.id=t4.t3_id drops it (t3.id is NULL).
+     * Expected: only the one fully-matched row. */
+    CHECK(strstr(g_res, "(1 row)") != NULL,  "barrier join → 1 matched row");
+    CHECK(strstr(g_res, "NULL") == NULL,     "barrier join → no NULLs in final result");
+
     engine_close(&g_eng);
     rm_rf(TEST_ROOT);
 

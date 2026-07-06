@@ -49,6 +49,12 @@ add_executable(test_parser query_parser/test_parser.cpp)
 target_link_libraries(test_parser PRIVATE query_parser)
 add_test(NAME test_parser COMMAND test_parser)
 
+# planner unit tests — exercise planner_plan_join_order and
+# planner_choose_join_algo with in-memory fixtures (no engine bootstrap).
+add_executable(test_join_order planner/test_join_order.c)
+target_link_libraries(test_join_order PRIVATE planner)
+add_test(NAME test_join_order COMMAND test_join_order)
+
 # execution_engine functional tests — drive the full engine via
 # engine_execute_sql().  Link `engine`, which transitively pulls the
 # execution_engine, planner, partition_manager, query_parser and storage

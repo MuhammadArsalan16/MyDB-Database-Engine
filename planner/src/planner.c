@@ -572,3 +572,260 @@ PlanNode planner_choose_path(const SchemaFile   *schema,
      * planner does not close it. */
     return p;
 }
+
+/* ================================================================== */
+/*  Join ordering and algorithm selection                             */
+/* ================================================================== */
+
+/* Returns 1 if col_idx has any index on rel (PK, UNIQUE secondary, or
+ * non-unique secondary — all three enable NLJ / SORT_MERGE lookup). */
+static int planner_col_is_indexed(const RelationDef *rel, int col_idx)
+{
+    if (col_idx < 0) return 0;
+    if (col_idx == (int)rel->pk_col_idx) return 1;
+    for (int j = 0; j < rel->num_secondary_indexes; j++)
+        if ((int)rel->secondary_col_idx[j] == col_idx) return 1;
+    return 0;
+}
+
+/* Column NDV from stats, or num_rows as the fallback. */
+static uint32_t join_col_ndv(StatsFile *sf, const SchemaFile *schema,
+                              const RelationDef *rel, int col_idx)
+{
+    RelationEntry *ent = schema_find_relation_stat((SchemaFile *)schema,
+                                                   rel->relation_name);
+    uint32_t num_rows = (ent && ent->num_rows > 0) ? ent->num_rows : 1;
+    if (sf && ent) {
+        int slot = (int)(ent - schema->relations);
+        if (stats_load_relation(sf, slot) == MYDB_OK) {
+            ColumnStats *cs = stats_get_column(sf, slot, col_idx);
+            if (cs && cs->has_stats && cs->num_distinct > 0)
+                return cs->num_distinct;
+        }
+    }
+    return num_rows;
+}
+
+/* Containment selectivity: 1 / max(ndv_a, ndv_b). */
+static float join_edge_sel(StatsFile *sf, const SchemaFile *schema,
+                            const RelationDef *rel_a, int col_a,
+                            const RelationDef *rel_b, int col_b)
+{
+    uint32_t ndv_a = join_col_ndv(sf, schema, rel_a, col_a);
+    uint32_t ndv_b = join_col_ndv(sf, schema, rel_b, col_b);
+    uint32_t mx    = (ndv_a > ndv_b) ? ndv_a : ndv_b;
+    return (mx > 0) ? 1.0f / (float)mx : 1.0f;
+}
+
+/* Choose and cost the cheapest algorithm for adding right_rel (via
+ * right_col) to an accumulated set of cardinality C.
+ * left_rel / left_col are for SORT_MERGE eligibility only (is_first_step). */
+static JoinAlgoChoice cheapest_algo_for_transition(
+    const SchemaFile  *schema,
+    const RelationDef *left_rel,    /* the singleton left, or NULL */
+    const RelationDef *right_rel,
+    int                right_col,
+    float              C,
+    int                is_cross,
+    int                is_first_step,
+    int                left_col)
+{
+    JoinAlgoChoice best;
+    best.algo = JOIN_ALGO_HASH;
+    best.cost = 1e30f;
+
+    RelationEntry *rent = schema_find_relation_stat((SchemaFile *)schema,
+                                                    right_rel->relation_name);
+    float npages_r = (rent && rent->num_pages > 0)   ? (float)rent->num_pages   : 1.0f;
+    float th_r     = (rent && rent->tree_height > 0) ? (float)rent->tree_height : 3.0f;
+
+    /* HASH — always legal */
+    float hash_cost = npages_r * PLANNER_SEQ_IO + C * PLANNER_SEQ_IO;
+    if (hash_cost < best.cost) { best.algo = JOIN_ALGO_HASH; best.cost = hash_cost; }
+
+    /* NLJ — right join column must be indexed */
+    if (!is_cross && planner_col_is_indexed(right_rel, right_col)) {
+        float nlj_cost = C * (th_r + 1.0f) * PLANNER_RAND_IO;
+        if (nlj_cost < best.cost) { best.algo = JOIN_ALGO_NLJ; best.cost = nlj_cost; }
+    }
+
+    /* SORT_MERGE — only when both join columns are indexed and this is the
+     * very first fold step (both sides still base tables). */
+    if (is_first_step && !is_cross && left_rel != NULL &&
+        planner_col_is_indexed(right_rel, right_col) &&
+        planner_col_is_indexed(left_rel,  left_col))
+    {
+        RelationEntry *lent = schema_find_relation_stat((SchemaFile *)schema,
+                                                        left_rel->relation_name);
+        float npages_l = (lent && lent->num_pages > 0) ? (float)lent->num_pages : 1.0f;
+        float sm_cost  = npages_l + npages_r;
+        if (sm_cost < best.cost) { best.algo = JOIN_ALGO_SORT_MERGE; best.cost = sm_cost; }
+    }
+
+    return best;
+}
+
+/* DP cell for the bitmask join-ordering search. */
+typedef struct {
+    int          valid;
+    float        card;
+    float        cost;
+    int          prev_mask;
+    int          last_added;
+    int          via_rel;
+    int          via_col;
+    int          join_col;
+    int          is_cross;
+    JoinAlgoType algo;
+} DPCell;
+
+/* ------------------------------------------------------------------ */
+/*  planner_plan_join_order — public                                  */
+/* ------------------------------------------------------------------ */
+JoinPlanResult planner_plan_join_order(const SchemaFile         *schema,
+                                        StatsFile                *sf,
+                                        const RelationDef *const  rels[],
+                                        int                       n_rels,
+                                        const JoinEdgeDef         edges[],
+                                        int                       n_edges)
+{
+    JoinPlanResult result;
+    memset(&result, 0, sizeof(result));
+
+    if (n_rels <= 0 || n_rels > PLANNER_MAX_JOIN_GROUP)
+        return result;
+
+    int full_mask     = (1 << n_rels) - 1;
+    int total_states  = full_mask + 1;
+
+    /* Stack-allocated DP table: 2^12 * ~40 bytes ≈ 164 KB — fine. */
+    DPCell best[1 << PLANNER_MAX_JOIN_GROUP];
+    memset(best, 0, (size_t)total_states * sizeof(DPCell));
+
+    /* Seed singletons */
+    for (int r = 0; r < n_rels; r++) {
+        RelationEntry *ent = schema_find_relation_stat((SchemaFile *)schema,
+                                                       rels[r]->relation_name);
+        uint32_t nrows = (ent && ent->num_rows > 0) ? ent->num_rows : 1;
+        int bit = 1 << r;
+        best[bit].valid      = 1;
+        best[bit].card       = (float)nrows;
+        best[bit].cost       = 0.0f;
+        best[bit].prev_mask  = 0;
+        best[bit].last_added = r;
+        best[bit].via_rel    = -1;
+        best[bit].via_col    = -1;
+        best[bit].join_col   = -1;
+    }
+
+    /* Enumerate all non-empty subsets in order */
+    for (int mask = 1; mask <= full_mask; mask++) {
+        if (!best[mask].valid) continue;
+
+        for (int r = 0; r < n_rels; r++) {
+            if (mask & (1 << r)) continue;   /* already in set */
+
+            int new_mask = mask | (1 << r);
+
+            /* Find the most selective edge connecting r to any relation in mask */
+            int   found = 0;
+            int   bvr = -1, bvc = -1, bjc = -1;
+            float bsel = 1.0f;
+
+            for (int e = 0; e < n_edges; e++) {
+                int ra = edges[e].a_rel_idx, ca = edges[e].a_col_idx;
+                int rb = edges[e].b_rel_idx, cb = edges[e].b_col_idx;
+                int vr = -1, vc = -1, jc = -1;
+
+                if (ra == r && (mask & (1 << rb)))      { vr = rb; vc = cb; jc = ca; }
+                else if (rb == r && (mask & (1 << ra))) { vr = ra; vc = ca; jc = cb; }
+                else continue;
+
+                float sel = join_edge_sel(sf, schema, rels[vr], vc, rels[r], jc);
+                if (!found || sel < bsel) {
+                    found = 1; bvr = vr; bvc = vc; bjc = jc; bsel = sel;
+                }
+            }
+
+            int  is_cross  = !found;
+            float C        = best[mask].card;
+            RelationEntry *rent = schema_find_relation_stat((SchemaFile *)schema,
+                                                            rels[r]->relation_name);
+            uint32_t nrows_r = (rent && rent->num_rows > 0) ? rent->num_rows : 1;
+            float new_card   = is_cross ? C * (float)nrows_r
+                                        : C * (float)nrows_r * bsel;
+
+            /* is_first_step when the accumulated set is a singleton */
+            int is_first = (__builtin_popcount((unsigned)mask) == 1);
+
+            /* Left join column for SORT_MERGE eligibility — col on the singleton's side */
+            int left_col = is_first ? bvc : -1;
+            const RelationDef *left_rel = is_first ? rels[best[mask].last_added] : NULL;
+
+            JoinAlgoChoice ac = cheapest_algo_for_transition(
+                schema, left_rel, rels[r],
+                is_cross ? 0 : bjc,
+                C, is_cross, is_first, is_cross ? -1 : left_col);
+
+            float new_total = best[mask].cost + ac.cost;
+
+            if (!best[new_mask].valid || new_total < best[new_mask].cost) {
+                best[new_mask].valid      = 1;
+                best[new_mask].card       = new_card;
+                best[new_mask].cost       = new_total;
+                best[new_mask].prev_mask  = mask;
+                best[new_mask].last_added = r;
+                best[new_mask].via_rel    = bvr;
+                best[new_mask].via_col    = bvc;
+                best[new_mask].join_col   = bjc;
+                best[new_mask].is_cross   = is_cross;
+                best[new_mask].algo       = ac.algo;
+            }
+        }
+    }
+
+    /* Reconstruct by walking back from full_mask */
+    JoinPlanStep rev[PLANNER_MAX_JOIN_GROUP];
+    int n = 0;
+    for (int cur = full_mask; cur != 0; ) {
+        DPCell *c = &best[cur];
+        JoinPlanStep s;
+        s.rel_idx      = c->last_added;
+        s.via_rel_idx  = c->via_rel;
+        s.via_col_idx  = c->via_col;
+        s.join_col_idx = c->join_col;
+        s.is_cross     = c->is_cross;
+        s.algo         = c->algo;
+        s.step_cost    = c->cost - best[c->prev_mask].cost;
+        s.card_after   = c->card;
+        rev[n++]       = s;
+        cur            = c->prev_mask;
+    }
+
+    /* Reverse into execution order (seed first) */
+    result.n_steps    = n;
+    result.total_cost = best[full_mask].cost;
+    for (int i = 0; i < n; i++)
+        result.steps[i] = rev[n - 1 - i];
+
+    return result;
+}
+
+/* ------------------------------------------------------------------ */
+/*  planner_choose_join_algo — public                                 */
+/* ------------------------------------------------------------------ */
+JoinAlgoChoice planner_choose_join_algo(const SchemaFile  *schema,
+                                         StatsFile         *sf,
+                                         const RelationDef *left_rel,
+                                         int                left_col,
+                                         float              left_card,
+                                         const RelationDef *right_rel,
+                                         int                right_col,
+                                         int                is_first_step)
+{
+    (void)sf;   /* reserved for future column-NDV-based cost tuning */
+    return cheapest_algo_for_transition(schema, left_rel, right_rel,
+                                        right_col, left_card,
+                                        /*is_cross=*/ 0,
+                                        is_first_step, left_col);
+}
