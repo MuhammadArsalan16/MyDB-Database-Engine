@@ -1,6 +1,0 @@
-Metadata-Version: 2.4
-Name: mydb-client
-Version: 0.1.0
-Summary: Pure-Python client for the MyDB database engine (mydbd)
-License: MIT
-Requires-Python: >=2.7
