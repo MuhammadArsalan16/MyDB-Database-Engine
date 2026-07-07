@@ -27,6 +27,11 @@ typedef struct {
  * Returns 0 on success (authenticated), -1 on connect / auth failure. */
 int  client_conn_open(ClientConn *c, const char *username);
 
+/* Same as client_conn_open, but connects over TCP to host:port instead of
+ * the Unix socket (e.g. mydbd's default TCP listener on port 4442). */
+int  client_conn_open_tcp(ClientConn *c, const char *host, uint16_t port,
+                          const char *username);
+
 /* Send one SQL string (PKT_QUERY) and read the server's PKT_RESPONSE into
  * `out` (NUL-terminated, truncated to cap-1).  Returns 0 on success, -1 on
  * I/O / protocol error. */

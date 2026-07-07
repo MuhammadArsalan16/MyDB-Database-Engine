@@ -18,6 +18,12 @@ Group=mydb
 Environment=MYDB_HOME=/var/lib/mydb
 Environment=MYDB_SOCKET=/run/mydb/mydb.sock
 
+# mydbd always also listens on TCP, alongside the Unix socket. Defaults
+# (0.0.0.0:4442) match these lines already, so they're optional — uncomment
+# to override.
+#Environment=MYDB_TCP_BIND_ADDR=0.0.0.0
+#Environment=MYDB_TCP_PORT=4442
+
 # 0755 so clients can traverse /run/mydb to reach the socket; the data dir
 # /var/lib/mydb stays 0750 (private to the mydb user).
 RuntimeDirectory=mydb

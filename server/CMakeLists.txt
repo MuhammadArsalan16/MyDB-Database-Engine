@@ -13,6 +13,7 @@ target_compile_options(mydb_proto PRIVATE -Wall -Wextra -Wpedantic)
 # loop).  Linked into the mydb-server binary alongside the engine.
 add_library(mydb_server STATIC
     src/listener.c
+    src/tcp_listener.c
     src/session.c
     src/auth.c
     src/dispatch.c

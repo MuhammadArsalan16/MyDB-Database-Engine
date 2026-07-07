@@ -1,0 +1,12 @@
+setup.cfg
+setup.py
+mydb_client/__init__.py
+mydb_client/_compat.py
+mydb_client/connection.py
+mydb_client/crypto.py
+mydb_client/protocol.py
+mydb_client.egg-info/PKG-INFO
+mydb_client.egg-info/SOURCES.txt
+mydb_client.egg-info/dependency_links.txt
+mydb_client.egg-info/top_level.txt
+mydb_client.egg-info/zip-safe
