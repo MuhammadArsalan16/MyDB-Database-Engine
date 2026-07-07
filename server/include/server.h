@@ -4,6 +4,7 @@
 #include <signal.h>
 
 #include "listener.h"
+#include "tcp_listener.h"
 #include "session.h"
 
 #ifdef __cplusplus
@@ -13,16 +14,18 @@ extern "C" {
 /*
  * server.h — the poll() event loop (server Layer 6).
  *
- * Single-threaded: one loop watches the listener fd and every active
- * session fd.  Exactly one statement executes at a time (a session is
- * marked SESSION_BUSY only for the synchronous duration of dispatch), so
- * the engine needs no locking yet — concurrency is a later layer.
+ * Single-threaded: one loop watches both listener fds (Unix + TCP, always
+ * both active) and every active session fd.  Exactly one statement executes
+ * at a time (a session is marked SESSION_BUSY only for the synchronous
+ * duration of dispatch), so the engine needs no locking yet — concurrency
+ * is a later layer.
  */
 
 struct EngineState;
 
 typedef struct {
     Listener            listener;
+    TcpListener         tcp_listener;
     SessionManager      sessions;
     struct EngineState *eng;       /* borrowed; owned by the caller */
     volatile sig_atomic_t running;

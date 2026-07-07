@@ -29,6 +29,10 @@ int server_init(Server *srv, struct EngineState *eng)
     srv->running = 0;
     session_mgr_init(&srv->sessions);
     if (listener_init(&srv->listener) != 0) return -1;
+    if (tcp_listener_init(&srv->tcp_listener) != 0) {
+        listener_close(&srv->listener);
+        return -1;
+    }
     return 0;
 }
 
@@ -86,15 +90,24 @@ int server_run(Server *srv)
 
     srv->running = 1;
     printf("mydb-server: listening on %s\n", srv->listener.socket_path);
+    printf("mydb-server: listening on TCP %s:%u\n",
+           srv->tcp_listener.bind_addr, srv->tcp_listener.port);
     fflush(stdout);
 
     while (srv->running) {
-        struct pollfd fds[1 + MAX_SESSIONS];
-        Session      *owner[1 + MAX_SESSIONS];
+        struct pollfd fds[2 + MAX_SESSIONS];
+        Session      *owner[2 + MAX_SESSIONS];
         nfds_t        nfds = 0;
 
-        /* fds[0] is always the listener. */
+        /* fds[0] is the Unix listener, fds[1] the TCP listener — both
+         * always active. */
         fds[nfds].fd      = srv->listener.fd;
+        fds[nfds].events  = POLLIN;
+        fds[nfds].revents = 0;
+        owner[nfds]       = NULL;
+        nfds++;
+
+        fds[nfds].fd      = srv->tcp_listener.fd;
         fds[nfds].events  = POLLIN;
         fds[nfds].revents = 0;
         owner[nfds]       = NULL;
@@ -119,7 +132,7 @@ int server_run(Server *srv)
         }
         if (n == 0) continue;               /* timeout — re-check running */
 
-        /* New connection on the listener. */
+        /* New connection on either listener. */
         if (fds[0].revents & POLLIN) {
             int cfd = listener_accept(&srv->listener);
             if (cfd >= 0) {
@@ -131,9 +144,20 @@ int server_run(Server *srv)
                 }
             }
         }
+        if (fds[1].revents & POLLIN) {
+            int cfd = tcp_listener_accept(&srv->tcp_listener);
+            if (cfd >= 0) {
+                Session *s = session_create(&srv->sessions, cfd);
+                if (!s) {
+                    close(cfd);             /* session table full */
+                } else if (auth_send_handshake(s) != 0) {
+                    drop_session(srv, s);
+                }
+            }
+        }
 
         /* Existing sessions with data (or hangup) waiting. */
-        for (nfds_t k = 1; k < nfds; k++) {
+        for (nfds_t k = 2; k < nfds; k++) {
             if (!owner[k]) continue;
             if (fds[k].revents & (POLLIN | POLLHUP | POLLERR))
                 service_session(srv, owner[k]);
@@ -153,5 +177,6 @@ void server_shutdown(Server *srv)
         if (s->active) drop_session(srv, s);
     }
     listener_close(&srv->listener);
+    tcp_listener_close(&srv->tcp_listener);
     g_server = NULL;
 }

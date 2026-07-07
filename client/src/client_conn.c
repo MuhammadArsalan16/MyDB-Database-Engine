@@ -7,12 +7,14 @@
 
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <netdb.h>
 #include <unistd.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 /* Connect a fresh AF_UNIX stream socket to the resolved server path. */
-static int connect_socket(void)
+static int connect_unix_socket(void)
 {
     char path[256];
     if (proto_socket_path(path, sizeof(path)) != 0) return -1;
@@ -33,48 +35,63 @@ static int connect_socket(void)
     return fd;
 }
 
-int client_conn_open(ClientConn *c, const char *username)
+/* Connect a fresh TCP stream socket to host:port. */
+static int connect_tcp_socket(const char *host, uint16_t port)
 {
-    if (!c || !username || username[0] == '\0') return -1;
-    c->fd = -1;
-    c->send_seq = 0;
-    c->recv_seq = 0;
+    char portstr[6];
+    snprintf(portstr, sizeof(portstr), "%u", port);
 
-    int fd = connect_socket();
-    if (fd < 0) {
-        fprintf(stderr, "ERROR: cannot connect to MyDB server\n"
-                        "       is mydb-server running?\n");
-        return -1;
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    struct addrinfo *res;
+    if (getaddrinfo(host, portstr, &hints, &res) != 0) return -1;
+
+    int fd = -1;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) continue;
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0) break;
+        close(fd);
+        fd = -1;
     }
-    c->fd = fd;
+    freeaddrinfo(res);
+    return fd;
+}
 
+/* Run the challenge-response handshake over an already-connected c->fd.
+ * Shared by both the Unix-socket and TCP connect paths. */
+static int do_handshake(ClientConn *c, const char *username)
+{
     PacketHeader hdr;
     uint8_t payload[PROTO_MAX_PAYLOAD];
 
     /* 1. HANDSHAKE (server version) — read and ignore the contents. */
-    if (proto_recv(fd, &hdr, payload, sizeof(payload), &c->recv_seq) != 0 ||
+    if (proto_recv(c->fd, &hdr, payload, sizeof(payload), &c->recv_seq) != 0 ||
         hdr.type != PKT_HANDSHAKE) {
-        close(fd); c->fd = -1; return -1;
+        close(c->fd); c->fd = -1; return -1;
     }
 
     /* 2. AUTH_INIT (username). */
-    if (proto_send(fd, PKT_AUTH_INIT, username,
+    if (proto_send(c->fd, PKT_AUTH_INIT, username,
                    (uint32_t)strlen(username), &c->send_seq) != 0) {
-        close(fd); c->fd = -1; return -1;
+        close(c->fd); c->fd = -1; return -1;
     }
 
     /* 3. AUTH_CHALLENGE (salt || nonce). */
-    if (proto_recv(fd, &hdr, payload, sizeof(payload), &c->recv_seq) != 0 ||
+    if (proto_recv(c->fd, &hdr, payload, sizeof(payload), &c->recv_seq) != 0 ||
         hdr.type != PKT_AUTH_CHALLENGE ||
         hdr.length != SALT_LEN + MYDB_NONCE_LEN) {
-        close(fd); c->fd = -1; return -1;
+        close(c->fd); c->fd = -1; return -1;
     }
     const uint8_t *salt  = payload;
     const uint8_t *nonce = payload + SALT_LEN;
 
     /* 4. Compute response = SHA-256(nonce || SHA-256(salt || password)). */
     char *pw = getpass("Password: ");
-    if (!pw) { close(fd); c->fd = -1; return -1; }
+    if (!pw) { close(c->fd); c->fd = -1; return -1; }
 
     uint8_t h1[SHA256_DIGEST_LEN];
     crypto_hash_password(pw, salt, h1);          /* SHA-256(salt || password) */
@@ -90,26 +107,62 @@ int client_conn_open(ClientConn *c, const char *username)
     size_t namelen = strlen(username);
     uint8_t out[PROTO_MAX_PAYLOAD];
     if (namelen + 1 + SHA256_DIGEST_LEN > sizeof(out)) {
-        close(fd); c->fd = -1; return -1;
+        close(c->fd); c->fd = -1; return -1;
     }
     memcpy(out, username, namelen);
     out[namelen] = '\0';
     memcpy(out + namelen + 1, response, SHA256_DIGEST_LEN);
-    if (proto_send(fd, PKT_AUTH_RESPONSE, out,
+    if (proto_send(c->fd, PKT_AUTH_RESPONSE, out,
                    (uint32_t)(namelen + 1 + SHA256_DIGEST_LEN),
                    &c->send_seq) != 0) {
-        close(fd); c->fd = -1; return -1;
+        close(c->fd); c->fd = -1; return -1;
     }
 
     /* 6. AUTH_OK / AUTH_ERR. */
-    if (proto_recv(fd, &hdr, payload, sizeof(payload), &c->recv_seq) != 0) {
-        close(fd); c->fd = -1; return -1;
+    if (proto_recv(c->fd, &hdr, payload, sizeof(payload), &c->recv_seq) != 0) {
+        close(c->fd); c->fd = -1; return -1;
     }
     if (hdr.type != PKT_AUTH_OK) {
         fprintf(stderr, "ERROR: authentication failed\n");
-        close(fd); c->fd = -1; return -1;
+        close(c->fd); c->fd = -1; return -1;
     }
     return 0;
+}
+
+int client_conn_open(ClientConn *c, const char *username)
+{
+    if (!c || !username || username[0] == '\0') return -1;
+    c->fd = -1;
+    c->send_seq = 0;
+    c->recv_seq = 0;
+
+    int fd = connect_unix_socket();
+    if (fd < 0) {
+        fprintf(stderr, "ERROR: cannot connect to MyDB server\n"
+                        "       is mydb-server running?\n");
+        return -1;
+    }
+    c->fd = fd;
+    return do_handshake(c, username);
+}
+
+int client_conn_open_tcp(ClientConn *c, const char *host, uint16_t port,
+                         const char *username)
+{
+    if (!c || !host || host[0] == '\0' || !username || username[0] == '\0')
+        return -1;
+    c->fd = -1;
+    c->send_seq = 0;
+    c->recv_seq = 0;
+
+    int fd = connect_tcp_socket(host, port);
+    if (fd < 0) {
+        fprintf(stderr, "ERROR: cannot connect to MyDB server at %s:%u\n",
+                        host, port);
+        return -1;
+    }
+    c->fd = fd;
+    return do_handshake(c, username);
 }
 
 int client_conn_query(ClientConn *c, const char *sql, char *out, size_t cap)
