@@ -672,6 +672,13 @@ int pm_insert(PartitionCtx *ctx, RelationDef *rel, Row *row)
                                                        r->owner_schema,
                                                        r->relation_name);
 
+    /* Snapshot root pages so we can tell, after the insert, whether any
+     * B+ tree (clustered or secondary) split its root — that's the only
+     * case the in-memory RelationDef diverges from what's on disk. */
+    uint32_t root_before = r->root_page_no;
+    uint32_t sec_root_before[MAX_SECONDARY_IDX];
+    memcpy(sec_root_before, r->secondary_root_page_no, sizeof(sec_root_before));
+
     RID rid;
     int rc = storage_insert(&ctx->storage, r, row,
                              trx_current_id(&ctx->txn_mgr), &rid);
@@ -683,10 +690,14 @@ int pm_insert(PartitionCtx *ctx, RelationDef *rel, Row *row)
 
     reconcile_growth(ctx, rel->relation_name, pages_before);
 
+    int root_changed = (r->root_page_no != root_before);
+    for (int i = 0; i < r->num_secondary_indexes && !root_changed; i++)
+        root_changed = (r->secondary_root_page_no[i] != sec_root_before[i]);
+
     SchemaFile *sf = pctx_active_schema(ctx);
     if (sf) {
         schema_bump_relation_rows(sf, rel->relation_name, 1);
-        if (r->columns[pk].is_auto_increment)
+        if (r->columns[pk].is_auto_increment || root_changed)
             schema_flush_relation(sf, rel->relation_name);
     }
 
@@ -790,10 +801,29 @@ int pm_update(PartitionCtx *ctx, RelationDef *rel, RID rid, Row *new_row)
                                                        r->owner_schema,
                                                        r->relation_name);
 
+    /* Snapshot root pages so we can tell, after the update, whether the
+     * delete-old + insert-new reshuffle split any B+ tree's root — that's
+     * the only case the in-memory RelationDef diverges from what's on disk. */
+    uint32_t root_before = r->root_page_no;
+    uint32_t sec_root_before[MAX_SECONDARY_IDX];
+    memcpy(sec_root_before, r->secondary_root_page_no, sizeof(sec_root_before));
+
     int rc = storage_update(&ctx->storage, r, rid, new_row,
                              trx_current_id(&ctx->txn_mgr));
 
     reconcile_growth(ctx, rel->relation_name, pages_before);
+
+    if (rc == MYDB_OK) {
+        int root_changed = (r->root_page_no != root_before);
+        for (int i = 0; i < r->num_secondary_indexes && !root_changed; i++)
+            root_changed = (r->secondary_root_page_no[i] != sec_root_before[i]);
+
+        if (root_changed) {
+            SchemaFile *sf = pctx_active_schema(ctx);
+            if (sf) schema_flush_relation(sf, rel->relation_name);
+        }
+    }
+
     autocommit_end(ctx, auto_txn, rc);
     return rc;
 }

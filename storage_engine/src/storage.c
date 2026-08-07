@@ -570,6 +570,8 @@ int storage_add_index(StorageEngine *se, RelationDef *rel, int col_idx)
     }
     btree_cursor_close(&btree_cur);
 
+    rel->secondary_root_page_no[idx_slot] = ot->secondary[idx_slot].root_page_no;
+
     return MYDB_OK;
 }
 
@@ -622,6 +624,7 @@ int storage_insert(StorageEngine *se, RelationDef *rel,
     RID rid;
     int rc = btree_insert(&ot->clustered, &row->cols[pk], rec_buf, rec_len, &rid);
     if (rc != MYDB_OK) return rc;
+    rel->root_page_no = ot->clustered.root_page_no;
 
     for (int i = 0; i < rel->num_secondary_indexes; i++) {
         int ci = rel->secondary_col_idx[i];
@@ -630,6 +633,7 @@ int storage_insert(StorageEngine *se, RelationDef *rel,
 
         rc = btree_insert(&ot->secondary[i], &row->cols[ci], srec, slen, NULL);
         if (rc != MYDB_OK) return rc;
+        rel->secondary_root_page_no[i] = ot->secondary[i].root_page_no;
     }
 
     se->last_written_dm = &ot->dm;
@@ -744,6 +748,7 @@ int storage_update(StorageEngine *se, RelationDef *rel,
     RID new_rid;
     int rc = btree_insert(&ot->clustered, new_pk, new_rec, new_rec_len, &new_rid);
     if (rc != MYDB_OK) return rc;
+    rel->root_page_no = ot->clustered.root_page_no;
 
     for (int i = 0; i < rel->num_secondary_indexes; i++) {
         if (!sec_changed[i]) continue;
@@ -752,6 +757,7 @@ int storage_update(StorageEngine *se, RelationDef *rel,
         uint16_t slen = build_secondary_record(&new_row->cols[ci], new_rid, srec);
         rc = btree_insert(&ot->secondary[i], &new_row->cols[ci], srec, slen, NULL);
         if (rc != MYDB_OK) return rc;
+        rel->secondary_root_page_no[i] = ot->secondary[i].root_page_no;
     }
 
     se->last_written_dm = &ot->dm;
