@@ -492,9 +492,15 @@ int pm_create_table(PartitionCtx *ctx, RelationDef *rel)
     strncpy(rel->owner_schema, sf->header.schema_name,
             sizeof(rel->owner_schema) - 1);
 
+    /* Allocate the persistent table_id from the partition's durable
+     * counter before storage ever touches disk — storage_create_table
+     * just stamps this value into the relation file's own header. */
+    int rc = cat_alloc_table_id(&ctx->catalog, &rel->table_id);
+    if (rc != MYDB_OK) return rc;
+
     /* Create the relation file and allocate its B+ tree root pages.
      * storage_create_table fills in rel->root_page_no. */
-    int rc = storage_create_table(&ctx->storage, rel);
+    rc = storage_create_table(&ctx->storage, rel);
     if (rc != MYDB_OK) return rc;
 
     /* Persist the relation in the active schema. schema_add_relation

@@ -18,7 +18,8 @@
 /*    32..39  : quota_bytes (uint64)                                  */
 /*    40..47  : used_bytes (uint64)                                   */
 /*    48      : num_schemas (uint8)                                   */
-/*    49..127 : reserved (79 B) — headroom for future fields          */
+/*    49..52  : next_table_id (uint32) — durable table_id generator   */
+/*    53..127 : reserved (75 B) — headroom for future fields          */
 /*    128..2687: 64 × SchemaEntry, 40 B each                          */
 /*    2688..  : reserved block (1400 B)                               */
 /*    4088..  : FNV-1a checksum over bytes 0..4087 (4 B)              */
@@ -63,7 +64,8 @@ static void serialize_header(uint8_t *buf, const CatalogHeader *h)
     memcpy(buf + 32, &h->quota_bytes,   8);
     memcpy(buf + 40, &h->used_bytes,    8);
     buf[48] = h->num_schemas;
-    /* bytes 49..63 zeroed by caller */
+    memcpy(buf + 49, &h->next_table_id, 4);
+    /* bytes 53..63 zeroed by caller */
 }
 
 static void deserialize_header(const uint8_t *buf, CatalogHeader *h)
@@ -75,6 +77,7 @@ static void deserialize_header(const uint8_t *buf, CatalogHeader *h)
     memcpy(&h->quota_bytes,   buf + 32, 8);
     memcpy(&h->used_bytes,    buf + 40, 8);
     h->num_schemas = buf[48];
+    memcpy(&h->next_table_id, buf + 49, 4);
 }
 
 static void serialize_schema(uint8_t *buf, const SchemaEntry *s)
@@ -152,6 +155,8 @@ int cat_create(const char *path, uint32_t partition_id, uint32_t owner_id,
     out->header.quota_bytes   = quota_bytes;
     out->header.used_bytes    = 0;
     out->header.num_schemas   = 0;
+    out->header.next_table_id = 1;   /* 0 stays reserved (matches the
+                                       * buffer pool's temp-id convention) */
 
     int rc = cat_save(out);
     if (rc != MYDB_OK) {
@@ -272,6 +277,14 @@ int cat_track_alloc(Catalog *cat, int64_t delta_bytes)
         return MYDB_OK; /* zero delta — nothing to do */
     }
 
+    return cat_save(cat);
+}
+
+int cat_alloc_table_id(Catalog *cat, uint32_t *out_id)
+{
+    if (!cat || !out_id) return MYDB_ERR;
+
+    *out_id = cat->header.next_table_id++;
     return cat_save(cat);
 }
 

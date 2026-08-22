@@ -39,6 +39,9 @@ typedef struct {
     uint32_t num_pages;               /* persisted source of truth for size */
     uint8_t  tree_height;             /* B+ tree height (1 = root only); CBO cost input */
     uint8_t  reserved;               /* reserved for future CBO fields */
+    uint32_t table_id;                /* persistent identity; mirrors the relation
+                                        * file's own FileHeader.table_id. Catalog-level
+                                        * copy — read here, not by opening the .mydb file. */
 } RelationEntry;
 
 /* In-memory schema file representation. relations[i] and defs[i] are

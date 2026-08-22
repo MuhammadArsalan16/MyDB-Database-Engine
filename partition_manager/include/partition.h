@@ -25,6 +25,10 @@ typedef struct {
     uint64_t quota_bytes;      /* maximum storage allowed */
     uint64_t used_bytes;       /* current consumption — persisted authoritatively */
     uint8_t  num_schemas;      /* count of valid schema slots */
+    uint32_t next_table_id;    /* durable per-partition counter; next value handed
+                                 * out by cat_alloc_table_id(). Never reused, even
+                                 * across restarts — the WAL-addressing property
+                                 * a per-process counter couldn't provide. */
 } CatalogHeader;
 
 typedef struct {
@@ -71,6 +75,12 @@ int cat_track_alloc(Catalog *cat, int64_t delta_bytes);
 /* Linear lookup. Returns NULL if no valid match. Pointer is valid
  * for the lifetime of *cat. */
 SchemaEntry *cat_find_schema(Catalog *cat, const char *schema_name);
+
+/* Hand out the next persistent table_id and persist the advanced counter
+ * before returning it — durable and never reused, even across restarts.
+ * Called once per CREATE TABLE, by pm_create_table, before
+ * storage_create_table stamps the id into the relation's own file header. */
+int cat_alloc_table_id(Catalog *cat, uint32_t *out_id);
 
 /* ------------------------------------------------------------------ */
 /*  Quota-aware page allocation                                       */

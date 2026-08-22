@@ -77,7 +77,7 @@ static void test_init(void)
 {
     printf("\n[test_init]\n");
 
-    BufferPool  local_bp;
+    static BufferPool  local_bp;
     TransactionManager local_tm;
     bp_init(&local_bp);
     trx_init(&local_tm, &local_bp);

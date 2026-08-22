@@ -35,7 +35,8 @@
 /*    39..42    : num_pages (uint32)                                  */
 /*    43        : tree_height (uint8) — B+ tree height, CBO cost input */
 /*    44        : reserved (uint8)                                    */
-/*    45..55    : reserved (11 B)                                     */
+/*    45..48    : table_id (uint32) — mirrors relation FileHeader.table_id */
+/*    49..55    : reserved (7 B)                                      */
 /* ------------------------------------------------------------------ */
 
 #define SF_HEADER_SIZE        128
@@ -205,6 +206,7 @@ static int relation_def_serialize(const RelationDef *r, uint8_t *page)
     put_u8 (page, &off, r->num_secondary_indexes);
     put_u32(page, &off, r->auto_incr_counter);
     put_u32(page, &off, r->root_page_no);
+    put_u32(page, &off, r->table_id);
 
     for (int i = 0; i < MAX_SECONDARY_IDX; i++)
         put_u8(page, &off, r->secondary_col_idx[i]);
@@ -271,6 +273,7 @@ static int relation_def_deserialize(RelationDef *r, const uint8_t *page)
     r->num_secondary_indexes = get_u8 (page, &off);
     r->auto_incr_counter     = get_u32(page, &off);
     r->root_page_no          = get_u32(page, &off);
+    r->table_id              = get_u32(page, &off);
 
     for (int i = 0; i < MAX_SECONDARY_IDX; i++)
         r->secondary_col_idx[i] = get_u8(page, &off);
@@ -352,7 +355,8 @@ static void serialize_relation_entry(uint8_t *buf, const RelationEntry *e)
     memcpy(buf + 39, &e->num_pages,    4);
     buf[43] = e->tree_height;
     buf[44] = e->reserved;
-    /* bytes 45..55 zeroed by caller */
+    memcpy(buf + 45, &e->table_id, 4);
+    /* bytes 49..55 zeroed by caller */
 }
 
 static void deserialize_relation_entry(const uint8_t *buf, RelationEntry *e)
@@ -366,6 +370,7 @@ static void deserialize_relation_entry(const uint8_t *buf, RelationEntry *e)
     memcpy(&e->num_pages,    buf + 39, 4);
     e->tree_height = buf[43];
     e->reserved    = buf[44];
+    memcpy(&e->table_id, buf + 45, 4);
 }
 
 static void pack_page0(const SchemaFile *sf, uint8_t *buf)
@@ -599,6 +604,7 @@ int schema_add_relation(SchemaFile *sf, const RelationDef *def)
     e->num_pages   = 0;
     e->tree_height = 1;   /* root page exists; tree starts at height 1 */
     e->reserved    = 0;
+    e->table_id    = def->table_id;
 
     sf->defs[slot] = *def;
     /* Stamp the owning schema on the in-memory def (not serialized). */
