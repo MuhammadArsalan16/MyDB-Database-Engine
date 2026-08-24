@@ -266,9 +266,56 @@ static void test_rollback_discards_dirty_metadata(void)
     teardown_ctx(ctx);
 }
 
-/* ------------------------------------------------------------------ */
-/*  Main                                                               */
-/* ------------------------------------------------------------------ */
+/* Phase 4: the same discard-on-rollback proof as
+ * test_rollback_discards_dirty_metadata above, but for PB[0]'s used_bytes
+ * (via cat_track_alloc) instead of SchemaFile's num_rows. reconcile_growth
+ * only calls cat_track_alloc when a DML statement actually changes the
+ * relation's page count — a single tiny row never does, so this inserts
+ * enough rows in one transaction to force at least one B+ tree page split
+ * (record ~26B + 2B slot ~28B/row; a 16KB page holds roughly 580 before
+ * splitting — 800 gives comfortable margin). */
+static void test_rollback_discards_dirty_quota(void)
+{
+    printf("\n[test_rollback_discards_dirty_quota]\n");
+    PartitionCtx *ctx = setup_ctx_with_real_table(TEST_REAL_TABLE);
+    CHECK(ctx != NULL, "real-table fixture set up");
+    if (!ctx) return;
+
+    Catalog *cat = pctx_catalog(ctx);
+    CHECK(cat != NULL, "catalog open on the fixture");
+    if (!cat) { teardown_ctx(ctx); return; }
+    uint64_t used_before = cat->header.used_bytes;
+
+    RelationDef *rel = pm_find_relation(ctx, TEST_REAL_TABLE);
+    CHECK(rel != NULL, "relation found for bulk insert");
+    if (!rel) { teardown_ctx(ctx); return; }
+
+    CHECK(pm_begin(ctx) == MYDB_OK, "BEGIN succeeds");
+
+    const int N = 800;
+    int insert_ok = 1;
+    for (int i = 0; i < N; i++) {
+        Row row;
+        memset(&row, 0, sizeof(row));
+        row.num_cols = 2;
+        row.cols[0].type = TYPE_INT; row.cols[0].v.int_val = i + 1;
+        row.cols[1].type = TYPE_INT; row.cols[1].v.int_val = i;
+        if (pm_insert(ctx, rel, &row) != MYDB_OK) insert_ok = 0;
+    }
+    CHECK(insert_ok, "all N rows insert inside the transaction");
+    pm_release_relation(ctx, rel);
+
+    CHECK(cat->header.used_bytes > used_before,
+          "used_bytes grew in memory — fixture forced at least one page split");
+
+    CHECK(pm_rollback(ctx) == MYDB_OK, "ROLLBACK succeeds");
+
+    CHECK(cat->header.used_bytes == used_before,
+          "used_bytes reverted to its pre-transaction value after rollback "
+          "(PB[0]'s dirty quota bookkeeping discarded, not just SchemaFile's)");
+
+    teardown_ctx(ctx);
+}
 
 /* Phase 3, plan Verification item 4: a bulk INSERT loop inside one explicit
  * transaction must result in a single flush at COMMIT, not one
@@ -322,6 +369,70 @@ static void test_bulk_insert_single_flush_at_commit(void)
     teardown_ctx(ctx);
 }
 
+/* Phase 4: the same single-flush-at-commit proof as
+ * test_bulk_insert_single_flush_at_commit above, but for PB[0]'s
+ * used_bytes — see test_rollback_discards_dirty_quota for why this needs
+ * enough rows to force a page split (reconcile_growth only touches
+ * cat_track_alloc when the page count actually changes). */
+static void test_bulk_insert_defers_quota_until_commit(void)
+{
+    printf("\n[test_bulk_insert_defers_quota_until_commit]\n");
+    PartitionCtx *ctx = setup_ctx_with_real_table(TEST_REAL_TABLE);
+    CHECK(ctx != NULL, "real-table fixture set up");
+    if (!ctx) return;
+
+    Catalog *cat = pctx_catalog(ctx);
+    CHECK(cat != NULL, "catalog open on the fixture");
+    if (!cat) { teardown_ctx(ctx); return; }
+    uint64_t used_before = cat->header.used_bytes;
+
+    RelationDef *rel = pm_find_relation(ctx, TEST_REAL_TABLE);
+    CHECK(rel != NULL, "relation found for bulk insert");
+    if (!rel) { teardown_ctx(ctx); return; }
+
+    CHECK(pm_begin(ctx) == MYDB_OK, "BEGIN succeeds");
+
+    const int N = 800;
+    int insert_ok = 1;
+    for (int i = 0; i < N; i++) {
+        Row row;
+        memset(&row, 0, sizeof(row));
+        row.num_cols = 2;
+        row.cols[0].type = TYPE_INT; row.cols[0].v.int_val = i + 1;
+        row.cols[1].type = TYPE_INT; row.cols[1].v.int_val = i;
+        if (pm_insert(ctx, rel, &row) != MYDB_OK) insert_ok = 0;
+    }
+    CHECK(insert_ok, "all N rows insert inside the transaction");
+    pm_release_relation(ctx, rel);
+
+    CHECK(cat->header.used_bytes > used_before,
+          "used_bytes grew in memory — fixture forced at least one page split");
+
+    /* Independent, freshly-opened Catalog handle — must still see the
+     * pre-transaction used_bytes, proving the deferred bumps never
+     * reached disk mid-transaction. */
+    Catalog disk_check;
+    CHECK(cat_open(TEST_CATALOG_FILE, &disk_check) == MYDB_OK,
+          "independent reopen before commit");
+    CHECK(disk_check.header.used_bytes == used_before,
+          "disk still shows the pre-transaction used_bytes mid-transaction");
+    cat_close(&disk_check);
+
+    CHECK(pm_commit(ctx) == MYDB_OK, "COMMIT succeeds");
+
+    CHECK(cat_open(TEST_CATALOG_FILE, &disk_check) == MYDB_OK,
+          "independent reopen after commit");
+    CHECK(disk_check.header.used_bytes == cat->header.used_bytes,
+          "single flush at COMMIT persisted the grown used_bytes");
+    cat_close(&disk_check);
+
+    teardown_ctx(ctx);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Main                                                               */
+/* ------------------------------------------------------------------ */
+
 int main(void)
 {
     printf("=== test_pm_api ===\n");
@@ -331,7 +442,9 @@ int main(void)
     test_find_missing_relation();
     test_debug_no_pinned_relations_null_safe();
     test_rollback_discards_dirty_metadata();
+    test_rollback_discards_dirty_quota();
     test_bulk_insert_single_flush_at_commit();
+    test_bulk_insert_defers_quota_until_commit();
 
     printf("\nResults: %d/%d passed\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

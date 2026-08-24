@@ -14,7 +14,7 @@
  *
  * Every pm_* function receives a PartitionCtx* which carries:
  *   ctx->storage    — StorageEngine (stateless I/O, one per partition)
- *   ctx->catalog    — Catalog (__catalog.mydb, quota + schema list)
+ *   pctx_catalog(ctx)       → Catalog* (PB[0]: __catalog.mydb, quota + schema list)
  *   ctx->txn_mgr    — TransactionManager (begin/commit/rollback)
  *   pctx_active_schema(ctx) → SchemaFile* (__schema.mydb, RelationDef pages)
  *
@@ -71,8 +71,8 @@ static int value_compare(const Value *a, const Value *b)
 
 static int quota_headroom(PartitionCtx *ctx, uint32_t headroom_pages)
 {
-    Catalog *c = &ctx->catalog;
-    if (c->fd < 0) return MYDB_OK;   /* analyst: no quota to enforce */
+    Catalog *c = pctx_catalog(ctx);
+    if (!c) return MYDB_OK;   /* analyst: no quota to enforce */
     if (c->header.used_bytes > c->header.quota_bytes) return MYDB_ERR_FULL;
     uint64_t need = (uint64_t)headroom_pages * PAGE_SIZE;
     if (c->header.quota_bytes - c->header.used_bytes < need)
@@ -112,7 +112,15 @@ static void reconcile_growth(PartitionCtx *ctx, const char *relation_name,
          * mark Page 0 dirty; pm_commit/pm_rollback (or eviction) resolve it. */
         PBOuterSlot *outer = pctx_active_outer_slot(ctx);
         if (outer) pb_mark_page0_dirty(outer);
-        cat_track_alloc(&ctx->catalog, (int64_t)delta * PAGE_SIZE);
+
+        /* Phase 4: cat_track_alloc no longer persists itself either — same
+         * write-back treatment, same reasoning, right next to the Page 0
+         * mark above. pm_commit/pm_rollback resolve PB[0] alongside it. */
+        Catalog *cat = pctx_catalog(ctx);
+        if (cat) {
+            cat_track_alloc(cat, (int64_t)delta * PAGE_SIZE);
+            pb_mark_catalog_dirty(ctx->schema_cache);
+        }
     }
 }
 
@@ -426,10 +434,11 @@ int pm_create_schema(PartitionCtx *ctx, const char *name)
 
     /* Owner check: only partition owners can create schemas. Analysts
      * (no partition) get MYDB_ERR_PERM here. */
-    if (ctx->catalog.fd < 0) return MYDB_ERR_PERM;
+    Catalog *cat = pctx_catalog(ctx);
+    if (!cat) return MYDB_ERR_PERM;
 
     /* Reject duplicates against the partition catalog. */
-    if (cat_find_schema(&ctx->catalog, name) != NULL)
+    if (cat_find_schema(cat, name) != NULL)
         return MYDB_ERR_DUPLICATE;
 
     /* Build <partition>/<name>/ and <partition>/<name>/__schema.mydb. */
@@ -450,11 +459,11 @@ int pm_create_schema(PartitionCtx *ctx, const char *name)
      * counter before either file is touched — schema_create and
      * cat_add_schema each stamp this same value into their own record. */
     uint32_t schema_id;
-    int rc = cat_alloc_schema_id(&ctx->catalog, &schema_id);
+    int rc = cat_alloc_schema_id(cat, &schema_id);
     if (rc != MYDB_OK) return rc;
 
     SchemaFile sf;
-    rc = schema_create(path, ctx->catalog.header.partition_id, schema_id,
+    rc = schema_create(path, cat->header.partition_id, schema_id,
                        name, &sf);
     if (rc != MYDB_OK) {
         rmdir(dir);   /* best-effort cleanup if dir was newly created */
@@ -462,7 +471,7 @@ int pm_create_schema(PartitionCtx *ctx, const char *name)
     }
     schema_close(&sf);
 
-    rc = cat_add_schema(&ctx->catalog, name, schema_id);
+    rc = cat_add_schema(cat, name, schema_id);
     if (rc != MYDB_OK) {
         unlink(path);
         rmdir(dir);
@@ -474,7 +483,8 @@ int pm_create_schema(PartitionCtx *ctx, const char *name)
 int pm_drop_schema(PartitionCtx *ctx, const char *name)
 {
     if (!ctx || !name || name[0] == '\0') return MYDB_ERR;
-    if (ctx->catalog.fd < 0) return MYDB_ERR_PERM;
+    Catalog *cat = pctx_catalog(ctx);
+    if (!cat) return MYDB_ERR_PERM;
 
     /* Reject dropping the currently active schema — caller must USE
      * another database (or none) before dropping this one. */
@@ -483,7 +493,7 @@ int pm_drop_schema(PartitionCtx *ctx, const char *name)
         return MYDB_ERR;   /* exec_drop_database checks and surfaces a message */
 
     /* Schema must be registered in the partition catalog. */
-    if (cat_find_schema(&ctx->catalog, name) == NULL)
+    if (cat_find_schema(cat, name) == NULL)
         return MYDB_ERR_NOT_FOUND;
 
     /* If the schema is cached in Cache 2, evict it now so we don't leave a
@@ -531,12 +541,17 @@ int pm_drop_schema(PartitionCtx *ctx, const char *name)
     /* Remove the now-empty schema directory. */
     rmdir(schema_dir);
 
-    /* Credit freed data pages back to the partition quota. */
-    if (freed_bytes > 0)
-        cat_track_alloc(&ctx->catalog, -(int64_t)freed_bytes);
+    /* Credit freed data pages back to the partition quota. Phase 4:
+     * cat_track_alloc no longer persists — mark PB[0] dirty and flush
+     * immediately (DDL has no autocommit wrapper to defer to). */
+    if (freed_bytes > 0) {
+        cat_track_alloc(cat, -(int64_t)freed_bytes);
+        pb_mark_catalog_dirty(ctx->schema_cache);
+        pb_flush_catalog_dirty(ctx->schema_cache);
+    }
 
     /* Remove the schema slot from __catalog.mydb. */
-    return cat_remove_schema(&ctx->catalog, name);
+    return cat_remove_schema(cat, name);
 }
 
 /* ------------------------------------------------------------------ */
@@ -569,7 +584,8 @@ int pm_create_table(PartitionCtx *ctx, RelationDef *rel)
     /* Allocate the persistent table_id from the partition's durable
      * counter before storage ever touches disk — storage_create_table
      * just stamps this value into the relation file's own header. */
-    int rc = cat_alloc_table_id(&ctx->catalog, &rel->table_id);
+    Catalog *cat = pctx_catalog(ctx);
+    int rc = cat_alloc_table_id(cat, &rel->table_id);
     if (rc != MYDB_OK) return rc;
 
     /* Create the relation file and allocate its B+ tree root pages.
@@ -600,15 +616,22 @@ int pm_create_table(PartitionCtx *ctx, RelationDef *rel)
         if (outer) { pb_mark_page0_dirty(outer); pb_flush_slot_dirty(outer); }
     }
 
-    /* Credit the allocated pages to the partition quota. */
-    cat_track_alloc(&ctx->catalog, (int64_t)need_pages * PAGE_SIZE);
+    /* Credit the allocated pages to the partition quota. Phase 4:
+     * cat_track_alloc no longer persists — mark PB[0] dirty; flushed
+     * below alongside num_relations, in one save. */
+    if (cat) {
+        cat_track_alloc(cat, (int64_t)need_pages * PAGE_SIZE);
+        pb_mark_catalog_dirty(ctx->schema_cache);
+    }
 
     /* Keep the partition catalog's SchemaEntry.num_relations in sync so
-     * DESCRIBE PARTITION shows the correct table count. */
-    SchemaEntry *se = cat_find_schema(&ctx->catalog, pctx_active_schema_name(ctx));
-    if (se) {
-        se->num_relations++;
-        cat_save(&ctx->catalog);
+     * DESCRIBE PARTITION shows the correct table count. This DDL path has
+     * no autocommit wrapper, so flush immediately — one save covers both
+     * the quota credit above and num_relations here. */
+    if (cat) {
+        SchemaEntry *se = cat_find_schema(cat, pctx_active_schema_name(ctx));
+        if (se) se->num_relations++;
+        pb_flush_catalog_dirty(ctx->schema_cache);
     }
 
     return MYDB_OK;
@@ -625,10 +648,15 @@ int pm_drop_table(PartitionCtx *ctx, RelationDef *rel)
     /* Reclaim the partition quota for the file's pages before deleting.
      * Also snapshot page_no now — schema_remove_relation clears this
      * directory entry, and the page_no is needed afterward to invalidate
-     * any cached inner frame for it (see below). */
+     * any cached inner frame for it (see below). Phase 4: cat_track_alloc
+     * no longer persists — mark PB[0] dirty; flushed below alongside
+     * num_relations, in one save. */
+    Catalog *cat = pctx_catalog(ctx);
     RelationEntry *e = schema_find_relation_stat(sf, rel->relation_name);
-    if (e && e->num_pages > 0)
-        cat_track_alloc(&ctx->catalog, -(int64_t)e->num_pages * PAGE_SIZE);
+    if (cat && e && e->num_pages > 0) {
+        cat_track_alloc(cat, -(int64_t)e->num_pages * PAGE_SIZE);
+        pb_mark_catalog_dirty(ctx->schema_cache);
+    }
     uint8_t dropped_page_no = e ? e->page_no : 0;
 
     int rc = storage_drop_table(&ctx->storage, sf->header.schema_name,
@@ -648,11 +676,13 @@ int pm_drop_table(PartitionCtx *ctx, RelationDef *rel)
         if (slot) pb_invalidate_page(slot, dropped_page_no);
     }
 
-    /* Keep the partition catalog's SchemaEntry.num_relations in sync. */
-    SchemaEntry *se = cat_find_schema(&ctx->catalog, pctx_active_schema_name(ctx));
-    if (se && se->num_relations > 0) {
-        se->num_relations--;
-        cat_save(&ctx->catalog);
+    /* Keep the partition catalog's SchemaEntry.num_relations in sync.
+     * This DDL path has no autocommit wrapper, so flush immediately —
+     * one save covers both the quota reclaim above and num_relations here. */
+    if (cat) {
+        SchemaEntry *se = cat_find_schema(cat, pctx_active_schema_name(ctx));
+        if (se && se->num_relations > 0) se->num_relations--;
+        pb_flush_catalog_dirty(ctx->schema_cache);
     }
 
     return MYDB_OK;
@@ -691,7 +721,17 @@ int pm_add_index(PartitionCtx *ctx, RelationDef *rel, int col_idx)
         schema_bump_relation_pages(sf, r->relation_name, 1);
         if (outer) { pb_mark_page0_dirty(outer); pb_flush_slot_dirty(outer); }
     }
-    cat_track_alloc(&ctx->catalog, (int64_t)PAGE_SIZE);
+    /* Phase 4: cat_track_alloc no longer persists — mark PB[0] dirty and
+     * flush immediately, same "no autocommit wrapper" reasoning as the
+     * schema-side flush just above. */
+    {
+        Catalog *cat = pctx_catalog(ctx);
+        if (cat) {
+            cat_track_alloc(cat, (int64_t)PAGE_SIZE);
+            pb_mark_catalog_dirty(ctx->schema_cache);
+            pb_flush_catalog_dirty(ctx->schema_cache);
+        }
+    }
     rc = MYDB_OK;
 
 done:
@@ -726,6 +766,10 @@ int pm_commit(PartitionCtx *ctx)
     PBOuterSlot *outer = pctx_active_outer_slot(ctx);
     if (outer) pb_flush_slot_dirty(outer);
 
+    /* Phase 4: same treatment for PB[0] (the partition catalog) — quota
+     * bookkeeping (cat_track_alloc) is deferred the same way. */
+    if (ctx->schema_cache) pb_flush_catalog_dirty(ctx->schema_cache);
+
     /* Fsync the active schema file so the flush above survives a crash. */
     SchemaFile *sf = pctx_active_schema(ctx);
     if (sf && sf->fd >= 0)
@@ -755,6 +799,11 @@ int pm_rollback(PartitionCtx *ctx)
      * incremented anyway — nothing here ever undid it. */
     PBOuterSlot *outer = pctx_active_outer_slot(ctx);
     if (outer) pb_discard_slot_dirty(outer);
+
+    /* Phase 4: same discard treatment for PB[0] — reverts a rolled-back
+     * transaction's uncommitted used_bytes bump, closing the same class
+     * of pre-existing gap Phase 3 closed for num_rows. */
+    if (ctx->schema_cache) pb_discard_catalog_dirty(ctx->schema_cache);
 
     return trx_rollback(&ctx->txn_mgr);
 }

@@ -24,8 +24,11 @@
  *  same discipline throughout.
  * ------------------------------------------------------------------ */
 
-#define TEST_PART_DIR  "/tmp/mydb_test_partition_buffer_part"
-#define TEST_PID       73
+#define TEST_PART_DIR    "/tmp/mydb_test_partition_buffer_part"
+#define TEST_PID         73
+#define TEST_OWNER       73
+#define TEST_QUOTA       (100ULL * 1024 * 1024)
+#define TEST_CATALOG_FILE TEST_PART_DIR "/__catalog.mydb"
 
 static int tests_run    = 0;
 static int tests_passed = 0;
@@ -76,6 +79,7 @@ static void cleanup(void)
         schema_path(i, path, sizeof(path));
         unlink(path);
     }
+    unlink(TEST_CATALOG_FILE);
     rmdir(TEST_PART_DIR);
 }
 
@@ -98,6 +102,17 @@ static int make_schema(int idx, int n_relations)
         }
     }
     schema_close(&sf);
+    return MYDB_OK;
+}
+
+/* Create __catalog.mydb on disk (closed) — a real file for pb_open_catalog
+ * to load into PB[0]. */
+static int make_catalog_file(void)
+{
+    Catalog cat;
+    if (cat_create(TEST_CATALOG_FILE, TEST_PID, TEST_OWNER, TEST_QUOTA, &cat) != MYDB_OK)
+        return MYDB_ERR;
+    cat_close(&cat);
     return MYDB_OK;
 }
 
@@ -744,6 +759,115 @@ static void test_inner_eviction_flushes_dirty_frame(void)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Catalog (PB[0]) — Phase 4                                          */
+/* ------------------------------------------------------------------ */
+
+static void test_open_catalog(void)
+{
+    printf("\n[test_open_catalog]\n");
+    cleanup();
+    mkdir(TEST_PART_DIR, 0755);
+    CHECK(make_catalog_file() == MYDB_OK, "fixture catalog file created");
+
+    PartitionBuffer *pb = (PartitionBuffer *)malloc(sizeof(PartitionBuffer));
+    pb_init(pb);
+
+    CHECK(pb_catalog(pb) == NULL, "no catalog loaded yet");
+    CHECK(pb_open_catalog(pb, TEST_CATALOG_FILE) == MYDB_OK, "pb_open_catalog succeeds");
+
+    Catalog *cat = pb_catalog(pb);
+    CHECK(cat != NULL, "pb_catalog returns non-NULL once loaded");
+    CHECK(cat && cat->header.partition_id == TEST_PID, "loaded catalog has the right partition_id");
+    CHECK(cat && cat->header.quota_bytes == TEST_QUOTA, "loaded catalog has the right quota");
+
+    pb_destroy(pb);
+    free(pb);
+    cleanup();
+}
+
+static void test_catalog_mark_dirty_flag(void)
+{
+    printf("\n[test_catalog_mark_dirty_flag]\n");
+    cleanup();
+    mkdir(TEST_PART_DIR, 0755);
+    CHECK(make_catalog_file() == MYDB_OK, "fixture catalog file created");
+
+    PartitionBuffer *pb = (PartitionBuffer *)malloc(sizeof(PartitionBuffer));
+    pb_init(pb);
+    pb_open_catalog(pb, TEST_CATALOG_FILE);
+
+    CHECK(pb->catalog.is_dirty == 0, "PB[0] starts clean");
+    pb_mark_catalog_dirty(pb);
+    CHECK(pb->catalog.is_dirty == 1, "pb_mark_catalog_dirty sets the flag");
+
+    pb_destroy(pb);
+    free(pb);
+    cleanup();
+}
+
+static void test_flush_catalog_dirty_persists_and_clears(void)
+{
+    printf("\n[test_flush_catalog_dirty_persists_and_clears]\n");
+    cleanup();
+    mkdir(TEST_PART_DIR, 0755);
+    CHECK(make_catalog_file() == MYDB_OK, "fixture catalog file created");
+
+    PartitionBuffer *pb = (PartitionBuffer *)malloc(sizeof(PartitionBuffer));
+    pb_init(pb);
+    pb_open_catalog(pb, TEST_CATALOG_FILE);
+
+    Catalog *cat = pb_catalog(pb);
+    CHECK(cat_track_alloc(cat, 5 * PAGE_SIZE) == MYDB_OK,
+          "used_bytes bumped in memory only (cat_track_alloc no longer persists)");
+    pb_mark_catalog_dirty(pb);
+
+    CHECK(pb_flush_catalog_dirty(pb) == MYDB_OK, "flush succeeds");
+    CHECK(pb->catalog.is_dirty == 0, "is_dirty cleared after flush");
+
+    /* Verify persistence via a completely independent, freshly-opened
+     * Catalog — proves the write actually reached disk. */
+    Catalog check;
+    CHECK(cat_open(TEST_CATALOG_FILE, &check) == MYDB_OK, "fresh reopen for verification");
+    CHECK(check.header.used_bytes == 5 * PAGE_SIZE, "used_bytes persisted to disk");
+    cat_close(&check);
+
+    pb_destroy(pb);
+    free(pb);
+    cleanup();
+}
+
+static void test_discard_catalog_dirty_reverts_and_clears(void)
+{
+    printf("\n[test_discard_catalog_dirty_reverts_and_clears]\n");
+    cleanup();
+    mkdir(TEST_PART_DIR, 0755);
+    CHECK(make_catalog_file() == MYDB_OK, "fixture catalog file created");
+
+    PartitionBuffer *pb = (PartitionBuffer *)malloc(sizeof(PartitionBuffer));
+    pb_init(pb);
+    pb_open_catalog(pb, TEST_CATALOG_FILE);
+
+    Catalog *cat = pb_catalog(pb);
+    cat_track_alloc(cat, 5 * PAGE_SIZE);
+    pb_mark_catalog_dirty(pb);
+
+    CHECK(pb_discard_catalog_dirty(pb) == MYDB_OK, "discard succeeds");
+    CHECK(pb->catalog.is_dirty == 0, "is_dirty cleared after discard");
+    CHECK(pb_catalog(pb)->header.used_bytes == 0,
+          "used_bytes reverted in memory — reloaded from disk, not persisted");
+
+    /* Disk itself was never touched. */
+    Catalog check;
+    CHECK(cat_open(TEST_CATALOG_FILE, &check) == MYDB_OK, "fresh reopen for verification");
+    CHECK(check.header.used_bytes == 0, "discarded change was never written to disk");
+    cat_close(&check);
+
+    pb_destroy(pb);
+    free(pb);
+    cleanup();
+}
+
+/* ------------------------------------------------------------------ */
 /*  Main                                                               */
 /* ------------------------------------------------------------------ */
 
@@ -769,6 +893,11 @@ int main(void)
     test_discard_slot_dirty_reverts_and_clears();
     test_outer_eviction_flushes_dirty_slot();
     test_inner_eviction_flushes_dirty_frame();
+
+    test_open_catalog();
+    test_catalog_mark_dirty_flag();
+    test_flush_catalog_dirty_persists_and_clears();
+    test_discard_catalog_dirty_reverts_and_clears();
 
     printf("\nResults: %d/%d passed\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

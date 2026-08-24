@@ -386,6 +386,11 @@ static void test_track_alloc_persists(void)
     Catalog cat;
     cat_create(TEST_FILE, TEST_PID, TEST_OWNER, TEST_QUOTA, &cat);
     cat_track_alloc(&cat, 5 * PAGE_SIZE);
+    /* Phase 4: cat_track_alloc no longer persists internally — caller
+     * (partition_manager's PB[0] write-back) is responsible for the
+     * cat_save. Save explicitly here since this test exercises cat_track_alloc
+     * directly, bypassing PartitionBuffer. */
+    cat_save(&cat);
     cat_close(&cat);
 
     Catalog cat2;
@@ -558,6 +563,11 @@ static void test_alloc_page_persists_used_bytes(void)
     partition_alloc_page(&cat, &dm, TEST_OWNER, &pno);
     partition_alloc_page(&cat, &dm, TEST_OWNER, &pno);
     partition_alloc_page(&cat, &dm, TEST_OWNER, &pno);
+
+    /* Phase 4: partition_alloc_page's internal cat_track_alloc no longer
+     * persists — save explicitly (this test bypasses PartitionBuffer,
+     * which would otherwise own this via pb_flush_catalog_dirty). */
+    cat_save(&cat);
 
     disk_close(&dm);
     cat_close(&cat);

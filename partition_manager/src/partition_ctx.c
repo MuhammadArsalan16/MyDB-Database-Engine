@@ -20,7 +20,6 @@ PartitionCtx *pctx_init(uint32_t partition_id, const char *partition_path)
     PartitionCtx *ctx = (PartitionCtx *)calloc(1, sizeof(PartitionCtx));
     if (!ctx) return NULL;
 
-    ctx->catalog.fd   = -1;
     ctx->partition_id = partition_id;
     strncpy(ctx->partition_path, partition_path,
             sizeof(ctx->partition_path) - 1);
@@ -58,7 +57,13 @@ int pctx_open_catalog(PartitionCtx *ctx)
     int n = snprintf(cat_path, sizeof(cat_path),
                      "%s/__catalog.mydb", ctx->partition_path);
     if (n < 0 || (size_t)n >= sizeof(cat_path)) return MYDB_ERR;
-    return cat_open(cat_path, &ctx->catalog);
+    return pb_open_catalog(ctx->schema_cache, cat_path);
+}
+
+Catalog *pctx_catalog(PartitionCtx *ctx)
+{
+    if (!ctx) return NULL;
+    return pb_catalog(ctx->schema_cache);
 }
 
 int pctx_close(PartitionCtx *ctx)
@@ -71,15 +76,13 @@ int pctx_close(PartitionCtx *ctx)
 
     if (ctx->schema_cache) {
         /* pb_flush_all is a safety net; storage_shutdown above already
-         * flushed everything. */
+         * flushed everything. pb_destroy closes PB[0]'s Catalog too
+         * (Phase 4) — no separate cat_close needed. */
         pb_flush_all(ctx->schema_cache, &ctx->storage);
         pb_destroy(ctx->schema_cache);
         free(ctx->schema_cache);
         ctx->schema_cache = NULL;
     }
-
-    if (ctx->catalog.fd > 0)
-        cat_close(&ctx->catalog);
 
     return MYDB_OK;
 }

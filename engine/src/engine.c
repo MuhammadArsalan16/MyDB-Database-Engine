@@ -610,7 +610,8 @@ int engine_use_schema(EngineState *eng, const char *schema_name)
         if (!part) return MYDB_ERR;
 
         /* Schema must exist in the user's own catalog. */
-        if (cat_find_schema(&part->catalog, schema_name) == NULL)
+        Catalog *part_cat = pctx_catalog(part);
+        if (!part_cat || cat_find_schema(part_cat, schema_name) == NULL)
             return MYDB_ERR_NOT_FOUND;
 
         if (join2(schema_path, sizeof(schema_path),
@@ -971,10 +972,12 @@ int engine_alter_user_quota(EngineState *eng,
     cat_close(&cat);
 
     /* If this is the currently logged-in user's own catalog, keep the
-     * in-memory copy (inside its PartitionCtx) consistent. */
+     * in-memory copy (inside its PartitionCtx's PB[0]) consistent. */
     PartitionCtx *self_part = cur_partition(eng);
-    if (u.user_id == c->user_id && c->partition_open && self_part)
-        self_part->catalog.header.quota_bytes = new_quota_bytes;
+    if (u.user_id == c->user_id && c->partition_open && self_part) {
+        Catalog *self_cat = pctx_catalog(self_part);
+        if (self_cat) self_cat->header.quota_bytes = new_quota_bytes;
+    }
 
     return rc;
 }

@@ -3,6 +3,7 @@
 
 #include "schema_file.h"
 #include "storage.h"
+#include "partition.h"
 
 #include <pthread.h>
 
@@ -11,15 +12,22 @@ extern "C" {
 #endif
 
 /*
- * partition_buffer.h — Cache 2.
+ * partition_buffer.h — Cache 1 + Cache 2, unified.
  *
- * Phase 2 of the PartitionBuffer redesign (PARTITION_BUFFER_DESIGN.md §1-§8):
- * an 8-slot outer LRU of schemas (unchanged count from v2/Phase 1), each
- * holding a real evictable 32-of-64 inner LRU cache of RelationDef pages —
- * not the old flat, fully-resident SchemaFile.defs[] array.
+ * Phase 4 of the PartitionBuffer redesign (PARTITION_BUFFER_DESIGN.md §1)
+ * folds the partition catalog (__catalog.mydb, formerly a standalone
+ * `Catalog` field on PartitionCtx) into PartitionBuffer as PB[0] — a 9th
+ * outer slot, never evicted, no inner LRU. PB[1..8] are the 8 schema
+ * slots Phases 1-3 already built: a real evictable 32-of-64 inner LRU
+ * cache of RelationDef pages, not the old flat, fully-resident
+ * SchemaFile.defs[] array.
  *
  *   PartitionBuffer
- *     PBOuterSlot[8]        one per cached schema, outer LRU
+ *     PBCatalogSlot            PB[0] — __catalog.mydb, never evicted
+ *       Catalog cat              header + schemas[] directory
+ *       is_dirty/fpi_pending     write-back state (§5) — no pin_count,
+ *                                nothing ever evicts this slot
+ *     PBOuterSlot[8]        PB[1..8], one per cached schema, outer LRU
  *       SchemaFile *sf        header + relations[] directory only now
  *                              (RelationDef pages moved out — see below)
  *       PBFrameDirEntry dir[32]   forward lookup: page_no -> inner[] index
@@ -29,6 +37,8 @@ extern "C" {
  *                                 for this slot — real pthread_mutex_t,
  *                                 built now even though nothing races under
  *                                 today's single-threaded execution (§7)
+ *     catalog_latch          protects PB[0]'s Catalog + dirty flag — same
+ *                             precedent as each PBOuterSlot's own latch
  *
  * Outer eviction (pb_get, §7): two-pass per candidate — check every inner
  * frame for pin_count > 0 under the slot's latch (abort this candidate,
@@ -36,7 +46,8 @@ extern "C" {
  * Fail-fast (return NULL) if every outer slot has a pinned inner frame,
  * matching bp_fetch_page's convention — never force-wait (see §7's
  * rationale: under single-threaded execution nothing could ever release
- * the pin we'd be waiting on).
+ * the pin we'd be waiting on). PB[0] is never a candidate — it isn't in
+ * slots[], §7 never sees it.
  *
  * Inner lazy-load/eviction (pb_pin_relation, §8): walks the inner LRU from
  * the tail; the first frame that's either empty or unpinned-and-evictable
@@ -79,20 +90,62 @@ typedef struct {
     pthread_mutex_t  latch;
 } PBOuterSlot;
 
+/* PB[0] — the partition catalog. Never evicted, no inner LRU, so no
+ * pin_count (nothing ever needs protecting from reclaiming it). Mirrors
+ * PBOuterSlot's page0_dirty/write-back shape but scoped to just the one
+ * fixed Catalog page. See PARTITION_BUFFER_DESIGN.md §1/§3. */
+typedef struct {
+    Catalog cat;
+    uint8_t is_dirty;
+    uint8_t fpi_pending;   /* unread until WAL integration, same as inner frames */
+} PBCatalogSlot;
+
 /* Named struct tag so partition_ctx.h can forward-declare it as
  * `struct PartitionBuffer` without including this header. */
 typedef struct PartitionBuffer {
-    PBOuterSlot slots[PARTITION_BUFFER_SLOTS];
-    int         lru_order[PARTITION_BUFFER_SLOTS]; /* [0]=MRU slot idx, [n_loaded-1]=LRU */
-    int         n_loaded;
+    PBCatalogSlot   catalog;                       /* PB[0] */
+    PBOuterSlot     slots[PARTITION_BUFFER_SLOTS];  /* PB[1..8] */
+    int             lru_order[PARTITION_BUFFER_SLOTS]; /* [0]=MRU slot idx, [n_loaded-1]=LRU */
+    int             n_loaded;
+    pthread_mutex_t catalog_latch;   /* protects catalog.cat + dirty flag */
 } PartitionBuffer;
+
+/* ------------------------------------------------------------------ */
+/*  Catalog (PB[0])                                                     */
+/* ------------------------------------------------------------------ */
+
+/* Open path's __catalog.mydb into PB[0] (wraps cat_open). Must be called
+ * after pb_init and before pb_catalog/pb_mark_catalog_dirty/etc. return
+ * anything meaningful — mirrors pctx_open_catalog's old direct cat_open
+ * call. */
+int pb_open_catalog(PartitionBuffer *pb, const char *path);
+
+/* Return &pb->catalog.cat, or NULL if it isn't open (fd < 0). */
+Catalog *pb_catalog(PartitionBuffer *pb);
+
+/* Mark PB[0] dirty. Called by pm_api.c after cat_track_alloc succeeds —
+ * cat_track_alloc no longer persists internally (Phase 4). */
+void pb_mark_catalog_dirty(PartitionBuffer *pb);
+
+/* Flush PB[0]'s dirty state to disk (cat_save) if dirty; clears the flag
+ * on success. Used by pm_commit (before the existing fsync), by DDL call
+ * sites that need immediate durability (pm_create_table/pm_drop_table/
+ * pm_add_index/pm_drop_schema — no autocommit wrapper to defer to), and
+ * by pb_flush_all (shutdown safety net). */
+int pb_flush_catalog_dirty(PartitionBuffer *pb);
+
+/* Discard PB[0]'s dirty state without persisting: re-read from disk
+ * (cat_open-style) if dirty, clears the flag. Used by pm_rollback — the
+ * PB[0] counterpart to pb_discard_slot_dirty. */
+int pb_discard_catalog_dirty(PartitionBuffer *pb);
 
 /* ------------------------------------------------------------------ */
 /*  Outer slot (Cache 2) — schema-level                                */
 /* ------------------------------------------------------------------ */
 
-/* Initialise all slots empty and their latches. Must be called before any
- * other pb_* function. */
+/* Initialise all slots empty (PB[0]'s Catalog.fd = -1, PB[1..8] empty)
+ * and every latch (catalog_latch + the 8 per-slot latches). Must be
+ * called before any other pb_* function. */
 int pb_init(PartitionBuffer *pb);
 
 /* Return a pointer to the MRU SchemaFile, or NULL if the cache is empty. */
@@ -104,15 +157,17 @@ const char *pb_active_schema_name(const PartitionBuffer *pb);
 /* Flush all dirty pages in the buffer pool for every cached schema, and
  * (Phase 3) every outer slot's dirty metadata (page0_dirty + any dirty
  * inner frames, via pb_flush_slot_dirty). se is the StorageEngine owned
- * by the same PartitionCtx. Does not close any SchemaFile handles. Used
- * as the final shutdown safety net (pctx_close) — the per-statement path
- * for metadata is pm_commit/pm_rollback, not this. */
+ * by the same PartitionCtx, and (Phase 4) PB[0]'s dirty Catalog state via
+ * pb_flush_catalog_dirty. Does not close any SchemaFile/Catalog handles.
+ * Used as the final shutdown safety net (pctx_close) — the per-statement
+ * path for metadata is pm_commit/pm_rollback, not this. */
 int pb_flush_all(PartitionBuffer *pb, StorageEngine *se);
 
-/* Close all open SchemaFile handles, free them, and destroy every slot's
- * latch. Safe to call on a partially-initialised PartitionBuffer
- * (n_loaded=0 is a no-op for the SchemaFile side; latches are always
- * destroyed since pb_init always initialises them). */
+/* Close all open SchemaFile handles and PB[0]'s Catalog, free the
+ * SchemaFile handles, and destroy every latch (catalog_latch + the 8
+ * per-slot latches). Safe to call on a partially-initialised
+ * PartitionBuffer (n_loaded=0 / catalog.cat.fd=-1 are no-ops; latches are
+ * always destroyed since pb_init always initialises them). */
 void pb_destroy(PartitionBuffer *pb);
 
 /* Full outer LRU get (§7). Returns the cached or newly-opened SchemaFile

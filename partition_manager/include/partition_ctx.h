@@ -18,8 +18,11 @@ extern "C" {
  *
  * PartitionCtx owns everything that belongs to one active partition:
  *   - StorageEngine storage : stateless I/O layer (BufferPool + OpenTableCache)
- *   - Catalog        catalog : Cache 1 — __catalog.mydb (quota, schema list)
- *   - PartitionBuffer*       : Cache 2 — LRU of open SchemaFile handles
+ *   - PartitionBuffer*       : Cache 1 + Cache 2, unified (PARTITION_BUFFER_DESIGN.md
+ *                              §1) — PB[0] is the catalog (__catalog.mydb, quota +
+ *                              schema list), PB[1..8] are the LRU of open
+ *                              SchemaFile handles. Phase 4 folded the old standalone
+ *                              `Catalog catalog` field into this — see pctx_catalog().
  *   - TransactionManager     : promoted from StorageState; WAL owner post-WAL
  *   - SubConnPool            : slice of the engine's master ConnectionPool
  *
@@ -29,9 +32,9 @@ extern "C" {
  *         one instance per simultaneously active partition.
  *
  * Engine lifecycle:
- *   ctx = pctx_init(partition_id, path)  → heap-alloc + init storage + catalog
- *   pctx_open_catalog(ctx)               → open __catalog.mydb
- *   pctx_open_schema(ctx, name, path)    → open schema into Cache 2
+ *   ctx = pctx_init(partition_id, path)  → heap-alloc + init storage + PartitionBuffer
+ *   pctx_open_catalog(ctx)               → open __catalog.mydb into PB[0]
+ *   pctx_open_schema(ctx, name, path)    → open schema into Cache 2 (PB[1..8])
  *   pctx_close(ctx)                      → flush, close schema cache + catalog,
  *                                          shutdown storage
  *   free(ctx)                            → caller frees the PartitionCtx
@@ -62,10 +65,10 @@ typedef struct PartitionCtx {
      * All storage_* calls pass &ctx->storage explicitly. */
     StorageEngine    storage;
 
-    Catalog          catalog;       /* Cache 1: __catalog.mydb */
-
-    /* Cache 2: heap-allocated PartitionBuffer (LRU of SchemaFile handles).
-     * Allocated by pctx_init, freed by pctx_close. */
+    /* Cache 1 (PB[0], __catalog.mydb) + Cache 2 (PB[1..8], LRU of
+     * SchemaFile handles) — unified since Phase 4. Heap-allocated;
+     * allocated by pctx_init, freed by pctx_close. Access the catalog via
+     * pctx_catalog(), not this field directly. */
     PartitionBuffer *schema_cache;
 
     TransactionManager txn_mgr;    /* promoted from StorageState; WAL owner post-WAL */
@@ -89,9 +92,14 @@ typedef struct PartitionCtx {
  * Caller frees with:  pctx_close(ctx);  free(ctx); */
 PartitionCtx *pctx_init(uint32_t partition_id, const char *partition_path);
 
-/* Open __catalog.mydb into ctx->catalog.
+/* Open __catalog.mydb into the schema cache's PB[0] slot.
  * Returns MYDB_OK or MYDB_ERR_* on I/O failure. */
 int pctx_open_catalog(PartitionCtx *ctx);
+
+/* Return the partition's Catalog (PB[0]), or NULL if not open (fd < 0) or
+ * ctx is NULL. Companion to pctx_active_schema()/pctx_active_outer_slot() —
+ * pm_api.c uses this instead of a direct ctx->catalog field (Phase 4). */
+Catalog *pctx_catalog(PartitionCtx *ctx);
 
 /* Flush all dirty pages (via ctx->storage), close all SchemaFile handles,
  * free the PartitionBuffer, close the catalog, and call storage_shutdown.

@@ -109,16 +109,71 @@ int pb_init(PartitionBuffer *pb)
 {
     if (!pb) return MYDB_ERR;
     memset(pb, 0, sizeof(*pb));   /* all slots[].sf = NULL, n_loaded = 0 */
+    pb->catalog.cat.fd = -1;
+
+    if (pthread_mutex_init(&pb->catalog_latch, NULL) != 0) return MYDB_ERR;
+
     for (int i = 0; i < PARTITION_BUFFER_SLOTS; i++) {
         if (pthread_mutex_init(&pb->slots[i].latch, NULL) != 0) {
             for (int j = 0; j < i; j++)
                 pthread_mutex_destroy(&pb->slots[j].latch);
+            pthread_mutex_destroy(&pb->catalog_latch);
             return MYDB_ERR;
         }
         for (int f = 0; f < PB_INNER_SLOTS; f++)
             pb->slots[i].inner_lru_order[f] = f;
     }
     return MYDB_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Catalog (PB[0])                                                     */
+/* ------------------------------------------------------------------ */
+
+int pb_open_catalog(PartitionBuffer *pb, const char *path)
+{
+    if (!pb || !path) return MYDB_ERR;
+    return cat_open(path, &pb->catalog.cat);
+}
+
+Catalog *pb_catalog(PartitionBuffer *pb)
+{
+    if (!pb || pb->catalog.cat.fd < 0) return NULL;
+    return &pb->catalog.cat;
+}
+
+void pb_mark_catalog_dirty(PartitionBuffer *pb)
+{
+    if (!pb) return;
+    pthread_mutex_lock(&pb->catalog_latch);
+    pb->catalog.is_dirty = 1;
+    pthread_mutex_unlock(&pb->catalog_latch);
+}
+
+int pb_flush_catalog_dirty(PartitionBuffer *pb)
+{
+    if (!pb || pb->catalog.cat.fd < 0) return MYDB_ERR;
+    pthread_mutex_lock(&pb->catalog_latch);
+    int rc = MYDB_OK;
+    if (pb->catalog.is_dirty) {
+        rc = cat_save(&pb->catalog.cat);
+        if (rc == MYDB_OK) pb->catalog.is_dirty = 0;
+    }
+    pthread_mutex_unlock(&pb->catalog_latch);
+    return rc;
+}
+
+int pb_discard_catalog_dirty(PartitionBuffer *pb)
+{
+    if (!pb || pb->catalog.cat.fd < 0) return MYDB_ERR;
+    pthread_mutex_lock(&pb->catalog_latch);
+    int rc = MYDB_OK;
+    if (pb->catalog.is_dirty) {
+        rc = cat_reload(&pb->catalog.cat);
+        if (rc == MYDB_OK) pb->catalog.is_dirty = 0;
+    }
+    pthread_mutex_unlock(&pb->catalog_latch);
+    return rc;
 }
 
 SchemaFile *pb_active_schema(PartitionBuffer *pb)
@@ -144,6 +199,8 @@ int pb_flush_all(PartitionBuffer *pb, StorageEngine *se)
     storage_flush_all_dirty(se);
 
     int rc = MYDB_OK;
+    if (pb->catalog.cat.fd >= 0) rc = pb_flush_catalog_dirty(pb);
+
     for (int i = 0; i < PARTITION_BUFFER_SLOTS; i++) {
         if (!pb->slots[i].sf) continue;
         int frc = pb_flush_slot_dirty(&pb->slots[i]);
@@ -155,6 +212,10 @@ int pb_flush_all(PartitionBuffer *pb, StorageEngine *se)
 void pb_destroy(PartitionBuffer *pb)
 {
     if (!pb) return;
+
+    if (pb->catalog.cat.fd > 0) cat_close(&pb->catalog.cat);
+    pthread_mutex_destroy(&pb->catalog_latch);
+
     for (int i = 0; i < PARTITION_BUFFER_SLOTS; i++) {
         PBOuterSlot *s = &pb->slots[i];
         if (s->sf) {

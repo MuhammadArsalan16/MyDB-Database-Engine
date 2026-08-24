@@ -563,9 +563,10 @@ int exec_show_databases(ExecContext *ectx,
     TableBuilder tb;
     tb.set_headers({"Database"});
 
-    for (int i = 0; i < MAX_SCHEMAS_PER_PARTITION; i++) {
-        if (!ectx->partition->catalog.schemas[i].is_valid) continue;
-        tb.add_row({ectx->partition->catalog.schemas[i].schema_name});
+    const Catalog *cat = pctx_catalog(ectx->partition);
+    for (int i = 0; cat && i < MAX_SCHEMAS_PER_PARTITION; i++) {
+        if (!cat->schemas[i].is_valid) continue;
+        tb.add_row({cat->schemas[i].schema_name});
     }
 
     tb.render(rb);
@@ -1196,7 +1197,8 @@ int exec_describe_partition(ExecContext *ectx,
     REQUIRE_LOGIN(ectx);
     REQUIRE_PARTITION(ectx);   /* analysts may not inspect partition metadata */
 
-    const Catalog       *cat = &ectx->partition->catalog;
+    const Catalog       *cat = pctx_catalog(ectx->partition);
+    if (!cat) return MYDB_ERR_PERM;
     const CatalogHeader *hdr = &cat->header;
 
     ResultBuf rb(out, cap);
