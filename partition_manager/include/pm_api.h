@@ -138,6 +138,19 @@ RelationDef *pm_find_relation(PartitionCtx *ctx, const char *relation_name);
 const RelationDef *pm_find_relation_const(PartitionCtx *ctx,
                                            const char *relation_name);
 
+/* Release a RelationDef* previously returned by pm_find_relation()/
+ * pm_find_relation_const() — decrements the owning SchemaFile slot's
+ * pin_count (clamped at 0; a no-op if already released).
+ *
+ * Phase 1 of the PartitionBuffer redesign (PARTITION_BUFFER_DESIGN.md):
+ * pin_count is inert bookkeeping only right now — nothing yet evicts or
+ * gates on it — but every pm_find_relation_const() call must be matched
+ * by exactly one of these so the discipline is proven leak-free before
+ * later phases make a leaked pin load-bearing. In C++ callers, prefer
+ * the RelationGuard RAII wrapper (execution_engine/include/relation_guard.hpp)
+ * over calling this directly. */
+int pm_release_relation(PartitionCtx *ctx, const RelationDef *rel);
+
 #ifdef __cplusplus
 }
 #endif

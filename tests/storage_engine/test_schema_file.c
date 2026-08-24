@@ -274,6 +274,44 @@ static void test_remove_and_reuse(void)
     schema_close(&sf);
 }
 
+/* Phase 1 of the PartitionBuffer redesign (PARTITION_BUFFER_DESIGN.md):
+ * pin_count[] must not leak a stale nonzero count across slot reuse — a
+ * relation dropped while (incorrectly) still "pinned" must not poison the
+ * unrelated relation that later reuses its slot. */
+static void test_pin_count_reset_on_reuse(void)
+{
+    printf("\n[test_pin_count_reset_on_reuse]\n");
+    cleanup();
+
+    SchemaFile sf;
+    schema_create(TEST_FILE, TEST_PID, TEST_NAME, &sf);
+
+    RelationDef a = make_simple_def("alpha");
+    schema_add_relation(&sf, &a);
+    RelationDef *pa = schema_find_relation(&sf, "alpha");
+    int slot = (int)(pa - sf.defs);
+
+    CHECK(sf.pin_count[slot] == 0, "pin_count starts at 0 on add");
+
+    /* Simulate a leaked pin against this slot, then remove the relation
+     * anyway (schema_file.c has no notion of pins — pm_api.c is what
+     * would normally refuse this; this test only exercises schema_file's
+     * own responsibility: resetting the counter on slot reuse). */
+    sf.pin_count[slot] = 3;
+    CHECK(schema_remove_relation(&sf, "alpha") == MYDB_OK, "remove succeeds");
+    CHECK(sf.pin_count[slot] == 0, "pin_count reset by removal");
+
+    RelationDef b = make_simple_def("beta");
+    CHECK(schema_add_relation(&sf, &b) == MYDB_OK, "reuse: add succeeds");
+    RelationDef *pb = schema_find_relation(&sf, "beta");
+    int slot_b = (int)(pb - sf.defs);
+    CHECK(slot_b == slot, "reuse landed on the freed slot (lowest-free policy)");
+    CHECK(sf.pin_count[slot_b] == 0,
+          "unrelated new relation does not inherit the old leaked pin_count");
+
+    schema_close(&sf);
+}
+
 static void test_remove_missing(void)
 {
     printf("\n[test_remove_missing]\n");
@@ -590,6 +628,7 @@ int main(void)
     test_add_duplicate_rejected();
     test_full_capacity();
     test_remove_and_reuse();
+    test_pin_count_reset_on_reuse();
     test_remove_missing();
 
     test_persistence_round_trip();

@@ -47,6 +47,13 @@ typedef struct {
     SchemaHeader  header;
     RelationEntry relations[MAX_RELATIONS_PER_SCHEMA];
     RelationDef   defs[MAX_RELATIONS_PER_SCHEMA];
+    /* Phase 1 of the PartitionBuffer redesign (PARTITION_BUFFER_DESIGN.md):
+     * pin_count[i] tracks outstanding pm_find_relation_const()/
+     * pm_release_relation() holds on defs[i], parallel-indexed with
+     * relations[]/defs[]. Inert bookkeeping only — nothing reads or gates
+     * on it yet; real eviction (and thus a reason to consult it) lands in
+     * a later phase. */
+    uint16_t      pin_count[MAX_RELATIONS_PER_SCHEMA];
     int           fd;                 /* open fd; -1 when closed */
     char          path[256];
 } SchemaFile;

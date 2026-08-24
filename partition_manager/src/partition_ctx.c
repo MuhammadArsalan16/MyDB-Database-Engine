@@ -145,3 +145,21 @@ int pctx_evict_schema(PartitionCtx *ctx, const char *schema_name)
         ctx->current_schema_name[0] = '\0';
     return pb_remove(ctx->schema_cache, schema_name);
 }
+
+/* Debug-only Phase 1 pin/release leak check — see partition_ctx.h. Walks
+ * every occupied outer slot (not just the active schema) since a pin taken
+ * against a schema that was active earlier in the same statement, then
+ * switched away from, would otherwise go unchecked. */
+int pctx_debug_no_pinned_relations(const PartitionCtx *ctx)
+{
+    if (!ctx || !ctx->schema_cache) return 1;
+
+    for (int i = 0; i < PARTITION_BUFFER_SLOTS; i++) {
+        const SchemaFile *sf = ctx->schema_cache->slots[i];
+        if (!sf) continue;
+        for (int j = 0; j < MAX_RELATIONS_PER_SCHEMA; j++) {
+            if (sf->pin_count[j] != 0) return 0;
+        }
+    }
+    return 1;
+}

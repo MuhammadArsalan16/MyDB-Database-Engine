@@ -19,6 +19,7 @@
 #include "expr_eval.hpp"
 #include "planner.h"    /* planner_choose_path, Sarg, PlanNode — extern "C" guards inside */
 #include "exec_access_path.hpp" /* AccessPath, AP_*, extract_sargs, plan_to_ap — shared with dml.cpp */
+#include "relation_guard.hpp"
 
 #include <algorithm>
 #include <map>
@@ -659,10 +660,22 @@ static int exec_group_by(ExecContext           *ectx,
  * is applied once at the end over the fully combined row.
  * ====================================================================== */
 
-/* One table participating in the join. */
+/* One table participating in the join.
+ *
+ * Owns a RelationGuard so the RelationDef* pinned via pm_find_relation_const()
+ * (Phase 1 pin/release discipline, PARTITION_BUFFER_DESIGN.md) is released
+ * automatically when this segment is destroyed — whether that's a normal
+ * return, an early error return with segs[] only partially populated, or
+ * segs[] fully built. `rel` stays a plain non-owning alias of guard.get()
+ * so the existing segs[i].rel read sites throughout this file need no
+ * changes. */
 struct JoinSeg {
-    const RelationDef *rel;
-    std::string        label;   /* alias if given, else relation_name */
+    RelationGuard       guard;
+    const RelationDef  *rel;
+    std::string         label;   /* alias if given, else relation_name */
+
+    JoinSeg(PartitionCtx *ctx, const RelationDef *r, std::string lbl)
+        : guard(ctx, r), rel(r), label(std::move(lbl)) {}
 };
 
 /* One fold step: add segs[right_seg] to the accumulated result. */
@@ -1168,7 +1181,7 @@ static int exec_join_select(ExecContext *ectx, const SelectStatement *s,
                      fi.table_name.c_str());
             return MYDB_ERR_NOT_FOUND;
         }
-        segs.push_back({ r, fi.alias.empty() ? std::string(r->relation_name) : fi.alias });
+        segs.emplace_back(pc, r, fi.alias.empty() ? std::string(r->relation_name) : fi.alias);
     }
     int first_join_seg = (int)segs.size();
     for (const auto &jc : s->join_list) {
@@ -1178,8 +1191,8 @@ static int exec_join_select(ExecContext *ectx, const SelectStatement *s,
                      jc.join_table.c_str());
             return MYDB_ERR_NOT_FOUND;
         }
-        segs.push_back({ r, jc.join_table_alias.empty()
-                            ? std::string(r->relation_name) : jc.join_table_alias });
+        segs.emplace_back(pc, r, jc.join_table_alias.empty()
+                                 ? std::string(r->relation_name) : jc.join_table_alias);
     }
 
     /* ---- Build the fold steps ---- */
@@ -1519,13 +1532,18 @@ int exec_select(ExecContext *ectx, const SelectStatement *s,
         return rc;
     }
 
-    const RelationDef *rel = pm_find_relation_const(ectx->partition, s->from_list[0].table_name.c_str());
+    RelationGuard rel_guard(ectx->partition,
+        pm_find_relation_const(ectx->partition, s->from_list[0].table_name.c_str()));
+    const RelationDef *rel = rel_guard.get();
     if (!rel) {
         snprintf(out, cap, "  Error: table '%s' does not exist",
                  s->from_list[0].table_name.c_str());
         return MYDB_ERR_NOT_FOUND;
     }
     RelationDef *rel_rw = (RelationDef *)rel;   /* storage API takes non-const */
+    /* rel_guard lives in this frame and outlives the exec_group_by(...) tail
+     * call below — its destructor fires only once exec_select itself returns,
+     * after exec_group_by has already finished. */
 
     /* ------------------------------------------------------------------
      * Step 2: validate projection columns.

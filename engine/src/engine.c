@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
+#include <assert.h>
 
 
 /* ====================================================================
@@ -1057,6 +1058,13 @@ int engine_execute_sql(EngineState *eng, int conn_id, const char *sql,
 
     rc = exec_engine_execute(&ectx, ast, result_out, result_cap);
     parser_free_ast(ast);
+
+    /* Phase 1 pin/release discipline leak check (PARTITION_BUFFER_DESIGN.md) —
+     * every pm_find_relation_const() taken during this statement must have
+     * been released (via a RelationGuard or a direct pm_release_relation())
+     * by the time the statement is done, on both the success and error path.
+     * A no-op in NDEBUG builds. */
+    assert(pctx_debug_no_pinned_relations(part));
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
 

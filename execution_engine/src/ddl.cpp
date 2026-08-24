@@ -15,6 +15,7 @@
 #include "result_fmt.hpp"
 #include "value_cast.hpp"
 #include "stats.h"
+#include "relation_guard.hpp"
 
 #include <cstring>
 #include <cstdio>
@@ -361,7 +362,9 @@ int exec_create_table(ExecContext *ectx, const CreateTableStatement *s,
         }
 
         /* (2) Referenced table must exist in the active schema. */
-        const RelationDef *ref_rel = pm_find_relation_const(ectx->partition, fk.ref_table.c_str());
+        RelationGuard ref_rel_guard(ectx->partition,
+                                     pm_find_relation_const(ectx->partition, fk.ref_table.c_str()));
+        const RelationDef *ref_rel = ref_rel_guard.get();
         if (!ref_rel) {
             snprintf(out, cap,
                      "  Error: FOREIGN KEY references unknown table '%s'",
@@ -433,7 +436,9 @@ int exec_create_index(ExecContext *ectx, const CreateIndexStatement *s,
     REQUIRE_SCHEMA(ectx);
 
     /* Resolve the table */
-    const RelationDef *rel = pm_find_relation_const(ectx->partition, s->table_name.c_str());
+    RelationGuard rel_guard(ectx->partition,
+                             pm_find_relation_const(ectx->partition, s->table_name.c_str()));
+    const RelationDef *rel = rel_guard.get();
     if (!rel) {
         snprintf(out, cap, "  Error: table '%s' does not exist",
                  s->table_name.c_str());
@@ -492,7 +497,9 @@ int exec_drop_table(ExecContext *ectx, const DropTableStatement *s,
     REQUIRE_LOGIN(ectx);
     REQUIRE_SCHEMA(ectx);
 
-    const RelationDef *rel = pm_find_relation_const(ectx->partition, s->table_name.c_str());
+    RelationGuard rel_guard(ectx->partition,
+                             pm_find_relation_const(ectx->partition, s->table_name.c_str()));
+    const RelationDef *rel = rel_guard.get();
     if (!rel) {
         snprintf(out, cap, "  Error: table '%s' does not exist",
                  s->table_name.c_str());
@@ -699,7 +706,9 @@ int exec_analyze_table(ExecContext *ectx, const AnalyzeTableStatement *s,
     REQUIRE_LOGIN(ectx);
     REQUIRE_SCHEMA(ectx);
 
-    const RelationDef *rel = pm_find_relation_const(ectx->partition, s->table_name.c_str());
+    RelationGuard rel_guard(ectx->partition,
+                             pm_find_relation_const(ectx->partition, s->table_name.c_str()));
+    const RelationDef *rel = rel_guard.get();
     if (!rel) {
         snprintf(out, cap, "  Error: table '%s' does not exist",
                  s->table_name.c_str());
@@ -919,7 +928,9 @@ int exec_describe_table(ExecContext *ectx,
     REQUIRE_LOGIN(ectx);
     REQUIRE_SCHEMA(ectx);
 
-    const RelationDef *rel = pm_find_relation_const(ectx->partition, s->table_name.c_str());
+    RelationGuard rel_guard(ectx->partition,
+                             pm_find_relation_const(ectx->partition, s->table_name.c_str()));
+    const RelationDef *rel = rel_guard.get();
     if (!rel) {
         snprintf(out, cap, "  Error: Table '%s' not found in schema '%s'",
                  s->table_name.c_str(), ectx->conn->current_schema_name);

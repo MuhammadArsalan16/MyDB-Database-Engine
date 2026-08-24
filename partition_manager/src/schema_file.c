@@ -628,6 +628,10 @@ int schema_remove_relation(SchemaFile *sf, const char *relation_name)
 
     memset(&sf->relations[slot], 0, sizeof(sf->relations[slot]));
     memset(&sf->defs[slot],      0, sizeof(sf->defs[slot]));
+    /* A future schema_add_relation() may reuse this slot for an unrelated
+     * relation — without this reset it would inherit a stale pin_count
+     * from whatever previously lived here. */
+    sf->pin_count[slot] = 0;
     if (sf->header.num_relations > 0) sf->header.num_relations--;
     sf->header.size_bytes = schema_compute_size_bytes(sf);
 

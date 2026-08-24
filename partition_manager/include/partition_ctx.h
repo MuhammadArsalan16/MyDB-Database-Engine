@@ -127,6 +127,17 @@ SchemaFile *pctx_active_schema(PartitionCtx *ctx);
 /* Return the active schema's name, or NULL if no schema is open. */
 const char *pctx_active_schema_name(const PartitionCtx *ctx);
 
+/* Debug-only leak check for the Phase 1 pin/release discipline
+ * (PARTITION_BUFFER_DESIGN.md, pm_find_relation_const()/pm_release_relation()):
+ * returns 1 if every SchemaFile currently held in this partition's schema
+ * cache has pin_count[i] == 0 for every slot, 0 if any slot is still
+ * pinned. Intended for `assert(pctx_debug_no_pinned_relations(ctx))` right
+ * after a statement finishes — a failure here means some pm_find_relation_const()
+ * call site is missing its matching release (a RelationGuard going out of
+ * scope, or a direct pm_release_relation() call). Safe to call with a NULL
+ * or partially-initialised ctx (returns 1 — nothing to leak). */
+int pctx_debug_no_pinned_relations(const PartitionCtx *ctx);
+
 #ifdef __cplusplus
 }
 #endif
