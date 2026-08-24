@@ -48,19 +48,25 @@ typedef struct {
                                         * copy — read here, not by opening the .mydb file. */
 } RelationEntry;
 
-/* In-memory schema file representation. relations[i] and defs[i] are
- * parallel arrays — defs[i] is meaningful only when relations[i].is_valid. */
+/* In-memory schema file representation — Page 0 only (header + relation
+ * directory). This is exactly what PB[X][0] is (PARTITION_BUFFER_DESIGN.md
+ * §2): always resident whenever the outer slot is loaded, never itself
+ * evicted independently.
+ *
+ * Phase 2 of the PartitionBuffer redesign moved RelationDef storage OFF
+ * this struct entirely — `defs[]` and Phase 1's `pin_count[]` used to live
+ * here, parallel-indexed with `relations[]`. They don't anymore: RelationDef
+ * pages are now a real evictable 32-of-64 cache owned by `PartitionBuffer`
+ * (`PBOuterSlot.inner[]`/`dir[]`/`pin_count`, partition_buffer.h) — up to 64
+ * relations can exist (`relations[]` below still covers all of them, it's
+ * small and always fully resident), but only 32 of their RelationDefs are
+ * ever loaded in memory at once. `schema_find_relation()` — which used to
+ * hand back `&defs[slot]` — is gone with it; resolving a RelationDef* now
+ * goes through PartitionBuffer's lazy-load path (pm_find_relation), not
+ * SchemaFile. */
 typedef struct {
     SchemaHeader  header;
     RelationEntry relations[MAX_RELATIONS_PER_SCHEMA];
-    RelationDef   defs[MAX_RELATIONS_PER_SCHEMA];
-    /* Phase 1 of the PartitionBuffer redesign (PARTITION_BUFFER_DESIGN.md):
-     * pin_count[i] tracks outstanding pm_find_relation_const()/
-     * pm_release_relation() holds on defs[i], parallel-indexed with
-     * relations[]/defs[]. Inert bookkeeping only — nothing reads or gates
-     * on it yet; real eviction (and thus a reason to consult it) lands in
-     * a later phase. */
-    uint16_t      pin_count[MAX_RELATIONS_PER_SCHEMA];
     int           fd;                 /* open fd; -1 when closed */
     char          path[256];
 } SchemaFile;
@@ -77,8 +83,9 @@ int schema_create(const char *path, uint32_t partition_id, uint32_t schema_id,
                   const char *schema_name, SchemaFile *out);
 
 /* Open an existing __schema.mydb. Verifies magic, version, file type,
- * and Page 0 checksum. Loads the slot directory and every valid
- * relation's RelationDef page into memory. */
+ * and Page 0 checksum. Loads the slot directory only — RelationDef pages
+ * are no longer eagerly loaded (Phase 2: they're lazy-loaded on demand
+ * into PartitionBuffer's inner cache, see pm_find_relation). */
 int schema_open(const char *path, SchemaFile *out);
 
 /* Close the file descriptor. Caller is responsible for saving any
@@ -98,22 +105,39 @@ int schema_save_page0(SchemaFile *sf);
  * lowest free def page (1..SCHEMA_FILE_PAGES-1), serializes def to that
  * page, marks the slot valid, persists the def page and Page 0.
  * Rejects duplicate relation_name. Returns MYDB_ERR_FULL when no slot
- * is free. */
+ * is free. Does not populate any cache — the caller (PartitionBuffer)
+ * lazy-loads on next access same as any other relation. */
 int schema_add_relation(SchemaFile *sf, const RelationDef *def);
 
 /* Remove a relation by name: zeroes the def page on disk, clears the
- * slot, persists Page 0. Returns MYDB_ERR_NOT_FOUND if absent. */
+ * slot, persists Page 0. Returns MYDB_ERR_NOT_FOUND if absent. Caller
+ * (pm_drop_table) is responsible for invalidating any cached inner frame
+ * for this relation's page_no in PartitionBuffer — schema_file.c has no
+ * visibility into PartitionBuffer, by design (see relation_def.h's
+ * layering note). */
 int schema_remove_relation(SchemaFile *sf, const char *relation_name);
 
-/* Linear lookups. Pointers are valid for the lifetime of *sf, NULL if
- * no valid slot matches. */
-RelationDef   *schema_find_relation     (SchemaFile *sf, const char *relation_name);
+/* Directory-only lookup (RelationEntry — name/page_no/table_id/stats),
+ * never evicted, no pin needed. Pointer valid for the lifetime of *sf,
+ * NULL if no valid slot matches. For the actual RelationDef content, see
+ * pm_find_relation (partition_buffer's lazy-load cache). */
 RelationEntry *schema_find_relation_stat(SchemaFile *sf, const char *relation_name);
 
-/* Re-serialize and persist the def page for an existing relation.
- * Used when a running relation's auto_incr_counter or root_page_no
- * changes. Does NOT touch Page 0. */
-int schema_flush_relation(SchemaFile *sf, const char *relation_name);
+/* Load one relation's def page from disk (page_no already known — e.g.
+ * from schema_find_relation_stat) into *out: deserializes and stamps
+ * owner_schema, same as schema_open's old eager-load loop used to do
+ * per-relation. This is the lazy-load primitive PartitionBuffer's inner
+ * cache (pb_pin_relation, partition_buffer.h) calls to populate one
+ * frame — schema_file.c holds no RelationDef cache of its own to serve
+ * this from (Phase 2). */
+int schema_load_relation_page(SchemaFile *sf, uint8_t page_no, RelationDef *out);
+
+/* Re-serialize and persist def to the relation's existing page (found by
+ * def->relation_name). Used when a running relation's auto_incr_counter
+ * or root_page_no changes. Does NOT touch Page 0. Caller passes the
+ * content directly (schema_file.c no longer holds any RelationDef data
+ * itself) — typically a PBInnerFrame.def the caller already has pinned. */
+int schema_flush_relation(SchemaFile *sf, const RelationDef *def);
 
 /* Update optimizer-stat fields (num_rows, num_pages, tree_height) on
  * the relation's slot and persist Page 0. */

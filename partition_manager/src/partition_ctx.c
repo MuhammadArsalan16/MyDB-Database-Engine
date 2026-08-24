@@ -146,7 +146,21 @@ int pctx_evict_schema(PartitionCtx *ctx, const char *schema_name)
     return pb_remove(ctx->schema_cache, schema_name);
 }
 
-/* Debug-only Phase 1 pin/release leak check — see partition_ctx.h. Walks
+/* Return the active outer slot (PBOuterSlot — dir[]/inner[]/pin_count/latch),
+ * or NULL if no schema is open. This is the Phase 2 companion to
+ * pctx_active_schema(): most callers still only need the SchemaFile*
+ * portion (relations[] directory, header) and keep using that; only the
+ * pin/release path (pm_find_relation, pm_release_relation) needs to reach
+ * the inner cache, which is why this is a separate accessor rather than a
+ * change to pctx_active_schema's return type. */
+PBOuterSlot *pctx_active_outer_slot(PartitionCtx *ctx)
+{
+    if (!ctx || !ctx->schema_cache) return NULL;
+    if (ctx->current_schema_name[0] == '\0') return NULL;
+    return pb_find_outer_slot(ctx->schema_cache, ctx->current_schema_name);
+}
+
+/* Debug-only Phase 1/2 pin/release leak check — see partition_ctx.h. Walks
  * every occupied outer slot (not just the active schema) since a pin taken
  * against a schema that was active earlier in the same statement, then
  * switched away from, would otherwise go unchecked. */
@@ -155,10 +169,10 @@ int pctx_debug_no_pinned_relations(const PartitionCtx *ctx)
     if (!ctx || !ctx->schema_cache) return 1;
 
     for (int i = 0; i < PARTITION_BUFFER_SLOTS; i++) {
-        const SchemaFile *sf = ctx->schema_cache->slots[i];
-        if (!sf) continue;
-        for (int j = 0; j < MAX_RELATIONS_PER_SCHEMA; j++) {
-            if (sf->pin_count[j] != 0) return 0;
+        const PBOuterSlot *s = &ctx->schema_cache->slots[i];
+        if (!s->sf) continue;
+        for (int j = 0; j < PB_INNER_SLOTS; j++) {
+            if (s->inner[j].pin_count != 0) return 0;
         }
     }
     return 1;

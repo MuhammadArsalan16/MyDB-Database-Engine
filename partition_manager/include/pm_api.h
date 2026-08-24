@@ -139,17 +139,31 @@ const RelationDef *pm_find_relation_const(PartitionCtx *ctx,
                                            const char *relation_name);
 
 /* Release a RelationDef* previously returned by pm_find_relation()/
- * pm_find_relation_const() — decrements the owning SchemaFile slot's
+ * pm_find_relation_const() — decrements the owning cache frame's
  * pin_count (clamped at 0; a no-op if already released).
  *
- * Phase 1 of the PartitionBuffer redesign (PARTITION_BUFFER_DESIGN.md):
- * pin_count is inert bookkeeping only right now — nothing yet evicts or
- * gates on it — but every pm_find_relation_const() call must be matched
- * by exactly one of these so the discipline is proven leak-free before
- * later phases make a leaked pin load-bearing. In C++ callers, prefer
- * the RelationGuard RAII wrapper (execution_engine/include/relation_guard.hpp)
- * over calling this directly. */
+ * Phase 2 of the PartitionBuffer redesign (PARTITION_BUFFER_DESIGN.md):
+ * pin_count now genuinely gates eviction of the 32-frame inner cache —
+ * every pm_find_relation_const() call must be matched by exactly one of
+ * these, or the frame it pinned can never be reclaimed. In C++ callers,
+ * prefer the RelationGuard RAII wrapper
+ * (execution_engine/include/relation_guard.hpp) over calling this
+ * directly. */
 int pm_release_relation(PartitionCtx *ctx, const RelationDef *rel);
+
+/* Return relation_name's slot index (0..MAX_RELATIONS_PER_SCHEMA-1) in the
+ * active schema's relations[] directory — the index StatsFile.pages[]/
+ * slot_loaded[] (stats.h) is keyed by. NOT the same thing as which of the
+ * 32 inner cache frames (if any) currently holds the relation's
+ * RelationDef — that's a transient cache position, this is the relation's
+ * stable, persistent directory slot. Replaces a pointer-arithmetic trick
+ * (`rel - schema->defs`) that only worked before Phase 2, when every
+ * relation was always resident in a flat array whose index matched the
+ * directory 1:1; it cannot work now that only 32 of up to 64 relations
+ * are ever cached at once. Returns -1 if relation_name isn't in the
+ * directory. Directory-only lookup (schema_find_relation_stat under the
+ * hood) — no pin taken, none needed. */
+int pm_relation_slot_index(PartitionCtx *ctx, const char *relation_name);
 
 #ifdef __cplusplus
 }

@@ -12,7 +12,7 @@ endforeach()
 # Their test files still live under tests/storage_engine/ (moved with git mv
 # would need an update here — for now keep the path, link partition_manager).
 set(PARTITION_MGR_TEST_MODULES
-    transaction partition schema_file pm_api)
+    transaction partition schema_file pm_api partition_buffer)
 
 foreach(mod ${PARTITION_MGR_TEST_MODULES})
     add_executable(test_${mod} storage_engine/test_${mod}.c)

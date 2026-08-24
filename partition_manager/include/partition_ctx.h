@@ -127,6 +127,11 @@ SchemaFile *pctx_active_schema(PartitionCtx *ctx);
 /* Return the active schema's name, or NULL if no schema is open. */
 const char *pctx_active_schema_name(const PartitionCtx *ctx);
 
+/* Return the active outer slot (PBOuterSlot — the Phase 2 inner cache +
+ * pin_count + latch), or NULL if no schema is open. Companion to
+ * pctx_active_schema(); see partition_ctx.c for why this is separate. */
+PBOuterSlot *pctx_active_outer_slot(PartitionCtx *ctx);
+
 /* Debug-only leak check for the Phase 1 pin/release discipline
  * (PARTITION_BUFFER_DESIGN.md, pm_find_relation_const()/pm_release_relation()):
  * returns 1 if every SchemaFile currently held in this partition's schema

@@ -13,6 +13,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Export compile commands so clangd/IDE can find include paths
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# pthread — first real threading primitive in the project, needed for
+# PartitionBuffer's per-outer-slot latch (PARTITION_BUFFER_DESIGN.md §6/§7).
+find_package(Threads REQUIRED)
+
 # Storage engine — stateless I/O layer (v3): BufferPool, BTree, Page,
 # DiskManager, RelationDef only.  No session state.
 add_subdirectory(storage_engine)

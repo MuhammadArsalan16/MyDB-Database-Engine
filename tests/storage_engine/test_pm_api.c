@@ -23,6 +23,7 @@
 #define TEST_SCHEMA_DIR  TEST_PART_DIR "/" TEST_SCHEMA_NAME
 #define TEST_SCHEMA_FILE TEST_SCHEMA_DIR "/__schema.mydb"
 #define TEST_PID         91
+#define TEST_SID         7
 
 static int tests_run    = 0;
 static int tests_passed = 0;
@@ -75,7 +76,7 @@ static PartitionCtx *setup_ctx_with_relation(const char *relation_name)
     if (!ctx) return NULL;
 
     SchemaFile sf;
-    if (schema_create(TEST_SCHEMA_FILE, TEST_PID, TEST_SCHEMA_NAME, &sf) != MYDB_OK) {
+    if (schema_create(TEST_SCHEMA_FILE, TEST_PID, TEST_SID, TEST_SCHEMA_NAME, &sf) != MYDB_OK) {
         pctx_close(ctx); free(ctx); return NULL;
     }
     RelationDef def = make_simple_def(relation_name);
@@ -111,14 +112,17 @@ static void test_find_increments_pin_count(void)
     const RelationDef *r2 = pm_find_relation_const(ctx, "orders");
     CHECK(r1 != NULL && r1 == r2, "repeated finds return the same pointer");
 
-    SchemaFile *sf   = pctx_active_schema(ctx);
-    int         slot = (int)(r1 - sf->defs);
-    CHECK(sf->pin_count[slot] == 2, "pin_count incremented once per find");
+    /* Phase 2: pin_count lives on PBInnerFrame now, not SchemaFile. def is
+     * the first member of PBInnerFrame, so this cast recovers the frame
+     * (same technique pb_unpin_relation itself uses internally). */
+    PBOuterSlot *outer = pctx_active_outer_slot(ctx);
+    int          frame = (int)((const PBInnerFrame *)r1 - outer->inner);
+    CHECK(outer->inner[frame].pin_count == 2, "pin_count incremented once per find");
     CHECK(!pctx_debug_no_pinned_relations(ctx), "leak check sees the outstanding pins");
 
     pm_release_relation(ctx, r1);
     pm_release_relation(ctx, r2);
-    CHECK(sf->pin_count[slot] == 0, "pin_count back to 0 after matching releases");
+    CHECK(outer->inner[frame].pin_count == 0, "pin_count back to 0 after matching releases");
     CHECK(pctx_debug_no_pinned_relations(ctx), "clean again after releasing");
 
     teardown_ctx(ctx);
@@ -132,17 +136,17 @@ static void test_release_clamped_at_zero(void)
     if (!ctx) return;
 
     const RelationDef *r = pm_find_relation_const(ctx, "orders");
-    SchemaFile *sf   = pctx_active_schema(ctx);
-    int         slot = (int)(r - sf->defs);
+    PBOuterSlot *outer = pctx_active_outer_slot(ctx);
+    int          frame = (int)((const PBInnerFrame *)r - outer->inner);
 
     CHECK(pm_release_relation(ctx, r) == MYDB_OK, "release matching the one find");
-    CHECK(sf->pin_count[slot] == 0, "pin_count at 0");
+    CHECK(outer->inner[frame].pin_count == 0, "pin_count at 0");
 
     /* An extra release beyond what was actually pinned must clamp, not
      * underflow — pin_count is unsigned, so an unclamped decrement here
      * would wrap to 65535 instead of staying at 0. */
     CHECK(pm_release_relation(ctx, r) == MYDB_OK, "extra release does not error");
-    CHECK(sf->pin_count[slot] == 0, "pin_count clamped at 0, not underflowed");
+    CHECK(outer->inner[frame].pin_count == 0, "pin_count clamped at 0, not underflowed");
 
     teardown_ctx(ctx);
 }
