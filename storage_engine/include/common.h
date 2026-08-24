@@ -24,7 +24,7 @@
 #define MAX_ENUM_VALUES     16
 #define MAX_ENUM_STR_LEN    32
 #define MAX_TABLES          64
-#define BUFFER_POOL_SIZE    64      /* number of frames in the buffer pool */
+#define BUFFER_POOL_SIZE    4096      /* number of frames in the buffer pool, 64MB buffer pool size per partition */
 
 /* ------------------------------------------------------------------ */
 /*  Hidden system column sizes (InnoDB-style, present in every row)   */

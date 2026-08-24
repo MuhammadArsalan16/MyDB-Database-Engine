@@ -38,11 +38,10 @@ int disk_create(DiskManager *dm, const char *path)
     /* Build the file header — sizeof(FileHeader) == PAGE_SIZE due to _pad */
     FileHeader fh;
     memset(&fh, 0, sizeof(fh));
-    fh.magic        = MYDB_MAGIC;
-    fh.version      = MYDB_FORMAT_VERSION;
-    fh.num_pages    = 1;             /* only page 0 exists right now */
-    fh.root_page_no = INVALID_PAGE;  /* no B+ Tree yet */
-    fh.flags        = 0;             /* caller sets FILEHDR_FLAG_AUTO_INCREMENT if applicable */
+    file_header_write_id(&fh, FILETYPE_RELATION);
+    fh.num_pages = 1;   /* only page 0 exists right now */
+    fh.table_id  = 0;   /* caller stamps the real persistent id via disk_write_header */
+    fh.flags     = 0;   /* caller sets FILEHDR_FLAG_AUTO_INCREMENT if applicable */
 
     if (pwrite_all(fd, &fh, sizeof(fh), 0) != MYDB_OK) {
         close(fd);
@@ -69,13 +68,10 @@ int disk_open(DiskManager *dm, const char *path)
         return MYDB_ERR;
     }
 
-    if (fh.magic != MYDB_MAGIC) {   /* sanity check */
+    int idrc = file_header_check_id(&fh, FILETYPE_RELATION);
+    if (idrc != MYDB_OK) {
         close(fd);
-        return MYDB_ERR;
-    }
-    if (fh.version > MYDB_FORMAT_VERSION) {   /* reject future-format files */
-        close(fd);
-        return MYDB_ERR_BAD_VERSION;
+        return idrc;
     }
 
     snprintf(dm->path, sizeof(dm->path), "%s", path);

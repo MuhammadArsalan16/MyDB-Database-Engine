@@ -22,6 +22,10 @@
 /* SchemaHeader — Page 0 fixed prefix (72 B per design doc §8.1) */
 typedef struct {
     uint32_t partition_id;            /* which partition owns this schema */
+    uint32_t schema_id;                /* persistent identity, stamped once at
+                                         * CREATE SCHEMA via cat_alloc_schema_id;
+                                         * mirrored into the partition catalog's
+                                         * SchemaEntry.schema_id */
     char     schema_name[32];
     uint64_t created_at;              /* YYYYMMDDHHmmSS */
     uint64_t last_modified;           /* refreshed on every Page 0 save */
@@ -39,6 +43,9 @@ typedef struct {
     uint32_t num_pages;               /* persisted source of truth for size */
     uint8_t  tree_height;             /* B+ tree height (1 = root only); CBO cost input */
     uint8_t  reserved;               /* reserved for future CBO fields */
+    uint32_t table_id;                /* persistent identity; mirrors the relation
+                                        * file's own FileHeader.table_id. Catalog-level
+                                        * copy — read here, not by opening the .mydb file. */
 } RelationEntry;
 
 /* In-memory schema file representation. relations[i] and defs[i] are
@@ -63,8 +70,10 @@ typedef struct {
 /* ------------------------------------------------------------------ */
 
 /* Create a new __schema.mydb. Fails if the file already exists.
- * Pre-allocates SCHEMA_FILE_SIZE zeroed bytes and writes Page 0. */
-int schema_create(const char *path, uint32_t partition_id,
+ * Pre-allocates SCHEMA_FILE_SIZE zeroed bytes and writes Page 0.
+ * schema_id is the already-allocated persistent id (from
+ * cat_alloc_schema_id) — stamped into SchemaHeader.schema_id. */
+int schema_create(const char *path, uint32_t partition_id, uint32_t schema_id,
                   const char *schema_name, SchemaFile *out);
 
 /* Open an existing __schema.mydb. Verifies magic, version, file type,

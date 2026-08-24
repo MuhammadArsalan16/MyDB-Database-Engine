@@ -146,18 +146,21 @@ static void test_add_schema_persists(void)
     Catalog cat;
     cat_create(TEST_FILE, TEST_PID, TEST_OWNER, TEST_QUOTA, &cat);
 
-    CHECK(cat_add_schema(&cat, "mydb") == MYDB_OK, "add 'mydb' succeeds");
+    CHECK(cat_add_schema(&cat, "mydb", 1) == MYDB_OK, "add 'mydb' succeeds");
     CHECK(cat.header.num_schemas == 1,             "num_schemas = 1");
 
     SchemaEntry *s = cat_find_schema(&cat, "mydb");
     CHECK(s != NULL,                               "find returns entry");
     CHECK(s && s->is_valid,                         "is_valid is set");
+    CHECK(s && s->schema_id == 1,                   "schema_id stamped from cat_add_schema");
 
     cat_close(&cat);
 
     Catalog cat2;
     cat_open(TEST_FILE, &cat2);
-    CHECK(cat_find_schema(&cat2, "mydb") != NULL,  "schema survived reopen");
+    SchemaEntry *s2 = cat_find_schema(&cat2, "mydb");
+    CHECK(s2 != NULL,                               "schema survived reopen");
+    CHECK(s2 && s2->schema_id == 1,                 "schema_id persisted");
     CHECK(cat2.header.num_schemas == 1,             "num_schemas survived reopen");
     cat_close(&cat2);
 }
@@ -170,8 +173,8 @@ static void test_add_schema_duplicate(void)
     Catalog cat;
     cat_create(TEST_FILE, TEST_PID, TEST_OWNER, TEST_QUOTA, &cat);
 
-    CHECK(cat_add_schema(&cat, "mydb") == MYDB_OK,           "first add succeeds");
-    CHECK(cat_add_schema(&cat, "mydb") == MYDB_ERR_DUPLICATE,
+    CHECK(cat_add_schema(&cat, "mydb", 1) == MYDB_OK,           "first add succeeds");
+    CHECK(cat_add_schema(&cat, "mydb", 1) == MYDB_ERR_DUPLICATE,
           "duplicate add returns MYDB_ERR_DUPLICATE");
 
     cat_close(&cat);
@@ -189,11 +192,11 @@ static void test_add_schema_full(void)
     for (int i = 0; i < MAX_SCHEMAS_PER_PARTITION; i++) {
         char name[32];
         snprintf(name, sizeof(name), "schema_%d", i);
-        if (cat_add_schema(&cat, name) != MYDB_OK) all_ok = 0;
+        if (cat_add_schema(&cat, name, (uint32_t)(i + 1)) != MYDB_OK) all_ok = 0;
     }
     CHECK(all_ok, "MAX_SCHEMAS_PER_PARTITION schemas added");
 
-    CHECK(cat_add_schema(&cat, "one_more") == MYDB_ERR_FULL,
+    CHECK(cat_add_schema(&cat, "one_more", 999) == MYDB_ERR_FULL,
           "next add returns MYDB_ERR_FULL");
 
     cat_close(&cat);
@@ -206,7 +209,7 @@ static void test_remove_schema(void)
 
     Catalog cat;
     cat_create(TEST_FILE, TEST_PID, TEST_OWNER, TEST_QUOTA, &cat);
-    cat_add_schema(&cat, "mydb");
+    cat_add_schema(&cat, "mydb", 1);
 
     CHECK(cat_remove_schema(&cat, "mydb") == MYDB_OK,    "remove succeeds");
     CHECK(cat_find_schema(&cat, "mydb")   == NULL,        "removed schema not findable");
@@ -240,14 +243,38 @@ static void test_remove_then_add_reuses_slot(void)
     for (int i = 0; i < MAX_SCHEMAS_PER_PARTITION; i++) {
         char name[32];
         snprintf(name, sizeof(name), "schema_%d", i);
-        cat_add_schema(&cat, name);
+        cat_add_schema(&cat, name, (uint32_t)(i + 1));
     }
     cat_remove_schema(&cat, "schema_5");
 
-    CHECK(cat_add_schema(&cat, "fresh") == MYDB_OK,
+    CHECK(cat_add_schema(&cat, "fresh", 999) == MYDB_OK,
           "add into freed slot succeeds");
 
     cat_close(&cat);
+}
+
+static void test_alloc_schema_id_increments_and_persists(void)
+{
+    printf("\n[test_alloc_schema_id_increments_and_persists]\n");
+    cleanup();
+
+    Catalog cat;
+    cat_create(TEST_FILE, TEST_PID, TEST_OWNER, TEST_QUOTA, &cat);
+
+    uint32_t id1 = 0, id2 = 0;
+    CHECK(cat_alloc_schema_id(&cat, &id1) == MYDB_OK, "first alloc succeeds");
+    CHECK(id1 == 1,                                    "first id is 1 (0 reserved)");
+    CHECK(cat_alloc_schema_id(&cat, &id2) == MYDB_OK, "second alloc succeeds");
+    CHECK(id2 == 2,                                    "second id is 2, never reused");
+
+    cat_close(&cat);
+
+    Catalog cat2;
+    cat_open(TEST_FILE, &cat2);
+    uint32_t id3 = 0;
+    CHECK(cat_alloc_schema_id(&cat2, &id3) == MYDB_OK, "alloc after reopen succeeds");
+    CHECK(id3 == 3,                            "counter survived reopen (durable)");
+    cat_close(&cat2);
 }
 
 static void test_find_schema_miss(void)
@@ -257,7 +284,7 @@ static void test_find_schema_miss(void)
 
     Catalog cat;
     cat_create(TEST_FILE, TEST_PID, TEST_OWNER, TEST_QUOTA, &cat);
-    cat_add_schema(&cat, "mydb");
+    cat_add_schema(&cat, "mydb", 1);
 
     CHECK(cat_find_schema(&cat, "mydb")  != NULL, "known name finds entry");
     CHECK(cat_find_schema(&cat, "ghost") == NULL, "unknown name → NULL");
@@ -652,6 +679,7 @@ int main(void)
     test_remove_schema();
     test_remove_unknown_schema();
     test_remove_then_add_reuses_slot();
+    test_alloc_schema_id_increments_and_persists();
     test_find_schema_miss();
 
     test_track_alloc_positive();

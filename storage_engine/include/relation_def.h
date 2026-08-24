@@ -90,6 +90,11 @@ struct RelationDef {
 
     uint32_t   auto_incr_counter;   /* next value for AUTO_INCREMENT columns */
     uint32_t   root_page_no;        /* root of the clustered B+ tree */
+    uint32_t   table_id;            /* persistent identity, stamped once at
+                                      * CREATE TABLE by storage_create_table;
+                                      * mirrored into the relation file's own
+                                      * FileHeader.table_id and into
+                                      * RelationEntry.table_id (__schema.mydb) */
 
     /* one secondary B+ tree per UNIQUE (non-PK) column */
     uint8_t    num_secondary_indexes;

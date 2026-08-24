@@ -111,7 +111,12 @@ static OpenTable *open_table(StorageEngine *se, const RelationDef *rel)
 
     strncpy(ot->name, rel->relation_name, MAX_TABLE_NAME - 1);
     strncpy(ot->schema_name, rel->owner_schema, sizeof(ot->schema_name) - 1);
-    ot->id = se->next_table_id++;
+    /* Persistent identity, stamped once at CREATE TABLE (storage_create_table)
+     * and carried in rel->table_id ever since — NOT minted here. Using the
+     * schema-supplied value (rather than a fresh se->next_table_id++) keeps
+     * the id stable across close/reopen within a run, which a runtime
+     * counter reset on every open could not guarantee. */
+    ot->id = rel->table_id;
 
     /* clustered B+ tree */
     btree_init(&ot->clustered, &se->bp, &ot->dm, ot->id,
@@ -329,7 +334,6 @@ int storage_init(StorageEngine *se)
     if (se->initialized) return MYDB_OK;
 
     memset(se, 0, sizeof(*se));
-    se->next_table_id = 1;
 
     bp_init(&se->bp);
 
@@ -415,12 +419,16 @@ int storage_create_table(StorageEngine *se, RelationDef *rel)
     DiskManager dm;
     if (disk_create(&dm, path) != MYDB_OK) return MYDB_ERR;
 
-    if (rel->columns[rel->pk_col_idx].is_auto_increment) {
-        FileHeader fh;
-        disk_read_header(&dm, &fh);
+    /* rel->table_id is allocated by the caller (pm_create_table, via the
+     * durable per-partition cat_alloc_table_id() counter in __catalog.mydb)
+     * and already stamped on rel before this call — stash it in the file's
+     * own header too, so an orphaned .mydb file can self-identify. */
+    FileHeader fh;
+    disk_read_header(&dm, &fh);
+    fh.table_id = rel->table_id;
+    if (rel->columns[rel->pk_col_idx].is_auto_increment)
         fh.flags |= FILEHDR_FLAG_AUTO_INCREMENT;
-        disk_write_header(&dm, &fh);
-    }
+    disk_write_header(&dm, &fh);
 
     /* Allocate the clustered root page via disk_alloc_page (raw allocator,
      * no quota tracking — partition_manager tracks the quota delta).
