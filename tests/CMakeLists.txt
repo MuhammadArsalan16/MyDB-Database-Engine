@@ -1,12 +1,37 @@
+# common_utils modules (common.h, file_header, checksum) — extracted out
+# of storage_engine in WAL Phase 1 since they're system-wide, not
+# storage-specific.
+set(COMMON_UTILS_TEST_MODULES file_header checksum)
+
+foreach(mod ${COMMON_UTILS_TEST_MODULES})
+    add_executable(test_${mod} common_utils/test_${mod}.c)
+    target_link_libraries(test_${mod} PRIVATE common_utils)
+    add_test(NAME test_${mod} COMMAND test_${mod})
+endforeach()
+
 # Pure storage_engine modules (stateless I/O layer).
 set(STORAGE_ONLY_TEST_MODULES
-    disk_manager page buffer_pool btree file_header relation_def)
+    disk_manager page buffer_pool btree relation_def)
 
 foreach(mod ${STORAGE_ONLY_TEST_MODULES})
     add_executable(test_${mod} storage_engine/test_${mod}.c)
     target_link_libraries(test_${mod} PRIVATE storage_engine)
     add_test(NAME test_${mod} COMMAND test_${mod})
 endforeach()
+
+# WAL — normal_wal's on-disk struct layer (record/page/segment header
+# format + checksum). Skeleton only this phase: no file I/O, no ring
+# buffer, no threads (see MYDB_WAL_IMPLEMENTATION.md §8).
+add_executable(test_wal_types wal/test_wal_types.c)
+target_link_libraries(test_wal_types PRIVATE wal)
+add_test(NAME test_wal_types COMMAND test_wal_types)
+
+# WAL Phase 2 — the pool of 10 physical wal_<N>.mydb segment files:
+# pre-allocation, round-robin claiming, raw page I/O, crash-reload
+# tail-scan (MYDB_WAL_IMPLEMENTATION.md §8.4). Real file I/O under /tmp.
+add_executable(test_wal_segment_pool wal/test_wal_segment_pool.c)
+target_link_libraries(test_wal_segment_pool PRIVATE wal)
+add_test(NAME test_wal_segment_pool COMMAND test_wal_segment_pool)
 
 # Session-state modules that moved to partition_manager in v3.
 # Their test files still live under tests/storage_engine/ (moved with git mv

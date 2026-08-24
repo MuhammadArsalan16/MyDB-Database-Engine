@@ -385,7 +385,7 @@ static void pack_page0(const SchemaFile *sf, uint8_t *buf)
             buf + SF_RELATION_OFFSET + i * SF_RELATION_SIZE,
             &sf->relations[i]);
     }
-    uint32_t cs = fnv1a(buf, SF_CHECKSUM_OFFSET);
+    uint32_t cs = crc32(buf, SF_CHECKSUM_OFFSET);
     memcpy(buf + SF_CHECKSUM_OFFSET, &cs, 4);
 }
 
@@ -396,7 +396,7 @@ static int unpack_page0(const uint8_t *buf, SchemaFile *sf)
 
     uint32_t stored;
     memcpy(&stored, buf + SF_CHECKSUM_OFFSET, 4);
-    if (stored != fnv1a(buf, SF_CHECKSUM_OFFSET))
+    if (stored != crc32(buf, SF_CHECKSUM_OFFSET))
         return MYDB_ERR_BAD_CHECKSUM;
 
     deserialize_header(buf, &sf->header);

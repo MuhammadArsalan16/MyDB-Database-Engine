@@ -155,7 +155,7 @@ static void users_pack(const UsersFile *uf, uint8_t *buf)
         user_serialize(buf + US_SLOT_OFFSET + i * US_SLOT_SIZE,
                        &uf->slots[i]);
     }
-    uint32_t cs = fnv1a(buf, US_CHECKSUM_OFFSET);
+    uint32_t cs = crc32(buf, US_CHECKSUM_OFFSET);
     memcpy(buf + US_CHECKSUM_OFFSET, &cs, 4);
 }
 
@@ -168,7 +168,7 @@ static int users_unpack(const uint8_t *buf, UsersFile *uf)
 
     uint32_t stored;
     memcpy(&stored, buf + US_CHECKSUM_OFFSET, 4);
-    if (stored != fnv1a(buf, US_CHECKSUM_OFFSET))
+    if (stored != crc32(buf, US_CHECKSUM_OFFSET))
         return MYDB_ERR_BAD_CHECKSUM;
 
     memcpy(&uf->next_user_id, buf + 8, 4);
@@ -302,7 +302,7 @@ static void priv_pack(const PrivilegesFile *pf, uint8_t *buf)
         priv_serialize(buf + PR_SLOT_OFFSET + i * PR_SLOT_SIZE,
                        &pf->slots[i]);
     }
-    uint32_t cs = fnv1a(buf, PR_CHECKSUM_OFFSET);
+    uint32_t cs = crc32(buf, PR_CHECKSUM_OFFSET);
     memcpy(buf + PR_CHECKSUM_OFFSET, &cs, 4);
 }
 
@@ -313,7 +313,7 @@ static int priv_unpack(const uint8_t *buf, PrivilegesFile *pf)
 
     uint32_t stored;
     memcpy(&stored, buf + PR_CHECKSUM_OFFSET, 4);
-    if (stored != fnv1a(buf, PR_CHECKSUM_OFFSET))
+    if (stored != crc32(buf, PR_CHECKSUM_OFFSET))
         return MYDB_ERR_BAD_CHECKSUM;
 
     memcpy(&pf->next_privilege_id, buf + 8,  4);

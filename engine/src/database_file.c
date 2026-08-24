@@ -104,7 +104,7 @@ static void pack(const DatabaseFile *db, uint8_t *buf)
             buf + DB_PARTITION_OFFSET + i * DB_PARTITION_SIZE,
             &db->partitions[i]);
     }
-    uint32_t cs = fnv1a(buf, DB_CHECKSUM_OFFSET);
+    uint32_t cs = crc32(buf, DB_CHECKSUM_OFFSET);
     memcpy(buf + DB_CHECKSUM_OFFSET, &cs, 4);
 }
 
@@ -117,7 +117,7 @@ static int unpack(const uint8_t *buf, DatabaseFile *db)
 
     uint32_t stored;
     memcpy(&stored, buf + DB_CHECKSUM_OFFSET, 4);
-    if (stored != fnv1a(buf, DB_CHECKSUM_OFFSET))
+    if (stored != crc32(buf, DB_CHECKSUM_OFFSET))
         return MYDB_ERR_BAD_CHECKSUM;
 
     deserialize_header(buf, &db->header);

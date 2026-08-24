@@ -17,9 +17,20 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # PartitionBuffer's per-outer-slot latch (PARTITION_BUFFER_DESIGN.md §6/§7).
 find_package(Threads REQUIRED)
 
+# Common utilities — common.h, file_header.h/.c, checksum.h/.c. Genuinely
+# system-wide (every module depends on them), so this is the first
+# subdirectory built, ahead of storage_engine which used to own them.
+add_subdirectory(common_utils)
 # Storage engine — stateless I/O layer (v3): BufferPool, BTree, Page,
 # DiskManager, RelationDef only.  No session state.
 add_subdirectory(storage_engine)
+# WAL — wal record/page/segment format (normal_wal) and, later, LARGE_WAL
+# overflow storage (large_wal). Depends only on common_utils (not
+# storage_engine) — WAL manages its own files and doesn't need BufferPool/
+# BTree/DiskManager/RelationDef. Built as an independent skeleton per
+# subsystem; not yet wired into partition_manager's TransactionManager
+# (see MYDB_WAL_IMPLEMENTATION.md §11, cross-subsystem dispatcher, deferred).
+add_subdirectory(wal)
 # crypto — SHA-256 + salt helpers, shared by engine (login/bootstrap) and the
 # network client (challenge-response). Lifted out of engine/ when the client
 # became a second consumer. Built before engine + client.
