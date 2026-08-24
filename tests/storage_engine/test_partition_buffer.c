@@ -517,6 +517,233 @@ static void test_remove_resets_cache(void)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Write-back (Phase 3)                                               */
+/* ------------------------------------------------------------------ */
+
+static void test_mark_dirty_flags(void)
+{
+    printf("\n[test_mark_dirty_flags]\n");
+    cleanup();
+    mkdir(TEST_PART_DIR, 0755);
+    CHECK(make_schema(0, 1) == MYDB_OK, "fixture schema created");
+
+    PartitionBuffer *pb = (PartitionBuffer *)malloc(sizeof(PartitionBuffer));
+    StorageEngine   *se = (StorageEngine *)malloc(sizeof(StorageEngine));
+    pb_init(pb);
+    storage_init(se);
+    char path[512]; schema_path(0, path, sizeof(path));
+    pb_get(pb, "sX", path, se);
+    PBOuterSlot *slot = pb_find_outer_slot(pb, "sX");
+
+    CHECK(slot->page0_dirty == 0, "page0 starts clean");
+    pb_mark_page0_dirty(slot);
+    CHECK(slot->page0_dirty == 1, "pb_mark_page0_dirty sets the flag");
+
+    RelationDef *r = pb_pin_relation(slot, "r0");
+    int frame = (int)((PBInnerFrame *)r - slot->inner);
+    CHECK(slot->inner[frame].is_dirty == 0, "frame starts clean");
+    pb_mark_relation_dirty(slot, r);
+    CHECK(slot->inner[frame].is_dirty == 1, "pb_mark_relation_dirty sets only this frame's flag");
+    pb_unpin_relation(slot, r);
+
+    pb_destroy(pb);
+    free(pb); free(se);
+    cleanup();
+}
+
+static void test_flush_slot_dirty_persists_and_clears(void)
+{
+    printf("\n[test_flush_slot_dirty_persists_and_clears]\n");
+    cleanup();
+    mkdir(TEST_PART_DIR, 0755);
+    CHECK(make_schema(0, 1) == MYDB_OK, "fixture schema created");
+
+    PartitionBuffer *pb = (PartitionBuffer *)malloc(sizeof(PartitionBuffer));
+    StorageEngine   *se = (StorageEngine *)malloc(sizeof(StorageEngine));
+    pb_init(pb);
+    storage_init(se);
+    char path[512]; schema_path(0, path, sizeof(path));
+    pb_get(pb, "sX", path, se);
+    PBOuterSlot *slot = pb_find_outer_slot(pb, "sX");
+
+    CHECK(schema_bump_relation_rows(slot->sf, "r0", 5) == MYDB_OK,
+          "num_rows bumped in memory only");
+    pb_mark_page0_dirty(slot);
+
+    RelationDef *r = pb_pin_relation(slot, "r0");
+    int frame = (int)((PBInnerFrame *)r - slot->inner);
+    r->auto_incr_counter = 77;
+    pb_mark_relation_dirty(slot, r);
+    pb_unpin_relation(slot, r);
+
+    CHECK(pb_flush_slot_dirty(slot) == MYDB_OK, "flush succeeds");
+    CHECK(slot->page0_dirty == 0,          "page0_dirty cleared after flush");
+    CHECK(slot->inner[frame].is_dirty == 0, "frame is_dirty cleared after flush");
+
+    /* Verify persistence via a completely independent, freshly-opened
+     * SchemaFile — proves the write actually reached disk, not just the
+     * cached in-memory copy. */
+    SchemaFile check;
+    CHECK(schema_open(path, &check) == MYDB_OK, "fresh reopen for verification");
+    RelationEntry *e = schema_find_relation_stat(&check, "r0");
+    CHECK(e != NULL && e->num_rows == 5, "num_rows persisted to disk");
+    RelationDef loaded;
+    CHECK(e && schema_load_relation_page(&check, e->page_no, &loaded) == MYDB_OK,
+          "def page loads");
+    CHECK(loaded.auto_incr_counter == 77, "auto_incr_counter persisted to disk");
+    schema_close(&check);
+
+    pb_destroy(pb);
+    free(pb); free(se);
+    cleanup();
+}
+
+static void test_discard_slot_dirty_reverts_and_clears(void)
+{
+    printf("\n[test_discard_slot_dirty_reverts_and_clears]\n");
+    cleanup();
+    mkdir(TEST_PART_DIR, 0755);
+    CHECK(make_schema(0, 1) == MYDB_OK, "fixture schema created");
+
+    PartitionBuffer *pb = (PartitionBuffer *)malloc(sizeof(PartitionBuffer));
+    StorageEngine   *se = (StorageEngine *)malloc(sizeof(StorageEngine));
+    pb_init(pb);
+    storage_init(se);
+    char path[512]; schema_path(0, path, sizeof(path));
+    pb_get(pb, "sX", path, se);
+    PBOuterSlot *slot = pb_find_outer_slot(pb, "sX");
+
+    CHECK(schema_bump_relation_rows(slot->sf, "r0", 5) == MYDB_OK,
+          "num_rows bumped in memory only");
+    pb_mark_page0_dirty(slot);
+
+    RelationDef *r = pb_pin_relation(slot, "r0");
+    int frame = (int)((PBInnerFrame *)r - slot->inner);
+    r->auto_incr_counter = 999;
+    pb_mark_relation_dirty(slot, r);
+    /* Release before discard — mirrors real usage: pm_rollback runs after
+     * the statement's RelationGuard has already released its pin. */
+    pb_unpin_relation(slot, r);
+
+    CHECK(pb_discard_slot_dirty(slot) == MYDB_OK, "discard succeeds");
+    CHECK(slot->page0_dirty == 0,          "page0_dirty cleared after discard");
+    CHECK(slot->inner[frame].is_dirty == 0, "frame is_dirty cleared after discard");
+
+    RelationEntry *e = schema_find_relation_stat(slot->sf, "r0");
+    CHECK(e != NULL && e->num_rows == 0,
+          "num_rows reverted in memory — page0 reloaded from disk, not persisted");
+
+    /* Frame was marked non-resident, not flushed — a fresh pin must
+     * reload the original on-disk value (1), not the discarded 999. */
+    RelationDef *r2 = pb_pin_relation(slot, "r0");
+    CHECK(r2 != NULL, "re-pin after discard reloads from disk");
+    CHECK(r2->auto_incr_counter == 1,
+          "discarded auto_incr_counter change was never written — reload sees the original");
+    pb_unpin_relation(slot, r2);
+
+    pb_destroy(pb);
+    free(pb); free(se);
+    cleanup();
+}
+
+/* Same 9-schema setup as test_outer_eviction_basic, but e0 (the LRU
+ * eviction candidate) is dirtied first — eviction must flush before
+ * closing the handle, not just drop the change on the floor. */
+static void test_outer_eviction_flushes_dirty_slot(void)
+{
+    printf("\n[test_outer_eviction_flushes_dirty_slot]\n");
+    cleanup();
+    mkdir(TEST_PART_DIR, 0755);
+    for (int i = 0; i < 9; i++) CHECK(make_schema(i, 1) == MYDB_OK, "fixture schema created");
+
+    PartitionBuffer *pb = (PartitionBuffer *)malloc(sizeof(PartitionBuffer));
+    StorageEngine   *se = (StorageEngine *)malloc(sizeof(StorageEngine));
+    pb_init(pb);
+    storage_init(se);
+
+    for (int i = 0; i < 8; i++) {
+        char path[512], uniq_name[16];
+        schema_path(i, path, sizeof(path));
+        snprintf(uniq_name, sizeof(uniq_name), "e%d", i);
+        rename_schema(i, uniq_name);
+        pb_get(pb, uniq_name, path, se);
+    }
+
+    PBOuterSlot *slot0 = pb_find_outer_slot(pb, "e0");
+    CHECK(schema_bump_relation_rows(slot0->sf, "r0", 3) == MYDB_OK,
+          "e0's num_rows bumped in memory only");
+    pb_mark_page0_dirty(slot0);
+
+    char path8[512];
+    schema_path(8, path8, sizeof(path8));
+    rename_schema(8, "e8");
+
+    SchemaFile *loaded9 = pb_get(pb, "e8", path8, se);
+    CHECK(loaded9 != NULL, "9th schema loads, evicting dirty e0");
+    CHECK(pb_find(pb, "e0") == NULL, "e0 evicted despite being dirty");
+
+    char path0[512];
+    schema_path(0, path0, sizeof(path0));
+    SchemaFile check;
+    CHECK(schema_open(path0, &check) == MYDB_OK, "reopen e0's file for verification");
+    RelationEntry *e = schema_find_relation_stat(&check, "r0");
+    CHECK(e != NULL && e->num_rows == 3,
+          "dirty num_rows was flushed before outer eviction closed the handle");
+    schema_close(&check);
+
+    pb_destroy(pb);
+    free(pb); free(se);
+    cleanup();
+}
+
+/* Same 33-relation setup as test_inner_eviction, but r0 (the inner-LRU
+ * eviction victim) is dirtied first — §8 eviction must flush the frame
+ * before reclaiming it. */
+static void test_inner_eviction_flushes_dirty_frame(void)
+{
+    printf("\n[test_inner_eviction_flushes_dirty_frame]\n");
+    cleanup();
+    mkdir(TEST_PART_DIR, 0755);
+    CHECK(make_schema(0, 33) == MYDB_OK, "33-relation fixture schema created");
+
+    PartitionBuffer *pb = (PartitionBuffer *)malloc(sizeof(PartitionBuffer));
+    StorageEngine   *se = (StorageEngine *)malloc(sizeof(StorageEngine));
+    pb_init(pb);
+    storage_init(se);
+    char path[512]; schema_path(0, path, sizeof(path));
+    pb_get(pb, "sX", path, se);
+    PBOuterSlot *slot = pb_find_outer_slot(pb, "sX");
+
+    uint8_t pno0 = page_no_of(slot, "r0");
+
+    RelationDef *r0 = pb_pin_relation(slot, "r0");
+    CHECK(r0 != NULL, "r0 pins");
+    r0->auto_incr_counter = 55;
+    pb_mark_relation_dirty(slot, r0);
+    pb_unpin_relation(slot, r0);   /* mirrors pm_insert's deferred-write path */
+
+    /* Cycle r1..r32 through the cache — forces r0 (now LRU and unpinned)
+     * out via §8 eviction. */
+    for (int i = 1; i <= 32; i++) {
+        char name[16]; relname(i, name, sizeof(name));
+        RelationDef *r = pb_pin_relation(slot, name);
+        CHECK(r != NULL, "unrelated relation pins");
+        pb_unpin_relation(slot, r);
+    }
+    CHECK(!is_page_cached(slot, pno0), "r0 evicted from the inner cache");
+
+    RelationDef loaded;
+    CHECK(schema_load_relation_page(slot->sf, pno0, &loaded) == MYDB_OK,
+          "load r0's page directly from disk");
+    CHECK(loaded.auto_incr_counter == 55,
+          "dirty auto_incr_counter was flushed before inner eviction reclaimed the frame");
+
+    pb_destroy(pb);
+    free(pb); free(se);
+    cleanup();
+}
+
+/* ------------------------------------------------------------------ */
 /*  Main                                                               */
 /* ------------------------------------------------------------------ */
 
@@ -536,6 +763,12 @@ int main(void)
     test_inner_fail_fast_when_all_pinned();
     test_invalidate_page();
     test_remove_resets_cache();
+
+    test_mark_dirty_flags();
+    test_flush_slot_dirty_persists_and_clears();
+    test_discard_slot_dirty_reverts_and_clears();
+    test_outer_eviction_flushes_dirty_slot();
+    test_inner_eviction_flushes_dirty_frame();
 
     printf("\nResults: %d/%d passed\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

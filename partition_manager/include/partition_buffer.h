@@ -58,10 +58,10 @@ typedef struct {
     uint8_t is_resident;
 } PBFrameDirEntry;
 
-/* One cached RelationDef page. is_dirty/fpi_pending are part of the final
- * struct shape (locked now per §3/§6) but stay unset/unread until Phase 3
- * (write-back) / WAL integration — nothing wires flush logic against them
- * yet, and nothing should until those phases actually land. */
+/* One cached RelationDef page. is_dirty is real as of Phase 3 (write-back
+ * — see pb_mark_relation_dirty/pb_flush_slot_dirty/pb_discard_slot_dirty
+ * below). fpi_pending stays unset/unread until WAL integration — nothing
+ * wires it up yet, and nothing should until that phase lands. */
 typedef struct {
     RelationDef def;
     uint8_t     is_dirty;
@@ -75,7 +75,7 @@ typedef struct {
     PBFrameDirEntry  dir[PB_INNER_SLOTS];
     PBInnerFrame     inner[PB_INNER_SLOTS];
     int              inner_lru_order[PB_INNER_SLOTS];  /* [0]=MRU frame idx, [31]=LRU */
-    uint8_t          page0_dirty;   /* placeholder, unused until Phase 3 */
+    uint8_t          page0_dirty;   /* real as of Phase 3 — see pb_mark_page0_dirty */
     pthread_mutex_t  latch;
 } PBOuterSlot;
 
@@ -101,9 +101,12 @@ SchemaFile *pb_active_schema(PartitionBuffer *pb);
 /* Return the schema_name of the MRU slot, or NULL if the cache is empty. */
 const char *pb_active_schema_name(const PartitionBuffer *pb);
 
-/* Flush all dirty pages in the buffer pool for every cached schema.
- * se is the StorageEngine owned by the same PartitionCtx.
- * Does not close any SchemaFile handles. */
+/* Flush all dirty pages in the buffer pool for every cached schema, and
+ * (Phase 3) every outer slot's dirty metadata (page0_dirty + any dirty
+ * inner frames, via pb_flush_slot_dirty). se is the StorageEngine owned
+ * by the same PartitionCtx. Does not close any SchemaFile handles. Used
+ * as the final shutdown safety net (pctx_close) — the per-statement path
+ * for metadata is pm_commit/pm_rollback, not this. */
 int pb_flush_all(PartitionBuffer *pb, StorageEngine *se);
 
 /* Close all open SchemaFile handles, free them, and destroy every slot's
@@ -164,6 +167,42 @@ int pb_unpin_relation(PBOuterSlot *slot, const RelationDef *rel);
  * page_no (schema_file.c's lowest-free-page policy) could be handed back
  * the previous relation's stale cached definition instead of its own. */
 void pb_invalidate_page(PBOuterSlot *slot, uint8_t page_no);
+
+/* ------------------------------------------------------------------ */
+/*  Write-back (Phase 3)                                                */
+/* ------------------------------------------------------------------ */
+
+/* Mark this slot's Page 0 (header + relations[] directory) dirty. Called
+ * by pm_api.c after schema_update_stats/schema_bump_relation_pages/
+ * schema_bump_relation_rows succeed — those no longer persist internally
+ * (Phase 3). Runs under slot->latch. */
+void pb_mark_page0_dirty(PBOuterSlot *slot);
+
+/* Mark the inner frame holding rel dirty. Called by pm_api.c after an
+ * in-place RelationDef mutation (auto_incr_counter, root_page_no) instead
+ * of the old immediate schema_flush_relation call. Uses the same
+ * pointer-arithmetic technique pb_unpin_relation already uses internally
+ * (def is PBInnerFrame's first member) — exposed here so pm_api.c doesn't
+ * need to know PBInnerFrame's layout directly. Runs under slot->latch. */
+void pb_mark_relation_dirty(PBOuterSlot *slot, const RelationDef *rel);
+
+/* Flush this slot's dirty state to disk: Page 0 if page0_dirty, every
+ * inner frame with is_dirty (via schema_flush_relation). Clears both
+ * flags on success. Runs under slot->latch. Used by pm_commit (the
+ * active slot only — v3's one-active-schema-at-a-time model means
+ * nothing else could have been dirtied) and by pb_flush_all (every slot,
+ * shutdown safety net). Also what §7 (outer eviction) and §8 (inner
+ * eviction) call internally before reclaiming a dirty slot/frame — same
+ * underlying per-frame/page0 flush, not reimplemented per call site. */
+int pb_flush_slot_dirty(PBOuterSlot *slot);
+
+/* Discard this slot's dirty state without persisting: Page 0 reloaded
+ * from disk (schema_reload_page0, schema_file.h) if page0_dirty, every
+ * dirty inner frame marked non-resident (next access reloads fresh from
+ * disk — same as an ordinary eviction, just without the flush). Clears
+ * both flags. Runs under slot->latch. Used by pm_rollback — the
+ * write-back counterpart to storage_evict_all's data-page discard. */
+int pb_discard_slot_dirty(PBOuterSlot *slot);
 
 #ifdef __cplusplus
 }

@@ -97,6 +97,15 @@ int schema_close(SchemaFile *sf);
  * a higher-level mutator. */
 int schema_save_page0(SchemaFile *sf);
 
+/* Re-read and unpack Page 0 from disk into the already-open *sf,
+ * discarding any in-memory changes made since the last save (header,
+ * relations[]). Phase 3 of the PartitionBuffer redesign: the write-back
+ * counterpart to schema_save_page0 — used by pb_discard_slot_dirty
+ * (partition_buffer.h) to revert a rolled-back transaction's uncommitted
+ * stat bumps without persisting them. size_bytes is recomputed after
+ * reload, same as schema_open does. */
+int schema_reload_page0(SchemaFile *sf);
+
 /* ------------------------------------------------------------------ */
 /*  RelationDef CRUD                                                   */
 /* ------------------------------------------------------------------ */
@@ -140,14 +149,19 @@ int schema_load_relation_page(SchemaFile *sf, uint8_t page_no, RelationDef *out)
 int schema_flush_relation(SchemaFile *sf, const RelationDef *def);
 
 /* Update optimizer-stat fields (num_rows, num_pages, tree_height) on
- * the relation's slot and persist Page 0. */
+ * the relation's slot, in memory only. Phase 3: no longer persists —
+ * caller (pm_api.c) marks the owning PBOuterSlot's page0_dirty via
+ * pb_mark_page0_dirty (partition_buffer.h) instead; actual persistence
+ * happens later via pb_flush_slot_dirty (on COMMIT, eviction, or
+ * shutdown). */
 int schema_update_stats(SchemaFile *sf, const char *relation_name,
                         uint32_t num_rows, uint32_t num_pages,
                         uint8_t tree_height);
 
-/* Increment (delta>0) or decrement (delta<0) the persisted num_pages
- * counter for one relation slot and persist Page 0. Refuses to drive
- * the counter below 0. Returns MYDB_ERR_NOT_FOUND if no valid slot
+/* Increment (delta>0) or decrement (delta<0) the num_pages counter for
+ * one relation slot, in memory only (Phase 3 — see schema_update_stats's
+ * comment; caller marks page0_dirty, does not persist here). Refuses to
+ * drive the counter below 0. Returns MYDB_ERR_NOT_FOUND if no valid slot
  * matches `relation_name`.
  *
  * Used by storage.c after every successful partition_alloc_page on a
@@ -156,9 +170,10 @@ int schema_update_stats(SchemaFile *sf, const char *relation_name,
 int schema_bump_relation_pages(SchemaFile *sf, const char *relation_name,
                                int32_t delta);
 
-/* Increment (delta>0) or decrement (delta<0) the persisted num_rows
- * counter for one relation slot and persist Page 0. Refuses to drive
- * the counter below 0. Returns MYDB_ERR_NOT_FOUND if no valid slot
+/* Increment (delta>0) or decrement (delta<0) the num_rows counter for
+ * one relation slot, in memory only (Phase 3 — see schema_update_stats's
+ * comment; caller marks page0_dirty, does not persist here). Refuses to
+ * drive the counter below 0. Returns MYDB_ERR_NOT_FOUND if no valid slot
  * matches `relation_name`.
  *
  * Called by storage.c after every successful storage_insert (+1) and

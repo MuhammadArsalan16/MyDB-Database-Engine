@@ -561,6 +561,20 @@ int schema_save_page0(SchemaFile *sf)
     return MYDB_OK;
 }
 
+int schema_reload_page0(SchemaFile *sf)
+{
+    if (!sf || sf->fd < 0) return MYDB_ERR;
+
+    uint8_t buf[PAGE_SIZE];
+    if (read_page(sf->fd, 0, buf) != MYDB_OK) return MYDB_ERR;
+
+    int rc = unpack_page0(buf, sf);
+    if (rc != MYDB_OK) return rc;
+
+    sf->header.size_bytes = schema_compute_size_bytes(sf);
+    return MYDB_OK;
+}
+
 int schema_add_relation(SchemaFile *sf, const RelationDef *def)
 {
     if (!sf || !def || sf->fd < 0) return MYDB_ERR;
@@ -674,7 +688,10 @@ int schema_update_stats(SchemaFile *sf, const char *relation_name,
     e->tree_height = tree_height;
     sf->header.size_bytes = schema_compute_size_bytes(sf);
 
-    return schema_save_page0(sf);
+    /* Phase 3: no longer persisted here — caller marks page0_dirty via
+     * pb_mark_page0_dirty (partition_buffer.h); pb_flush_slot_dirty
+     * writes it out later, on COMMIT/eviction/shutdown. */
+    return MYDB_OK;
 }
 
 int schema_bump_relation_pages(SchemaFile *sf, const char *relation_name,
@@ -695,7 +712,9 @@ int schema_bump_relation_pages(SchemaFile *sf, const char *relation_name,
     e->num_pages = (uint32_t)((int64_t)e->num_pages + delta);
     sf->header.size_bytes = schema_compute_size_bytes(sf);
 
-    return schema_save_page0(sf);
+    /* Phase 3: no longer persisted here — see schema_update_stats's
+     * comment above. */
+    return MYDB_OK;
 }
 
 int schema_bump_relation_rows(SchemaFile *sf, const char *relation_name,
@@ -714,7 +733,9 @@ int schema_bump_relation_rows(SchemaFile *sf, const char *relation_name,
 
     e->num_rows = (uint32_t)((int64_t)e->num_rows + delta);
 
-    return schema_save_page0(sf);
+    /* Phase 3: no longer persisted here — see schema_update_stats's
+     * comment above. */
+    return MYDB_OK;
 }
 
 uint64_t schema_compute_size_bytes(const SchemaFile *sf)

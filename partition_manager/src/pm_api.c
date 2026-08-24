@@ -108,6 +108,10 @@ static void reconcile_growth(PartitionCtx *ctx, const char *relation_name,
     SchemaFile *sf = pctx_active_schema(ctx);
     if (sf) {
         schema_bump_relation_pages(sf, relation_name, delta);
+        /* Phase 3: schema_bump_relation_pages no longer persists itself —
+         * mark Page 0 dirty; pm_commit/pm_rollback (or eviction) resolve it. */
+        PBOuterSlot *outer = pctx_active_outer_slot(ctx);
+        if (outer) pb_mark_page0_dirty(outer);
         cat_track_alloc(&ctx->catalog, (int64_t)delta * PAGE_SIZE);
     }
 }
@@ -586,6 +590,16 @@ int pm_create_table(PartitionCtx *ctx, RelationDef *rel)
      * relation.  Bump num_pages for the root pages just allocated. */
     schema_bump_relation_pages(sf, rel->relation_name, (int32_t)need_pages);
 
+    /* Phase 3: schema_bump_relation_pages no longer persists itself. This
+     * DDL path (unlike DML) has no autocommit wrapper to flush it later,
+     * so flush immediately — matches schema_add_relation's own immediacy
+     * a few lines above, keeping CREATE TABLE fully durable by the time
+     * this function returns, same as before Phase 3. */
+    {
+        PBOuterSlot *outer = pctx_active_outer_slot(ctx);
+        if (outer) { pb_mark_page0_dirty(outer); pb_flush_slot_dirty(outer); }
+    }
+
     /* Credit the allocated pages to the partition quota. */
     cat_track_alloc(&ctx->catalog, (int64_t)need_pages * PAGE_SIZE);
 
@@ -666,14 +680,17 @@ int pm_add_index(PartitionCtx *ctx, RelationDef *rel, int col_idx)
     rc = storage_add_index(&ctx->storage, r, col_idx);
     if (rc != MYDB_OK) goto done;
 
-    /* Persist the updated RelationDef before backfill so a crash after
-     * a partial backfill leaves the index visible (and rebuildable). r
-     * itself is the content to write — schema_flush_relation no longer
-     * has any cached copy of its own to read from (Phase 2). */
-    rc = schema_flush_relation(sf, r);
-    if (rc != MYDB_OK) goto done;
-
-    schema_bump_relation_pages(sf, r->relation_name, 1);
+    /* Mark the updated RelationDef and Page 0 dirty, then flush
+     * immediately — this DDL path (unlike DML) has no autocommit
+     * wrapper to flush it later. Persisting before backfill (same
+     * ordering as before Phase 3) means a crash after a partial backfill
+     * still leaves the index visible and rebuildable. */
+    {
+        PBOuterSlot *outer = pctx_active_outer_slot(ctx);
+        if (outer) pb_mark_relation_dirty(outer, r);
+        schema_bump_relation_pages(sf, r->relation_name, 1);
+        if (outer) { pb_mark_page0_dirty(outer); pb_flush_slot_dirty(outer); }
+    }
     cat_track_alloc(&ctx->catalog, (int64_t)PAGE_SIZE);
     rc = MYDB_OK;
 
@@ -699,8 +716,17 @@ int pm_commit(PartitionCtx *ctx)
     /* Flush all dirty pages to disk before acknowledging the commit. */
     storage_flush_all_dirty(&ctx->storage);
 
-    /* Fsync the active schema file so RelationDef mutations (row counts,
-     * auto_incr_counter, num_pages) survive a crash. */
+    /* Phase 3: metadata mutations (row counts, auto_incr_counter,
+     * num_pages) are write-back now — schema_update_stats, the
+     * schema_bump_relation_pages/rows pair, and schema_flush_relation's
+     * callers only mark PBOuterSlot dirty, they don't persist. Flush the
+     * active slot's dirty Page 0 + inner frames HERE, before fsync —
+     * otherwise fsync below has nothing new to harden and this whole
+     * function would silently stop being durable for metadata. */
+    PBOuterSlot *outer = pctx_active_outer_slot(ctx);
+    if (outer) pb_flush_slot_dirty(outer);
+
+    /* Fsync the active schema file so the flush above survives a crash. */
     SchemaFile *sf = pctx_active_schema(ctx);
     if (sf && sf->fd >= 0)
         fsync(sf->fd);
@@ -718,6 +744,17 @@ int pm_rollback(PartitionCtx *ctx)
     /* Evict all pages without flushing — dirty changes are discarded;
      * on next access the buffer pool reloads pre-transaction data from disk. */
     storage_evict_all(&ctx->storage);
+
+    /* Phase 3: the write-back counterpart for metadata — discard the
+     * active slot's dirty Page 0 (reload from disk) and dirty inner
+     * frames (mark non-resident, next access reloads fresh), mirroring
+     * storage_evict_all's data-page discard above. Closes a real,
+     * pre-existing gap: before Phase 3, schema_bump_relation_rows/etc.
+     * persisted immediately and unconditionally, so a BEGIN; INSERT;
+     * ROLLBACK sequence reverted the row's data but left num_rows
+     * incremented anyway — nothing here ever undid it. */
+    PBOuterSlot *outer = pctx_active_outer_slot(ctx);
+    if (outer) pb_discard_slot_dirty(outer);
 
     return trx_rollback(&ctx->txn_mgr);
 }
@@ -807,8 +844,15 @@ int pm_insert(PartitionCtx *ctx, RelationDef *rel, Row *row)
         SchemaFile *sf = pctx_active_schema(ctx);
         if (sf) {
             schema_bump_relation_rows(sf, rel->relation_name, 1);
-            if (r->columns[pk].is_auto_increment || root_changed)
-                schema_flush_relation(sf, r);
+            /* Phase 3: neither call persists itself anymore — mark dirty
+             * and let autocommit_end's pm_commit (below) flush it, same
+             * as every other dirty state this transaction touched. */
+            PBOuterSlot *outer = pctx_active_outer_slot(ctx);
+            if (outer) {
+                pb_mark_page0_dirty(outer);
+                if (r->columns[pk].is_auto_increment || root_changed)
+                    pb_mark_relation_dirty(outer, r);
+            }
         }
     }
 
@@ -860,7 +904,13 @@ int pm_delete(PartitionCtx *ctx, RelationDef *rel, RID rid)
 
     if (rc == MYDB_OK) {
         SchemaFile *sf = pctx_active_schema(ctx);
-        if (sf) schema_bump_relation_rows(sf, rel->relation_name, -1);
+        if (sf) {
+            schema_bump_relation_rows(sf, rel->relation_name, -1);
+            /* Phase 3: no longer persists itself — mark dirty; autocommit_end's
+             * pm_commit (below) flushes it. */
+            PBOuterSlot *outer = pctx_active_outer_slot(ctx);
+            if (outer) pb_mark_page0_dirty(outer);
+        }
     }
 
     autocommit_end(ctx, auto_txn, rc);
@@ -953,8 +1003,10 @@ int pm_update(PartitionCtx *ctx, RelationDef *rel, RID rid, Row *new_row)
             root_changed = (r->secondary_root_page_no[i] != sec_root_before[i]);
 
         if (root_changed) {
-            SchemaFile *sf = pctx_active_schema(ctx);
-            if (sf) schema_flush_relation(sf, r);
+            /* Phase 3: no longer persists itself — mark dirty; autocommit_end's
+             * pm_commit (below) flushes it. */
+            PBOuterSlot *outer = pctx_active_outer_slot(ctx);
+            if (outer) pb_mark_relation_dirty(outer, r);
         }
     }
 

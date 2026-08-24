@@ -31,6 +31,80 @@ static void inner_lru_bump(PBOuterSlot *slot, int frame_idx)
     slot->inner_lru_order[0] = frame_idx;
 }
 
+/* ------------------------------------------------------------------ */
+/*  Write-back internals (Phase 3) — all assume slot->latch is already
+ *  held by the caller. Shared by the public pb_flush_slot_dirty/
+ *  pb_discard_slot_dirty wrappers below AND by §7/§8's eviction paths,
+ *  which already hold the latch when they need to flush a dirty
+ *  slot/frame before reclaiming it — one implementation, not
+ *  reimplemented per call site.
+ * ------------------------------------------------------------------ */
+
+/* Flush this frame to disk if dirty; clears is_dirty on success. */
+static int flush_inner_frame_locked(PBOuterSlot *slot, int idx)
+{
+    if (!slot->inner[idx].is_dirty) return MYDB_OK;
+    int rc = schema_flush_relation(slot->sf, &slot->inner[idx].def);
+    if (rc != MYDB_OK) return rc;
+    slot->inner[idx].is_dirty = 0;
+    return MYDB_OK;
+}
+
+/* Flush Page 0 to disk if dirty; clears page0_dirty on success. */
+static int flush_page0_locked(PBOuterSlot *slot)
+{
+    if (!slot->page0_dirty) return MYDB_OK;
+    int rc = schema_save_page0(slot->sf);
+    if (rc != MYDB_OK) return rc;
+    slot->page0_dirty = 0;
+    return MYDB_OK;
+}
+
+/* Flush every dirty inner frame + Page 0. Best-effort — keeps going even
+ * if one write fails, so a single bad page doesn't block the rest;
+ * returns the first error encountered, if any. */
+static int flush_slot_dirty_locked(PBOuterSlot *slot)
+{
+    int rc = flush_page0_locked(slot);
+    for (int i = 0; i < PB_INNER_SLOTS; i++) {
+        int frc = flush_inner_frame_locked(slot, i);
+        if (frc != MYDB_OK && rc == MYDB_OK) rc = frc;
+    }
+    return rc;
+}
+
+/* Discard this frame's dirty in-memory content without persisting — mark
+ * non-resident so the next access reloads fresh from disk. No I/O:
+ * unlike Page 0 (below), a frame's content lives only in the cache, so
+ * "discard" is just forgetting it. */
+static void discard_inner_frame_locked(PBOuterSlot *slot, int idx)
+{
+    if (!slot->inner[idx].is_dirty) return;
+    slot->dir[idx].is_resident = 0;
+    slot->inner[idx].is_dirty  = 0;
+}
+
+/* Discard Page 0's in-memory changes by re-reading it from disk — unlike
+ * an inner frame, Page 0's content lives directly in sf->header/
+ * relations[] with no separate cache copy, so reverting requires an
+ * actual re-read rather than just forgetting something. */
+static int discard_page0_locked(PBOuterSlot *slot)
+{
+    if (!slot->page0_dirty) return MYDB_OK;
+    int rc = schema_reload_page0(slot->sf);
+    if (rc != MYDB_OK) return rc;
+    slot->page0_dirty = 0;
+    return MYDB_OK;
+}
+
+static int discard_slot_dirty_locked(PBOuterSlot *slot)
+{
+    int rc = discard_page0_locked(slot);
+    for (int i = 0; i < PB_INNER_SLOTS; i++)
+        discard_inner_frame_locked(slot, i);
+    return rc;
+}
+
 int pb_init(PartitionBuffer *pb)
 {
     if (!pb) return MYDB_ERR;
@@ -59,13 +133,23 @@ const char *pb_active_schema_name(const PartitionBuffer *pb)
     return pb->slots[pb->lru_order[0]].sf->header.schema_name;
 }
 
-/* Flush all dirty pages in the buffer pool for every cached schema.
- * se is the StorageEngine owned by the same PartitionCtx.
- * Does not close any SchemaFile handles. */
+/* Flush all dirty pages in the buffer pool for every cached schema, plus
+ * (Phase 3) every outer slot's dirty metadata. se is the StorageEngine
+ * owned by the same PartitionCtx. Does not close any SchemaFile handles.
+ * Shutdown safety net (pctx_close) — the per-statement path for metadata
+ * is pm_commit/pm_rollback, not this. */
 int pb_flush_all(PartitionBuffer *pb, StorageEngine *se)
 {
-    if (!pb || pb->n_loaded == 0) return MYDB_OK;
-    return storage_flush_all_dirty(se);
+    if (!pb) return MYDB_OK;
+    storage_flush_all_dirty(se);
+
+    int rc = MYDB_OK;
+    for (int i = 0; i < PARTITION_BUFFER_SLOTS; i++) {
+        if (!pb->slots[i].sf) continue;
+        int frc = pb_flush_slot_dirty(&pb->slots[i]);
+        if (frc != MYDB_OK && rc == MYDB_OK) rc = frc;
+    }
+    return rc;
 }
 
 void pb_destroy(PartitionBuffer *pb)
@@ -174,11 +258,11 @@ SchemaFile *pb_get(PartitionBuffer *pb,
             }
 
             /* Evictable. storage_flush_all_dirty covers BP data pages
-             * (existing behaviour, unchanged). Flushing this slot's own
-             * dirty inner frames before close is a no-op this phase —
-             * write-through means is_dirty is never set yet; Phase 3
-             * (write-back) is what gives this step real work to do. */
+             * (existing behaviour, unchanged). flush_slot_dirty_locked
+             * (Phase 3) persists this slot's own dirty metadata — Page 0
+             * and any dirty inner frames — before the handle closes. */
             storage_flush_all_dirty(se);
+            flush_slot_dirty_locked(cs);
             if (cs->sf) {
                 if (cs->sf->fd > 0) schema_close(cs->sf);
                 free(cs->sf);
@@ -277,8 +361,9 @@ RelationDef *pb_pin_relation(PBOuterSlot *slot, const char *relation_name)
         int i = slot->inner_lru_order[p];
         if (slot->inner[i].pin_count > 0) continue;   /* implies occupied */
         if (slot->dir[i].is_resident) {
-            /* Evict. No flush needed this phase — write-through means
-             * is_dirty is never set yet (Phase 3 gives this real work). */
+            /* Evict — flush first if dirty (Phase 3); a no-op if the
+             * frame is clean. */
+            flush_inner_frame_locked(slot, i);
             slot->dir[i].is_resident = 0;
         }
         target = i;
@@ -337,4 +422,45 @@ void pb_invalidate_page(PBOuterSlot *slot, uint8_t page_no)
         }
     }
     pthread_mutex_unlock(&slot->latch);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Write-back (Phase 3)                                                */
+/* ------------------------------------------------------------------ */
+
+void pb_mark_page0_dirty(PBOuterSlot *slot)
+{
+    if (!slot) return;
+    pthread_mutex_lock(&slot->latch);
+    slot->page0_dirty = 1;
+    pthread_mutex_unlock(&slot->latch);
+}
+
+void pb_mark_relation_dirty(PBOuterSlot *slot, const RelationDef *rel)
+{
+    if (!slot || !rel) return;
+    pthread_mutex_lock(&slot->latch);
+    /* Same technique pb_unpin_relation uses — see its comment. */
+    const PBInnerFrame *frame = (const PBInnerFrame *)rel;
+    int idx = (int)(frame - slot->inner);
+    if (idx >= 0 && idx < PB_INNER_SLOTS) slot->inner[idx].is_dirty = 1;
+    pthread_mutex_unlock(&slot->latch);
+}
+
+int pb_flush_slot_dirty(PBOuterSlot *slot)
+{
+    if (!slot || !slot->sf) return MYDB_ERR;
+    pthread_mutex_lock(&slot->latch);
+    int rc = flush_slot_dirty_locked(slot);
+    pthread_mutex_unlock(&slot->latch);
+    return rc;
+}
+
+int pb_discard_slot_dirty(PBOuterSlot *slot)
+{
+    if (!slot || !slot->sf) return MYDB_ERR;
+    pthread_mutex_lock(&slot->latch);
+    int rc = discard_slot_dirty_locked(slot);
+    pthread_mutex_unlock(&slot->latch);
+    return rc;
 }

@@ -310,6 +310,10 @@ static void test_persistence_round_trip(void)
     RelationDef d = make_simple_def("persisted");
     schema_add_relation(&sf, &d);
     schema_update_stats(&sf, "persisted", 100, 5, 3);
+    /* Phase 3: schema_update_stats no longer persists itself — explicit
+     * schema_save_page0 needed here (PartitionBuffer normally does this
+     * via pb_flush_slot_dirty). */
+    schema_save_page0(&sf);
     schema_close(&sf);
 
     SchemaFile sf2;
@@ -514,6 +518,10 @@ static void test_size_bytes_multi(void)
     CHECK(sf.header.size_bytes == (uint64_t)(3 + 7 + 1) * PAGE_SIZE,
           "size_bytes sums num_pages * PAGE_SIZE across slots");
 
+    /* Phase 3: schema_update_stats no longer persists itself — explicit
+     * schema_save_page0 needed to test the on-disk round-trip (the
+     * PartitionBuffer layer normally does this via pb_flush_slot_dirty). */
+    schema_save_page0(&sf);
     schema_close(&sf);
 
     SchemaFile sf2;
@@ -544,7 +552,10 @@ static void test_bump_pages_positive(void)
     CHECK(sf.header.size_bytes == (uint64_t)5 * PAGE_SIZE,
           "size_bytes recomputed after bump");
 
-    /* Persists across reopen. */
+    /* Phase 3: schema_bump_relation_pages no longer persists itself —
+     * explicit schema_save_page0 needed here (PartitionBuffer normally
+     * does this via pb_flush_slot_dirty). Persists across reopen. */
+    schema_save_page0(&sf);
     schema_close(&sf);
     SchemaFile sf2;
     schema_open(TEST_FILE, &sf2);
