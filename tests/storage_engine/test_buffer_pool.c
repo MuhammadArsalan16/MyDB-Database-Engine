@@ -42,7 +42,7 @@ static void test_fetch_and_unpin(void)
     page_set_checksum(wbuf);
     disk_write_page(&dm, pno, wbuf);
 
-    BufferPool bp;
+    static BufferPool bp;
     bp_init(&bp);
 
     /* Fetch the page — should load from disk */
@@ -66,7 +66,7 @@ static void test_dirty_flush(void)
     uint32_t pno;
     disk_alloc_page(&dm, &pno);
 
-    BufferPool bp;
+    static BufferPool bp;
     bp_init(&bp);
 
     /* Fetch, init as a valid page, modify the body, unpin as dirty */
@@ -98,7 +98,7 @@ static void test_cache_hit(void)
     uint32_t pno;
     disk_alloc_page(&dm, &pno);
 
-    BufferPool bp;
+    static BufferPool bp;
     bp_init(&bp);
 
     uint8_t *p1 = bp_fetch_page(&bp, &dm, TABLE_ID, pno);
@@ -127,7 +127,7 @@ static void test_lru_eviction(void)
         disk_alloc_page(&dm, &pno);
     }
 
-    BufferPool bp;
+    static BufferPool bp;
     bp_init(&bp);
 
     /* Fill all 64 frames by fetching pages 1..64 and immediately unpinning */
@@ -153,7 +153,7 @@ static void test_page0_rejected(void)
     DiskManager dm;
     disk_create(&dm, TEST_FILE);
 
-    BufferPool bp;
+    static BufferPool bp;
     bp_init(&bp);
 
     /* page 0 must never go through the buffer pool */
@@ -171,7 +171,7 @@ static void test_alloc_page(void)
     DiskManager dm;
     disk_create(&dm, TEST_FILE);
 
-    BufferPool bp;
+    static BufferPool bp;
     bp_init(&bp);
 
     uint32_t new_pno;

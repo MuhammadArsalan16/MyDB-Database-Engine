@@ -382,15 +382,23 @@ int pm_create_schema(PartitionCtx *ctx, const char *name)
             return MYDB_ERR;
     }
 
+    /* Allocate the persistent schema_id from the partition's durable
+     * counter before either file is touched — schema_create and
+     * cat_add_schema each stamp this same value into their own record. */
+    uint32_t schema_id;
+    int rc = cat_alloc_schema_id(&ctx->catalog, &schema_id);
+    if (rc != MYDB_OK) return rc;
+
     SchemaFile sf;
-    int rc = schema_create(path, ctx->catalog.header.partition_id, name, &sf);
+    rc = schema_create(path, ctx->catalog.header.partition_id, schema_id,
+                       name, &sf);
     if (rc != MYDB_OK) {
         rmdir(dir);   /* best-effort cleanup if dir was newly created */
         return rc;
     }
     schema_close(&sf);
 
-    rc = cat_add_schema(&ctx->catalog, name);
+    rc = cat_add_schema(&ctx->catalog, name, schema_id);
     if (rc != MYDB_OK) {
         unlink(path);
         rmdir(dir);
@@ -492,9 +500,15 @@ int pm_create_table(PartitionCtx *ctx, RelationDef *rel)
     strncpy(rel->owner_schema, sf->header.schema_name,
             sizeof(rel->owner_schema) - 1);
 
+    /* Allocate the persistent table_id from the partition's durable
+     * counter before storage ever touches disk — storage_create_table
+     * just stamps this value into the relation file's own header. */
+    int rc = cat_alloc_table_id(&ctx->catalog, &rel->table_id);
+    if (rc != MYDB_OK) return rc;
+
     /* Create the relation file and allocate its B+ tree root pages.
      * storage_create_table fills in rel->root_page_no. */
-    int rc = storage_create_table(&ctx->storage, rel);
+    rc = storage_create_table(&ctx->storage, rel);
     if (rc != MYDB_OK) return rc;
 
     /* Persist the relation in the active schema. schema_add_relation

@@ -533,11 +533,8 @@ int btree_insert(BTree *bt, const Value *key,
 
         bt->root_page_no = root_pno;
 
-        /* Update root page in file header */
-        FileHeader fh;
-        disk_read_header(bt->dm, &fh);
-        fh.root_page_no = root_pno;
-        disk_write_header(bt->dm, &fh);
+        /* Root page lives in __schema.mydb (RelationDef.root_page_no), not
+         * in this file's own FileHeader — nothing here reads it back. */
 
         if (out_rid) { out_rid->page_no = root_pno; out_rid->slot_no = 0; }
         return MYDB_OK;
@@ -685,11 +682,10 @@ int btree_insert(BTree *bt, const Value *key,
 
     bt->root_page_no = new_root_pno;
 
-    /* Persist new root in the file header */
-    FileHeader fh;
-    disk_read_header(bt->dm, &fh);
-    fh.root_page_no = new_root_pno;
-    disk_write_header(bt->dm, &fh);
+    /* Root page lives in __schema.mydb (RelationDef.root_page_no) — the
+     * caller (pm_insert/pm_update) already snapshots-and-compares
+     * rel->root_page_no around this call and force-flushes the schema
+     * file when it changes. Nothing here reads FileHeader back. */
 
     return MYDB_OK;
 }

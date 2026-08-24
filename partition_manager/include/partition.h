@@ -25,12 +25,22 @@ typedef struct {
     uint64_t quota_bytes;      /* maximum storage allowed */
     uint64_t used_bytes;       /* current consumption — persisted authoritatively */
     uint8_t  num_schemas;      /* count of valid schema slots */
+    uint32_t next_table_id;    /* durable per-partition counter; next value handed
+                                 * out by cat_alloc_table_id(). Never reused, even
+                                 * across restarts — the WAL-addressing property
+                                 * a per-process counter couldn't provide. */
+    uint32_t next_schema_id;   /* durable per-partition counter; next value handed
+                                 * out by cat_alloc_schema_id(). Same never-reused
+                                 * guarantee as next_table_id. */
 } CatalogHeader;
 
 typedef struct {
-    char    schema_name[32];
-    uint8_t num_relations;     /* updated by schema_file.c when relations come/go */
-    uint8_t is_valid;          /* 1 = occupied, 0 = empty */
+    char     schema_name[32];
+    uint8_t  num_relations;    /* updated by schema_file.c when relations come/go */
+    uint8_t  is_valid;         /* 1 = occupied, 0 = empty */
+    uint32_t schema_id;        /* persistent identity; mirrors the schema file's
+                                 * own SchemaHeader.schema_id. Catalog-level copy
+                                 * — read here, not by opening __schema.mydb. */
 } SchemaEntry;
 
 typedef struct {
@@ -55,9 +65,11 @@ int cat_close(Catalog *cat);
 /* Refresh last_modified, repack, recompute checksum, pwrite, fsync. */
 int cat_save(Catalog *cat);
 
-/* Add a schema slot. Rejects duplicates. Returns MYDB_ERR_FULL when
- * all MAX_SCHEMAS_PER_PARTITION slots are valid. Persists. */
-int cat_add_schema(Catalog *cat, const char *schema_name);
+/* Add a schema slot, stamping the already-allocated schema_id (from
+ * cat_alloc_schema_id) into the new entry. Rejects duplicates. Returns
+ * MYDB_ERR_FULL when all MAX_SCHEMAS_PER_PARTITION slots are valid.
+ * Persists. */
+int cat_add_schema(Catalog *cat, const char *schema_name, uint32_t schema_id);
 
 /* Mark a schema slot empty. Does NOT delete <partition>/<schema>/
  * on disk — that's a higher-layer DROP DATABASE concern. */
@@ -71,6 +83,19 @@ int cat_track_alloc(Catalog *cat, int64_t delta_bytes);
 /* Linear lookup. Returns NULL if no valid match. Pointer is valid
  * for the lifetime of *cat. */
 SchemaEntry *cat_find_schema(Catalog *cat, const char *schema_name);
+
+/* Hand out the next persistent table_id and persist the advanced counter
+ * before returning it — durable and never reused, even across restarts.
+ * Called once per CREATE TABLE, by pm_create_table, before
+ * storage_create_table stamps the id into the relation's own file header. */
+int cat_alloc_table_id(Catalog *cat, uint32_t *out_id);
+
+/* Hand out the next persistent schema_id and persist the advanced counter
+ * before returning it — same durability guarantee as cat_alloc_table_id.
+ * Called once per CREATE SCHEMA, by pm_create_schema, before schema_create
+ * stamps the id into the schema file's own header and cat_add_schema
+ * stamps it into this schema's catalog-level SchemaEntry. */
+int cat_alloc_schema_id(Catalog *cat, uint32_t *out_id);
 
 /* ------------------------------------------------------------------ */
 /*  Quota-aware page allocation                                       */

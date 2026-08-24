@@ -2,6 +2,7 @@
 #define DISK_MANAGER_H
 
 #include "common.h"
+#include "file_header.h"
 
 /*
  * disk_manager.h — lowest layer of the storage engine
@@ -10,10 +11,16 @@
  * pread/pwrite so we never load an entire file into memory.
  *
  * File layout:
- *   Page 0  : FileHeader (metadata — magic, version, page count, root page)
+ *   Page 0  : FileHeader (id prefix, page count, persistent table_id, flags)
  *   Page 1+ : Data / index pages (each exactly PAGE_SIZE bytes)
  *
  * Page N starts at byte offset: N * PAGE_SIZE
+ *
+ * NOTE: the clustered B+ tree's root page is NOT tracked here. It lives in
+ * __schema.mydb (RelationDef.root_page_no), which is the caller-supplied
+ * value btree_init() is seeded with at open_table() time — never read back
+ * from this header. Keeping it out of FileHeader avoids two disk-resident
+ * copies of the same fact that could drift.
  */
 
 /* ------------------------------------------------------------------ */
@@ -23,13 +30,16 @@
 #define FILEHDR_FLAG_AUTO_INCREMENT 0x01  /* table has an AUTO_INCREMENT column */
 
 typedef struct {
-    uint32_t magic;         /* MYDB_MAGIC (0x4D594442) — sanity check on open */
-    uint32_t version;       /* file format version, currently 1 */
-    uint32_t num_pages;     /* total pages in file including page 0 */
-    uint32_t root_page_no;  /* root page of the clustered B+ Tree */
-    uint8_t  flags;         /* FILEHDR_FLAG_* bits — see above */
+    FileHeaderId id;         /* magic + version + file_type (== FILETYPE_RELATION) */
+    uint32_t     num_pages;  /* total pages in file including page 0 */
+    uint32_t     table_id;   /* persistent identity, assigned once at CREATE TABLE;
+                              * RelationEntry.table_id (__schema.mydb) is the fast-path
+                              * copy the engine actually reads — this one lets an
+                              * orphaned .mydb file self-identify (e.g. during
+                              * recovery) without consulting the schema catalog. */
+    uint8_t      flags;      /* FILEHDR_FLAG_* bits — see above */
     /* remaining bytes padded to PAGE_SIZE so page 1 starts at the right offset */
-    uint8_t  _pad[PAGE_SIZE - 17];
+    uint8_t      _pad[PAGE_SIZE - sizeof(FileHeaderId) - 9];
 } FileHeader;
 
 /* ------------------------------------------------------------------ */

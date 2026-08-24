@@ -68,7 +68,6 @@ typedef struct StorageEngine {
     BufferPool  bp;
     OpenTable   open_tables[MAX_TABLES];
     int         num_open;
-    int         next_table_id;   /* monotonic counter for buffer-pool table IDs */
     int         initialized;
     DiskManager *last_written_dm; /* track for fsync on commit */
 } StorageEngine;
