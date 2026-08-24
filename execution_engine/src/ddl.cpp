@@ -15,6 +15,7 @@
 #include "result_fmt.hpp"
 #include "value_cast.hpp"
 #include "stats.h"
+#include "relation_guard.hpp"
 
 #include <cstring>
 #include <cstdio>
@@ -361,7 +362,9 @@ int exec_create_table(ExecContext *ectx, const CreateTableStatement *s,
         }
 
         /* (2) Referenced table must exist in the active schema. */
-        const RelationDef *ref_rel = pm_find_relation_const(ectx->partition, fk.ref_table.c_str());
+        RelationGuard ref_rel_guard(ectx->partition,
+                                     pm_find_relation_const(ectx->partition, fk.ref_table.c_str()));
+        const RelationDef *ref_rel = ref_rel_guard.get();
         if (!ref_rel) {
             snprintf(out, cap,
                      "  Error: FOREIGN KEY references unknown table '%s'",
@@ -433,7 +436,9 @@ int exec_create_index(ExecContext *ectx, const CreateIndexStatement *s,
     REQUIRE_SCHEMA(ectx);
 
     /* Resolve the table */
-    const RelationDef *rel = pm_find_relation_const(ectx->partition, s->table_name.c_str());
+    RelationGuard rel_guard(ectx->partition,
+                             pm_find_relation_const(ectx->partition, s->table_name.c_str()));
+    const RelationDef *rel = rel_guard.get();
     if (!rel) {
         snprintf(out, cap, "  Error: table '%s' does not exist",
                  s->table_name.c_str());
@@ -492,7 +497,9 @@ int exec_drop_table(ExecContext *ectx, const DropTableStatement *s,
     REQUIRE_LOGIN(ectx);
     REQUIRE_SCHEMA(ectx);
 
-    const RelationDef *rel = pm_find_relation_const(ectx->partition, s->table_name.c_str());
+    RelationGuard rel_guard(ectx->partition,
+                             pm_find_relation_const(ectx->partition, s->table_name.c_str()));
+    const RelationDef *rel = rel_guard.get();
     if (!rel) {
         snprintf(out, cap, "  Error: table '%s' does not exist",
                  s->table_name.c_str());
@@ -556,9 +563,10 @@ int exec_show_databases(ExecContext *ectx,
     TableBuilder tb;
     tb.set_headers({"Database"});
 
-    for (int i = 0; i < MAX_SCHEMAS_PER_PARTITION; i++) {
-        if (!ectx->partition->catalog.schemas[i].is_valid) continue;
-        tb.add_row({ectx->partition->catalog.schemas[i].schema_name});
+    const Catalog *cat = pctx_catalog(ectx->partition);
+    for (int i = 0; cat && i < MAX_SCHEMAS_PER_PARTITION; i++) {
+        if (!cat->schemas[i].is_valid) continue;
+        tb.add_row({cat->schemas[i].schema_name});
     }
 
     tb.render(rb);
@@ -699,7 +707,9 @@ int exec_analyze_table(ExecContext *ectx, const AnalyzeTableStatement *s,
     REQUIRE_LOGIN(ectx);
     REQUIRE_SCHEMA(ectx);
 
-    const RelationDef *rel = pm_find_relation_const(ectx->partition, s->table_name.c_str());
+    RelationGuard rel_guard(ectx->partition,
+                             pm_find_relation_const(ectx->partition, s->table_name.c_str()));
+    const RelationDef *rel = rel_guard.get();
     if (!rel) {
         snprintf(out, cap, "  Error: table '%s' does not exist",
                  s->table_name.c_str());
@@ -707,13 +717,15 @@ int exec_analyze_table(ExecContext *ectx, const AnalyzeTableStatement *s,
     }
 
     /*
-     * Resolve the relation's slot in the active SchemaFile.  pm_analyze_table
-     * writes the computed stats into sf->pages[slot_idx]; the planner later
-     * reads the same slot.  pm_find_relation_const returns &defs[i], so the
-     * pointer difference gives i directly (parallel arrays).
+     * Resolve the relation's slot in the active schema's directory.
+     * pm_analyze_table writes the computed stats into sf->pages[slot_idx];
+     * the planner later reads the same slot. Phase 2: this is the
+     * relations[] directory index, not a cache-frame index — pointer
+     * arithmetic against `rel` can no longer answer this now that only
+     * 32 of up to 64 relations are ever cached at once (see
+     * pm_relation_slot_index's doc comment, pm_api.h).
      */
-    SchemaFile *as       = pctx_active_schema(ectx->partition);
-    int         slot_idx = (int)(rel - as->defs);
+    int slot_idx = pm_relation_slot_index(ectx->partition, s->table_name.c_str());
     if (slot_idx < 0 || slot_idx >= MAX_RELATIONS_PER_SCHEMA) {
         snprintf(out, cap, "  Error: cannot locate '%s' in schema",
                  s->table_name.c_str());
@@ -919,7 +931,9 @@ int exec_describe_table(ExecContext *ectx,
     REQUIRE_LOGIN(ectx);
     REQUIRE_SCHEMA(ectx);
 
-    const RelationDef *rel = pm_find_relation_const(ectx->partition, s->table_name.c_str());
+    RelationGuard rel_guard(ectx->partition,
+                             pm_find_relation_const(ectx->partition, s->table_name.c_str()));
+    const RelationDef *rel = rel_guard.get();
     if (!rel) {
         snprintf(out, cap, "  Error: Table '%s' not found in schema '%s'",
                  s->table_name.c_str(), ectx->conn->current_schema_name);
@@ -933,15 +947,15 @@ int exec_describe_table(ExecContext *ectx,
      * we fall back gracefully: stats columns show "N/A".  The StatsBuffer owns
      * the handle — we do not open or close it here.
      *
-     * slot_idx: pm_find_relation_const returns &active_schema.defs[i], so
-     * pointer arithmetic gives us i directly (parallel arrays).
+     * slot_idx: the relations[] directory index (Phase 2: not a cache-
+     * frame index — see pm_relation_slot_index's doc comment, pm_api.h).
      */
     StatsFile *sf       = ectx->stats;
     bool       stats_ok = false;   /* true once the page is loaded */
     int        slot_idx = -1;
 
     if (s->full && sf) {
-        slot_idx = (int)(rel - pctx_active_schema(ectx->partition)->defs);
+        slot_idx = pm_relation_slot_index(ectx->partition, s->table_name.c_str());
         if (slot_idx >= 0 && slot_idx < MAX_RELATIONS_PER_SCHEMA &&
             stats_load_relation(sf, slot_idx) == MYDB_OK) {
             stats_ok = true;
@@ -1183,7 +1197,8 @@ int exec_describe_partition(ExecContext *ectx,
     REQUIRE_LOGIN(ectx);
     REQUIRE_PARTITION(ectx);   /* analysts may not inspect partition metadata */
 
-    const Catalog       *cat = &ectx->partition->catalog;
+    const Catalog       *cat = pctx_catalog(ectx->partition);
+    if (!cat) return MYDB_ERR_PERM;
     const CatalogHeader *hdr = &cat->header;
 
     ResultBuf rb(out, cap);

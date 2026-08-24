@@ -181,20 +181,23 @@ static void test_add_relation_basic(void)
     CHECK(schema_add_relation(&sf, &def) == MYDB_OK, "add_relation succeeds");
     CHECK(sf.header.num_relations == 1,              "num_relations bumped");
 
-    RelationDef *got = schema_find_relation(&sf, "students");
-    CHECK(got != NULL,                                "find_relation returns def");
-    CHECK(got->num_columns == 2,                      "num_columns round-trip");
-    CHECK(got->root_page_no == 99,                    "root_page_no round-trip");
-    CHECK(got->auto_incr_counter == 1,                "auto_incr_counter round-trip");
-    CHECK(strcmp(got->columns[0].name, "id") == 0,    "col[0] name round-trip");
-    CHECK(got->columns[0].is_primary_key == 1,        "col[0] pk flag round-trip");
-
     RelationEntry *stat = schema_find_relation_stat(&sf, "students");
     CHECK(stat != NULL,                               "find_relation_stat works");
     CHECK(stat->is_valid == 1,                        "stat slot is valid");
     CHECK(stat->page_no >= 1 && stat->page_no < SCHEMA_FILE_PAGES,
                                                       "page_no in valid range");
     CHECK(stat->num_columns == 2,                     "stat num_columns set");
+
+    /* Phase 2: RelationDef content is no longer cached on SchemaFile —
+     * load the page directly to verify what was actually written. */
+    RelationDef got;
+    CHECK(schema_load_relation_page(&sf, stat->page_no, &got) == MYDB_OK,
+          "load_relation_page succeeds");
+    CHECK(got.num_columns == 2,                      "num_columns round-trip");
+    CHECK(got.root_page_no == 99,                    "root_page_no round-trip");
+    CHECK(got.auto_incr_counter == 1,                "auto_incr_counter round-trip");
+    CHECK(strcmp(got.columns[0].name, "id") == 0,    "col[0] name round-trip");
+    CHECK(got.columns[0].is_primary_key == 1,        "col[0] pk flag round-trip");
 
     schema_close(&sf);
 }
@@ -264,8 +267,8 @@ static void test_remove_and_reuse(void)
 
     CHECK(schema_remove_relation(&sf, "alpha") == MYDB_OK,    "remove succeeds");
     CHECK(sf.header.num_relations == 1,                       "count drops");
-    CHECK(schema_find_relation(&sf, "alpha") == NULL,         "removed disappears");
-    CHECK(schema_find_relation(&sf, "beta")  != NULL,         "sibling intact");
+    CHECK(schema_find_relation_stat(&sf, "alpha") == NULL,    "removed disappears");
+    CHECK(schema_find_relation_stat(&sf, "beta")  != NULL,    "sibling intact");
 
     /* re-add: should reuse the freed slot/page */
     RelationDef c = make_simple_def("gamma");
@@ -276,6 +279,10 @@ static void test_remove_and_reuse(void)
 
     schema_close(&sf);
 }
+
+/* pin_count moved off SchemaFile in Phase 2 — it now lives on PartitionBuffer's
+ * PBInnerFrame (partition_buffer.h), tested against the real pin/release
+ * discipline in test_pm_api.c instead of here. */
 
 static void test_remove_missing(void)
 {
@@ -303,6 +310,10 @@ static void test_persistence_round_trip(void)
     RelationDef d = make_simple_def("persisted");
     schema_add_relation(&sf, &d);
     schema_update_stats(&sf, "persisted", 100, 5, 3);
+    /* Phase 3: schema_update_stats no longer persists itself — explicit
+     * schema_save_page0 needed here (PartitionBuffer normally does this
+     * via pb_flush_slot_dirty). */
+    schema_save_page0(&sf);
     schema_close(&sf);
 
     SchemaFile sf2;
@@ -320,9 +331,10 @@ static void test_persistence_round_trip(void)
     CHECK(sf2.header.size_bytes == (uint64_t)5 * PAGE_SIZE,
           "size_bytes recomputed on load");
 
-    RelationDef *def = schema_find_relation(&sf2, "persisted");
-    CHECK(def != NULL,                   "RelationDef recovered");
-    CHECK(def->root_page_no == 99,       "root_page_no persisted in def page");
+    RelationDef def;
+    CHECK(schema_load_relation_page(&sf2, stat->page_no, &def) == MYDB_OK,
+          "RelationDef recovered");
+    CHECK(def.root_page_no == 99,        "root_page_no persisted in def page");
 
     schema_close(&sf2);
 }
@@ -414,14 +426,18 @@ static void test_full_relation_def_round_trip(void)
 
     SchemaFile sf2;
     CHECK(schema_open(TEST_FILE, &sf2) == MYDB_OK, "reopen succeeds");
-    RelationDef *got = schema_find_relation(&sf2, "kitchen_sink");
-    CHECK(got != NULL, "RelationDef recovered");
+    RelationEntry *stat = schema_find_relation_stat(&sf2, "kitchen_sink");
+    CHECK(stat != NULL, "relation directory entry recovered");
+
+    RelationDef got;
+    CHECK(stat && schema_load_relation_page(&sf2, stat->page_no, &got) == MYDB_OK,
+          "RelationDef recovered");
 
     /* owner_schema is stamped from the schema header on load (v3, in-memory only) */
     strncpy(r.owner_schema, TEST_NAME, sizeof(r.owner_schema) - 1);
 
     /* deep equality — memcmp because both structs are zeroed in their padding */
-    CHECK(memcmp(got, &r, sizeof(RelationDef)) == 0,
+    CHECK(memcmp(&got, &r, sizeof(RelationDef)) == 0,
           "full RelationDef byte-equal after round-trip");
 
     schema_close(&sf2);
@@ -441,20 +457,26 @@ static void test_flush_relation(void)
     RelationDef d = make_simple_def("counters");
     schema_add_relation(&sf, &d);
 
-    /* mutate in-memory and flush */
-    RelationDef *got = schema_find_relation(&sf, "counters");
-    got->auto_incr_counter = 555;
-    got->root_page_no      = 1234;
-    CHECK(schema_flush_relation(&sf, "counters") == MYDB_OK,
+    /* Phase 2: load into a local copy, mutate that, flush it back —
+     * schema_file.c holds no cached copy of its own to mutate in place. */
+    RelationEntry *stat = schema_find_relation_stat(&sf, "counters");
+    RelationDef got;
+    schema_load_relation_page(&sf, stat->page_no, &got);
+    got.auto_incr_counter = 555;
+    got.root_page_no      = 1234;
+    CHECK(schema_flush_relation(&sf, &got) == MYDB_OK,
           "flush_relation succeeds");
     schema_close(&sf);
 
     SchemaFile sf2;
     schema_open(TEST_FILE, &sf2);
-    RelationDef *got2 = schema_find_relation(&sf2, "counters");
-    CHECK(got2 != NULL,                          "relation recovered");
-    CHECK(got2->auto_incr_counter == 555,        "auto_incr_counter persisted");
-    CHECK(got2->root_page_no      == 1234,       "root_page_no persisted");
+    RelationEntry *stat2 = schema_find_relation_stat(&sf2, "counters");
+    CHECK(stat2 != NULL,                          "relation recovered");
+    RelationDef got2;
+    CHECK(stat2 && schema_load_relation_page(&sf2, stat2->page_no, &got2) == MYDB_OK,
+          "flushed page reloads");
+    CHECK(got2.auto_incr_counter == 555,          "auto_incr_counter persisted");
+    CHECK(got2.root_page_no      == 1234,         "root_page_no persisted");
     schema_close(&sf2);
 }
 
@@ -465,7 +487,8 @@ static void test_flush_missing(void)
 
     SchemaFile sf;
     schema_create(TEST_FILE, TEST_PID, TEST_SID, TEST_NAME, &sf);
-    CHECK(schema_flush_relation(&sf, "nope") == MYDB_ERR_NOT_FOUND,
+    RelationDef ghost = make_simple_def("nope");
+    CHECK(schema_flush_relation(&sf, &ghost) == MYDB_ERR_NOT_FOUND,
           "flush missing returns NOT_FOUND");
     schema_close(&sf);
 }
@@ -495,6 +518,10 @@ static void test_size_bytes_multi(void)
     CHECK(sf.header.size_bytes == (uint64_t)(3 + 7 + 1) * PAGE_SIZE,
           "size_bytes sums num_pages * PAGE_SIZE across slots");
 
+    /* Phase 3: schema_update_stats no longer persists itself — explicit
+     * schema_save_page0 needed to test the on-disk round-trip (the
+     * PartitionBuffer layer normally does this via pb_flush_slot_dirty). */
+    schema_save_page0(&sf);
     schema_close(&sf);
 
     SchemaFile sf2;
@@ -525,7 +552,10 @@ static void test_bump_pages_positive(void)
     CHECK(sf.header.size_bytes == (uint64_t)5 * PAGE_SIZE,
           "size_bytes recomputed after bump");
 
-    /* Persists across reopen. */
+    /* Phase 3: schema_bump_relation_pages no longer persists itself —
+     * explicit schema_save_page0 needed here (PartitionBuffer normally
+     * does this via pb_flush_slot_dirty). Persists across reopen. */
+    schema_save_page0(&sf);
     schema_close(&sf);
     SchemaFile sf2;
     schema_open(TEST_FILE, &sf2);

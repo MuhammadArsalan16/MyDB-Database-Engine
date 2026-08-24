@@ -529,30 +529,10 @@ int schema_open(const char *path, SchemaFile *out)
         return rc;
     }
 
-    /* load every valid relation's def page into defs[] */
-    uint8_t buf[PAGE_SIZE];
-    for (int i = 0; i < MAX_RELATIONS_PER_SCHEMA; i++) {
-        if (!out->relations[i].is_valid) continue;
-        uint8_t pno = out->relations[i].page_no;
-        if (pno == 0 || pno >= SCHEMA_FILE_PAGES) {
-            close(fd);
-            return MYDB_ERR;
-        }
-        if (read_page(fd, pno, buf) != MYDB_OK) {
-            close(fd);
-            return MYDB_ERR;
-        }
-        if (relation_def_deserialize(&out->defs[i], buf) != MYDB_OK) {
-            close(fd);
-            return MYDB_ERR;
-        }
-        /* Stamp the owning schema (in-memory only, not serialized) so the
-         * storage engine can build the table's path and key its open-table
-         * cache by (owner_schema, relation_name) without holding any
-         * active-schema state of its own. */
-        strncpy(out->defs[i].owner_schema, out->header.schema_name,
-                sizeof(out->defs[i].owner_schema) - 1);
-    }
+    /* Phase 2: RelationDef pages are no longer eagerly loaded here — only
+     * Page 0 (header + relations[] directory). Each relation's def page is
+     * lazy-loaded on first access into PartitionBuffer's inner cache (see
+     * pm_find_relation / partition_buffer.c's pb_get_relation_frame). */
 
     out->fd = fd;
     strncpy(out->path, path, sizeof(out->path) - 1);
@@ -578,6 +558,20 @@ int schema_save_page0(SchemaFile *sf)
     pack_page0(sf, buf);
 
     if (write_page(sf->fd, 0, buf) != MYDB_OK) return MYDB_ERR;
+    return MYDB_OK;
+}
+
+int schema_reload_page0(SchemaFile *sf)
+{
+    if (!sf || sf->fd < 0) return MYDB_ERR;
+
+    uint8_t buf[PAGE_SIZE];
+    if (read_page(sf->fd, 0, buf) != MYDB_OK) return MYDB_ERR;
+
+    int rc = unpack_page0(buf, sf);
+    if (rc != MYDB_OK) return rc;
+
+    sf->header.size_bytes = schema_compute_size_bytes(sf);
     return MYDB_OK;
 }
 
@@ -610,10 +604,6 @@ int schema_add_relation(SchemaFile *sf, const RelationDef *def)
     e->reserved    = 0;
     e->table_id    = def->table_id;
 
-    sf->defs[slot] = *def;
-    /* Stamp the owning schema on the in-memory def (not serialized). */
-    strncpy(sf->defs[slot].owner_schema, sf->header.schema_name,
-            sizeof(sf->defs[slot].owner_schema) - 1);
     sf->header.num_relations++;
     sf->header.size_bytes = schema_compute_size_bytes(sf);
 
@@ -637,18 +627,10 @@ int schema_remove_relation(SchemaFile *sf, const char *relation_name)
     }
 
     memset(&sf->relations[slot], 0, sizeof(sf->relations[slot]));
-    memset(&sf->defs[slot],      0, sizeof(sf->defs[slot]));
     if (sf->header.num_relations > 0) sf->header.num_relations--;
     sf->header.size_bytes = schema_compute_size_bytes(sf);
 
     return schema_save_page0(sf);
-}
-
-RelationDef *schema_find_relation(SchemaFile *sf, const char *relation_name)
-{
-    if (!sf || !relation_name) return NULL;
-    int slot = find_slot(sf, relation_name);
-    return (slot < 0) ? NULL : &sf->defs[slot];
 }
 
 RelationEntry *schema_find_relation_stat(SchemaFile *sf, const char *relation_name)
@@ -658,15 +640,33 @@ RelationEntry *schema_find_relation_stat(SchemaFile *sf, const char *relation_na
     return (slot < 0) ? NULL : &sf->relations[slot];
 }
 
-int schema_flush_relation(SchemaFile *sf, const char *relation_name)
+int schema_load_relation_page(SchemaFile *sf, uint8_t page_no, RelationDef *out)
 {
-    if (!sf || !relation_name || sf->fd < 0) return MYDB_ERR;
+    if (!sf || !out || sf->fd < 0) return MYDB_ERR;
+    if (page_no == 0 || page_no >= SCHEMA_FILE_PAGES) return MYDB_ERR;
 
-    int slot = find_slot(sf, relation_name);
+    uint8_t buf[PAGE_SIZE];
+    if (read_page(sf->fd, page_no, buf) != MYDB_OK) return MYDB_ERR;
+    if (relation_def_deserialize(out, buf) != MYDB_OK) return MYDB_ERR;
+
+    /* Stamp the owning schema (in-memory only, not serialized) so the
+     * storage engine can build the table's path and key its open-table
+     * cache by (owner_schema, relation_name) without holding any
+     * active-schema state of its own. */
+    strncpy(out->owner_schema, sf->header.schema_name,
+            sizeof(out->owner_schema) - 1);
+    return MYDB_OK;
+}
+
+int schema_flush_relation(SchemaFile *sf, const RelationDef *def)
+{
+    if (!sf || !def || sf->fd < 0) return MYDB_ERR;
+
+    int slot = find_slot(sf, def->relation_name);
     if (slot < 0) return MYDB_ERR_NOT_FOUND;
 
     uint8_t page[PAGE_SIZE];
-    if (relation_def_serialize(&sf->defs[slot], page) != MYDB_OK)
+    if (relation_def_serialize(def, page) != MYDB_OK)
         return MYDB_ERR;
     if (write_page(sf->fd, sf->relations[slot].page_no, page) != MYDB_OK)
         return MYDB_ERR;
@@ -688,7 +688,10 @@ int schema_update_stats(SchemaFile *sf, const char *relation_name,
     e->tree_height = tree_height;
     sf->header.size_bytes = schema_compute_size_bytes(sf);
 
-    return schema_save_page0(sf);
+    /* Phase 3: no longer persisted here — caller marks page0_dirty via
+     * pb_mark_page0_dirty (partition_buffer.h); pb_flush_slot_dirty
+     * writes it out later, on COMMIT/eviction/shutdown. */
+    return MYDB_OK;
 }
 
 int schema_bump_relation_pages(SchemaFile *sf, const char *relation_name,
@@ -709,7 +712,9 @@ int schema_bump_relation_pages(SchemaFile *sf, const char *relation_name,
     e->num_pages = (uint32_t)((int64_t)e->num_pages + delta);
     sf->header.size_bytes = schema_compute_size_bytes(sf);
 
-    return schema_save_page0(sf);
+    /* Phase 3: no longer persisted here — see schema_update_stats's
+     * comment above. */
+    return MYDB_OK;
 }
 
 int schema_bump_relation_rows(SchemaFile *sf, const char *relation_name,
@@ -728,7 +733,9 @@ int schema_bump_relation_rows(SchemaFile *sf, const char *relation_name,
 
     e->num_rows = (uint32_t)((int64_t)e->num_rows + delta);
 
-    return schema_save_page0(sf);
+    /* Phase 3: no longer persisted here — see schema_update_stats's
+     * comment above. */
+    return MYDB_OK;
 }
 
 uint64_t schema_compute_size_bytes(const SchemaFile *sf)

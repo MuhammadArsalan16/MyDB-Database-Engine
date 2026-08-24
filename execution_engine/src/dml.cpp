@@ -12,6 +12,7 @@
 #include "expr_eval.hpp"
 #include "exec_access_path.hpp"   /* AccessPath, extract_sargs, plan_to_ap */
 #include "planner.h"              /* Sarg, PlanNode, planner_choose_path   */
+#include "relation_guard.hpp"
 
 #include <cstring>
 #include <cstdio>
@@ -79,7 +80,9 @@ int exec_insert(ExecContext *ectx, const InsertStatement *s,
     }
 
     /* look up the table */
-    const RelationDef *rel_c = pm_find_relation_const(ectx->partition, s->table_name.c_str());
+    RelationGuard rel_guard(ectx->partition,
+                             pm_find_relation_const(ectx->partition, s->table_name.c_str()));
+    const RelationDef *rel_c = rel_guard.get();
     if (!rel_c) {
         snprintf(out, cap, "  Error: table '%s' does not exist",
                  s->table_name.c_str());
@@ -290,7 +293,9 @@ int exec_update(ExecContext *ectx,
     }
 
     /* find the table */
-    const RelationDef *rel_c = pm_find_relation_const(ectx->partition, s->table_name.c_str());
+    RelationGuard rel_guard(ectx->partition,
+                             pm_find_relation_const(ectx->partition, s->table_name.c_str()));
+    const RelationDef *rel_c = rel_guard.get();
     if (!rel_c) {
         snprintf(out, cap, "  Error: table '%s' does not exist",
                  s->table_name.c_str());
@@ -449,7 +454,9 @@ int exec_delete(ExecContext *ectx,
     }
 
     /* find the table */
-    const RelationDef *rel_c = pm_find_relation_const(ectx->partition, s->table_name.c_str());
+    RelationGuard rel_guard(ectx->partition,
+                             pm_find_relation_const(ectx->partition, s->table_name.c_str()));
+    const RelationDef *rel_c = rel_guard.get();
     if (!rel_c) {
         snprintf(out, cap, "  Error: table '%s' does not exist",
                  s->table_name.c_str());

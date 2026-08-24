@@ -65,6 +65,14 @@ int cat_close(Catalog *cat);
 /* Refresh last_modified, repack, recompute checksum, pwrite, fsync. */
 int cat_save(Catalog *cat);
 
+/* Re-read and unpack the catalog from disk into the already-open *cat,
+ * discarding any in-memory changes made since the last save (header +
+ * schemas[]; fd/path are untouched). Write-back counterpart to cat_save
+ * — used by pb_discard_catalog_dirty (partition_buffer.h) to revert a
+ * rolled-back transaction's uncommitted used_bytes bump without
+ * persisting it. Mirrors schema_reload_page0 (schema_file.h). */
+int cat_reload(Catalog *cat);
+
 /* Add a schema slot, stamping the already-allocated schema_id (from
  * cat_alloc_schema_id) into the new entry. Rejects duplicates. Returns
  * MYDB_ERR_FULL when all MAX_SCHEMAS_PER_PARTITION slots are valid.
@@ -77,7 +85,11 @@ int cat_remove_schema(Catalog *cat, const char *schema_name);
 
 /* Update used_bytes by delta_bytes (signed: + on alloc, - on free).
  * Returns MYDB_ERR_FULL if a positive delta would exceed quota_bytes,
- * MYDB_ERR if a negative delta would underflow. Persists on success. */
+ * MYDB_ERR if a negative delta would underflow. In memory only (Phase 4
+ * of the PartitionBuffer redesign — PARTITION_BUFFER_DESIGN.md) — does
+ * NOT persist. Caller marks the owning PB[0] slot dirty
+ * (pb_mark_catalog_dirty, partition_buffer.h); pm_commit/pm_rollback (or
+ * shutdown) resolve it via pb_flush_catalog_dirty/pb_discard_catalog_dirty. */
 int cat_track_alloc(Catalog *cat, int64_t delta_bytes);
 
 /* Linear lookup. Returns NULL if no valid match. Pointer is valid

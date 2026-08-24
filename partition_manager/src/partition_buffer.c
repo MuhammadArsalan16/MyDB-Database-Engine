@@ -5,47 +5,225 @@
 #include <string.h>
 #include <stdlib.h>
 
+/* Zero an outer slot's cache state back to "nothing resident" — dir[],
+ * inner[] (which also clears pin_count/is_dirty/fpi_pending), and
+ * inner_lru_order reset to identity order. Called whenever a slot starts
+ * representing a different schema (eviction-and-reuse in pb_get, or
+ * pb_remove) — never needed on a slot's first-ever use, since pb_init
+ * already leaves it in exactly this state. Does not touch sf or the
+ * latch itself. */
+static void reset_outer_slot_cache(PBOuterSlot *slot)
+{
+    memset(slot->dir,   0, sizeof(slot->dir));
+    memset(slot->inner, 0, sizeof(slot->inner));
+    for (int i = 0; i < PB_INNER_SLOTS; i++) slot->inner_lru_order[i] = i;
+}
+
+/* Move frame_idx to the front (MRU) of an outer slot's inner LRU order.
+ * Precondition: frame_idx is present in inner_lru_order[0..PB_INNER_SLOTS). */
+static void inner_lru_bump(PBOuterSlot *slot, int frame_idx)
+{
+    int p = 0;
+    while (p < PB_INNER_SLOTS && slot->inner_lru_order[p] != frame_idx) p++;
+    if (p >= PB_INNER_SLOTS) return;   /* not found — shouldn't happen */
+    for (int i = p; i > 0; i--)
+        slot->inner_lru_order[i] = slot->inner_lru_order[i - 1];
+    slot->inner_lru_order[0] = frame_idx;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Write-back internals (Phase 3) — all assume slot->latch is already
+ *  held by the caller. Shared by the public pb_flush_slot_dirty/
+ *  pb_discard_slot_dirty wrappers below AND by §7/§8's eviction paths,
+ *  which already hold the latch when they need to flush a dirty
+ *  slot/frame before reclaiming it — one implementation, not
+ *  reimplemented per call site.
+ * ------------------------------------------------------------------ */
+
+/* Flush this frame to disk if dirty; clears is_dirty on success. */
+static int flush_inner_frame_locked(PBOuterSlot *slot, int idx)
+{
+    if (!slot->inner[idx].is_dirty) return MYDB_OK;
+    int rc = schema_flush_relation(slot->sf, &slot->inner[idx].def);
+    if (rc != MYDB_OK) return rc;
+    slot->inner[idx].is_dirty = 0;
+    return MYDB_OK;
+}
+
+/* Flush Page 0 to disk if dirty; clears page0_dirty on success. */
+static int flush_page0_locked(PBOuterSlot *slot)
+{
+    if (!slot->page0_dirty) return MYDB_OK;
+    int rc = schema_save_page0(slot->sf);
+    if (rc != MYDB_OK) return rc;
+    slot->page0_dirty = 0;
+    return MYDB_OK;
+}
+
+/* Flush every dirty inner frame + Page 0. Best-effort — keeps going even
+ * if one write fails, so a single bad page doesn't block the rest;
+ * returns the first error encountered, if any. */
+static int flush_slot_dirty_locked(PBOuterSlot *slot)
+{
+    int rc = flush_page0_locked(slot);
+    for (int i = 0; i < PB_INNER_SLOTS; i++) {
+        int frc = flush_inner_frame_locked(slot, i);
+        if (frc != MYDB_OK && rc == MYDB_OK) rc = frc;
+    }
+    return rc;
+}
+
+/* Discard this frame's dirty in-memory content without persisting — mark
+ * non-resident so the next access reloads fresh from disk. No I/O:
+ * unlike Page 0 (below), a frame's content lives only in the cache, so
+ * "discard" is just forgetting it. */
+static void discard_inner_frame_locked(PBOuterSlot *slot, int idx)
+{
+    if (!slot->inner[idx].is_dirty) return;
+    slot->dir[idx].is_resident = 0;
+    slot->inner[idx].is_dirty  = 0;
+}
+
+/* Discard Page 0's in-memory changes by re-reading it from disk — unlike
+ * an inner frame, Page 0's content lives directly in sf->header/
+ * relations[] with no separate cache copy, so reverting requires an
+ * actual re-read rather than just forgetting something. */
+static int discard_page0_locked(PBOuterSlot *slot)
+{
+    if (!slot->page0_dirty) return MYDB_OK;
+    int rc = schema_reload_page0(slot->sf);
+    if (rc != MYDB_OK) return rc;
+    slot->page0_dirty = 0;
+    return MYDB_OK;
+}
+
+static int discard_slot_dirty_locked(PBOuterSlot *slot)
+{
+    int rc = discard_page0_locked(slot);
+    for (int i = 0; i < PB_INNER_SLOTS; i++)
+        discard_inner_frame_locked(slot, i);
+    return rc;
+}
+
 int pb_init(PartitionBuffer *pb)
 {
     if (!pb) return MYDB_ERR;
-    memset(pb, 0, sizeof(*pb));   /* all slots[] = NULL, n_loaded = 0 */
+    memset(pb, 0, sizeof(*pb));   /* all slots[].sf = NULL, n_loaded = 0 */
+    pb->catalog.cat.fd = -1;
+
+    if (pthread_mutex_init(&pb->catalog_latch, NULL) != 0) return MYDB_ERR;
+
+    for (int i = 0; i < PARTITION_BUFFER_SLOTS; i++) {
+        if (pthread_mutex_init(&pb->slots[i].latch, NULL) != 0) {
+            for (int j = 0; j < i; j++)
+                pthread_mutex_destroy(&pb->slots[j].latch);
+            pthread_mutex_destroy(&pb->catalog_latch);
+            return MYDB_ERR;
+        }
+        for (int f = 0; f < PB_INNER_SLOTS; f++)
+            pb->slots[i].inner_lru_order[f] = f;
+    }
     return MYDB_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Catalog (PB[0])                                                     */
+/* ------------------------------------------------------------------ */
+
+int pb_open_catalog(PartitionBuffer *pb, const char *path)
+{
+    if (!pb || !path) return MYDB_ERR;
+    return cat_open(path, &pb->catalog.cat);
+}
+
+Catalog *pb_catalog(PartitionBuffer *pb)
+{
+    if (!pb || pb->catalog.cat.fd < 0) return NULL;
+    return &pb->catalog.cat;
+}
+
+void pb_mark_catalog_dirty(PartitionBuffer *pb)
+{
+    if (!pb) return;
+    pthread_mutex_lock(&pb->catalog_latch);
+    pb->catalog.is_dirty = 1;
+    pthread_mutex_unlock(&pb->catalog_latch);
+}
+
+int pb_flush_catalog_dirty(PartitionBuffer *pb)
+{
+    if (!pb || pb->catalog.cat.fd < 0) return MYDB_ERR;
+    pthread_mutex_lock(&pb->catalog_latch);
+    int rc = MYDB_OK;
+    if (pb->catalog.is_dirty) {
+        rc = cat_save(&pb->catalog.cat);
+        if (rc == MYDB_OK) pb->catalog.is_dirty = 0;
+    }
+    pthread_mutex_unlock(&pb->catalog_latch);
+    return rc;
+}
+
+int pb_discard_catalog_dirty(PartitionBuffer *pb)
+{
+    if (!pb || pb->catalog.cat.fd < 0) return MYDB_ERR;
+    pthread_mutex_lock(&pb->catalog_latch);
+    int rc = MYDB_OK;
+    if (pb->catalog.is_dirty) {
+        rc = cat_reload(&pb->catalog.cat);
+        if (rc == MYDB_OK) pb->catalog.is_dirty = 0;
+    }
+    pthread_mutex_unlock(&pb->catalog_latch);
+    return rc;
 }
 
 SchemaFile *pb_active_schema(PartitionBuffer *pb)
 {
     if (!pb || pb->n_loaded == 0) return NULL;
-    return pb->slots[pb->lru_order[0]];   /* pointer, not address-of */
+    return pb->slots[pb->lru_order[0]].sf;
 }
 
 const char *pb_active_schema_name(const PartitionBuffer *pb)
 {
     if (!pb || pb->n_loaded == 0) return NULL;
-    return pb->slots[pb->lru_order[0]]->header.schema_name;
+    return pb->slots[pb->lru_order[0]].sf->header.schema_name;
 }
 
-/* Flush all dirty pages in the buffer pool for every cached schema.
- * se is the StorageEngine owned by the same PartitionCtx.
- * Does not close any SchemaFile handles. */
+/* Flush all dirty pages in the buffer pool for every cached schema, plus
+ * (Phase 3) every outer slot's dirty metadata. se is the StorageEngine
+ * owned by the same PartitionCtx. Does not close any SchemaFile handles.
+ * Shutdown safety net (pctx_close) — the per-statement path for metadata
+ * is pm_commit/pm_rollback, not this. */
 int pb_flush_all(PartitionBuffer *pb, StorageEngine *se)
 {
-    if (!pb || pb->n_loaded == 0) return MYDB_OK;
-    return storage_flush_all_dirty(se);
+    if (!pb) return MYDB_OK;
+    storage_flush_all_dirty(se);
+
+    int rc = MYDB_OK;
+    if (pb->catalog.cat.fd >= 0) rc = pb_flush_catalog_dirty(pb);
+
+    for (int i = 0; i < PARTITION_BUFFER_SLOTS; i++) {
+        if (!pb->slots[i].sf) continue;
+        int frc = pb_flush_slot_dirty(&pb->slots[i]);
+        if (frc != MYDB_OK && rc == MYDB_OK) rc = frc;
+    }
+    return rc;
 }
 
 void pb_destroy(PartitionBuffer *pb)
 {
     if (!pb) return;
-    /* Only iterate slots tracked in lru_order — safe on zero-initialized
-     * state where n_loaded=0. */
-    for (int i = 0; i < pb->n_loaded; i++) {
-        int slot = pb->lru_order[i];
-        SchemaFile *sf = pb->slots[slot];
-        if (sf) {
-            if (sf->fd > 0) schema_close(sf);
-            free(sf);
-            pb->slots[slot] = NULL;
+
+    if (pb->catalog.cat.fd > 0) cat_close(&pb->catalog.cat);
+    pthread_mutex_destroy(&pb->catalog_latch);
+
+    for (int i = 0; i < PARTITION_BUFFER_SLOTS; i++) {
+        PBOuterSlot *s = &pb->slots[i];
+        if (s->sf) {
+            if (s->sf->fd > 0) schema_close(s->sf);
+            free(s->sf);
+            s->sf = NULL;
         }
+        pthread_mutex_destroy(&s->latch);
     }
     pb->n_loaded = 0;
 }
@@ -65,18 +243,26 @@ static void lru_bump(PartitionBuffer *pb, int slot)
 /* Return the cached SchemaFile for schema_name without loading or bumping. */
 SchemaFile *pb_find(PartitionBuffer *pb, const char *schema_name)
 {
+    PBOuterSlot *s = pb_find_outer_slot(pb, schema_name);
+    return s ? s->sf : NULL;
+}
+
+PBOuterSlot *pb_find_outer_slot(PartitionBuffer *pb, const char *schema_name)
+{
     if (!pb || !schema_name) return NULL;
     for (int i = 0; i < PARTITION_BUFFER_SLOTS; i++) {
-        if (pb->slots[i] &&
-            strncmp(pb->slots[i]->header.schema_name, schema_name, 32) == 0)
-            return pb->slots[i];
+        if (pb->slots[i].sf &&
+            strncmp(pb->slots[i].sf->header.schema_name, schema_name, 32) == 0)
+            return &pb->slots[i];
     }
     return NULL;
 }
 
 /* Get-or-load the SchemaFile for schema_name, marking it MRU.
- * On a miss with all slots full, evicts the LRU slot (flush dirty pages,
- * close the handle, free) and reuses it. */
+ * On a miss with all slots full: §7's two-pass outer eviction — walk the
+ * LRU end, first candidate slot with no pinned inner frame is evicted and
+ * reused. Returns NULL if every slot has at least one pinned inner frame
+ * (fail-fast, no force-wait — see partition_buffer.h's file header). */
 SchemaFile *pb_get(PartitionBuffer *pb,
                    const char *schema_name,
                    const char *schema_path,
@@ -86,14 +272,15 @@ SchemaFile *pb_get(PartitionBuffer *pb,
 
     /* Cache hit — bump to MRU and return. */
     for (int i = 0; i < PARTITION_BUFFER_SLOTS; i++) {
-        if (pb->slots[i] &&
-            strncmp(pb->slots[i]->header.schema_name, schema_name, 32) == 0) {
+        if (pb->slots[i].sf &&
+            strncmp(pb->slots[i].sf->header.schema_name, schema_name, 32) == 0) {
             lru_bump(pb, i);
-            return pb->slots[i];
+            return pb->slots[i].sf;
         }
     }
 
-    /* Miss — open the schema file. */
+    /* Miss — open the schema file first, before touching any slot, so a
+     * failed open never disturbs existing cache state. */
     SchemaFile *sf = (SchemaFile *)calloc(1, sizeof(SchemaFile));
     if (!sf) return NULL;
     if (schema_open(schema_path, sf) != MYDB_OK) {
@@ -103,50 +290,95 @@ SchemaFile *pb_get(PartitionBuffer *pb,
 
     int slot;
     if (pb->n_loaded < PARTITION_BUFFER_SLOTS) {
-        /* Free slot available. */
+        /* Free slot available — already correctly "nothing resident" from
+         * pb_init, no reset needed. */
         slot = -1;
         for (int i = 0; i < PARTITION_BUFFER_SLOTS; i++)
-            if (pb->slots[i] == NULL) { slot = i; break; }
-        /* Shift lru_order right, insert new slot at MRU. */
+            if (pb->slots[i].sf == NULL) { slot = i; break; }
         for (int i = pb->n_loaded; i > 0; i--)
             pb->lru_order[i] = pb->lru_order[i - 1];
         pb->lru_order[0] = slot;
         pb->n_loaded++;
     } else {
-        /* Full — evict the LRU slot (tail of lru_order). */
-        slot = pb->lru_order[pb->n_loaded - 1];
-        if (pb->slots[slot]) {
-            storage_flush_all_dirty(se);   /* persist dirty pages before forget */
-            if (pb->slots[slot]->fd > 0) schema_close(pb->slots[slot]);
-            free(pb->slots[slot]);
-            pb->slots[slot] = NULL;
+        /* Full — evict. Two-pass per candidate: check every inner frame
+         * for a pin under the slot's latch before touching anything; skip
+         * to the next LRU candidate if any frame is pinned. */
+        int victim = -1;
+        for (int p = pb->n_loaded - 1; p >= 0; p--) {
+            int candidate = pb->lru_order[p];
+            PBOuterSlot *cs = &pb->slots[candidate];
+            pthread_mutex_lock(&cs->latch);
+
+            int any_pinned = 0;
+            for (int f = 0; f < PB_INNER_SLOTS; f++) {
+                if (cs->inner[f].pin_count > 0) { any_pinned = 1; break; }
+            }
+            if (any_pinned) {
+                pthread_mutex_unlock(&cs->latch);
+                continue;
+            }
+
+            /* Evictable. storage_flush_all_dirty covers BP data pages
+             * (existing behaviour, unchanged). flush_slot_dirty_locked
+             * (Phase 3) persists this slot's own dirty metadata — Page 0
+             * and any dirty inner frames — before the handle closes. */
+            storage_flush_all_dirty(se);
+            flush_slot_dirty_locked(cs);
+            if (cs->sf) {
+                if (cs->sf->fd > 0) schema_close(cs->sf);
+                free(cs->sf);
+                cs->sf = NULL;
+            }
+            reset_outer_slot_cache(cs);
+            pthread_mutex_unlock(&cs->latch);
+            victim = candidate;
+            break;
         }
-        lru_bump(pb, slot);                /* LRU slot becomes MRU */
+        if (victim < 0) {
+            /* Every outer slot has a pinned inner frame — fail-fast, same
+             * rationale as §7/§8: single-threaded execution means nothing
+             * could ever release the pin we'd be waiting on, and under
+             * real concurrency this avoids undesigned deadlock/starvation
+             * machinery. */
+            if (sf->fd > 0) schema_close(sf);
+            free(sf);
+            return NULL;
+        }
+        slot = victim;
+        lru_bump(pb, slot);
     }
 
-    pb->slots[slot] = sf;
+    pb->slots[slot].sf = sf;
     return sf;
 }
 
-/* Evict schema_name from the cache if present (close handle, free, compact).
- * Used when a schema is dropped.  No-op if not cached. */
+/* Evict schema_name from the cache if present (close handle, free, reset
+ * cache state, compact lru_order). Used when a schema is dropped.
+ * No-op if not cached. Does not check for pinned inner frames — callers
+ * (pm_drop_schema) already reject dropping the currently active schema,
+ * and single-threaded execution means nothing else can be mid-use of a
+ * schema that isn't active. */
 int pb_remove(PartitionBuffer *pb, const char *schema_name)
 {
     if (!pb || !schema_name) return MYDB_ERR;
 
     int slot = -1;
     for (int i = 0; i < PARTITION_BUFFER_SLOTS; i++) {
-        if (pb->slots[i] &&
-            strncmp(pb->slots[i]->header.schema_name, schema_name, 32) == 0) {
+        if (pb->slots[i].sf &&
+            strncmp(pb->slots[i].sf->header.schema_name, schema_name, 32) == 0) {
             slot = i;
             break;
         }
     }
     if (slot < 0) return MYDB_OK;          /* not cached */
 
-    if (pb->slots[slot]->fd > 0) schema_close(pb->slots[slot]);
-    free(pb->slots[slot]);
-    pb->slots[slot] = NULL;
+    PBOuterSlot *cs = &pb->slots[slot];
+    pthread_mutex_lock(&cs->latch);
+    if (cs->sf->fd > 0) schema_close(cs->sf);
+    free(cs->sf);
+    cs->sf = NULL;
+    reset_outer_slot_cache(cs);
+    pthread_mutex_unlock(&cs->latch);
 
     /* Drop slot from lru_order and compact the tail. */
     int p = 0;
@@ -155,4 +387,141 @@ int pb_remove(PartitionBuffer *pb, const char *schema_name)
         pb->lru_order[i] = pb->lru_order[i + 1];
     pb->n_loaded--;
     return MYDB_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Inner cache (§8)                                                    */
+/* ------------------------------------------------------------------ */
+
+RelationDef *pb_pin_relation(PBOuterSlot *slot, const char *relation_name)
+{
+    if (!slot || !slot->sf || !relation_name) return NULL;
+
+    RelationEntry *entry = schema_find_relation_stat(slot->sf, relation_name);
+    if (!entry) return NULL;
+    uint8_t page_no = entry->page_no;
+
+    pthread_mutex_lock(&slot->latch);
+
+    /* Hit path */
+    for (int i = 0; i < PB_INNER_SLOTS; i++) {
+        if (slot->dir[i].is_resident && slot->dir[i].page_no == page_no) {
+            inner_lru_bump(slot, i);
+            slot->inner[i].pin_count++;
+            RelationDef *rel = &slot->inner[i].def;
+            pthread_mutex_unlock(&slot->latch);
+            return rel;
+        }
+    }
+
+    /* Miss path — walk inner LRU from the tail; the first frame that's
+     * either empty or unpinned-and-evictable wins (same case, not two —
+     * an empty frame is trivially easy to evict, nothing to flush). */
+    int target = -1;
+    for (int p = PB_INNER_SLOTS - 1; p >= 0; p--) {
+        int i = slot->inner_lru_order[p];
+        if (slot->inner[i].pin_count > 0) continue;   /* implies occupied */
+        if (slot->dir[i].is_resident) {
+            /* Evict — flush first if dirty (Phase 3); a no-op if the
+             * frame is clean. */
+            flush_inner_frame_locked(slot, i);
+            slot->dir[i].is_resident = 0;
+        }
+        target = i;
+        break;
+    }
+
+    if (target == -1) {
+        pthread_mutex_unlock(&slot->latch);
+        return NULL;   /* every inner frame pinned — fail-fast */
+    }
+
+    if (schema_load_relation_page(slot->sf, page_no, &slot->inner[target].def)
+        != MYDB_OK) {
+        pthread_mutex_unlock(&slot->latch);
+        return NULL;
+    }
+    slot->inner[target].is_dirty    = 0;
+    slot->inner[target].fpi_pending = 0;
+    slot->dir[target].page_no       = page_no;
+    slot->dir[target].is_resident   = 1;
+    inner_lru_bump(slot, target);
+    slot->inner[target].pin_count   = 1;
+
+    RelationDef *rel = &slot->inner[target].def;
+    pthread_mutex_unlock(&slot->latch);
+    return rel;
+}
+
+int pb_unpin_relation(PBOuterSlot *slot, const RelationDef *rel)
+{
+    if (!slot || !rel) return MYDB_ERR;
+
+    pthread_mutex_lock(&slot->latch);
+    /* def is the first member of PBInnerFrame, so this cast recovers the
+     * enclosing frame — well-defined in C (a pointer to a structure,
+     * suitably converted, points to its initial member, and vice versa). */
+    const PBInnerFrame *frame = (const PBInnerFrame *)rel;
+    int idx = (int)(frame - slot->inner);
+    if (idx < 0 || idx >= PB_INNER_SLOTS) {
+        pthread_mutex_unlock(&slot->latch);
+        return MYDB_ERR;
+    }
+    if (slot->inner[idx].pin_count > 0) slot->inner[idx].pin_count--;
+    pthread_mutex_unlock(&slot->latch);
+    return MYDB_OK;
+}
+
+void pb_invalidate_page(PBOuterSlot *slot, uint8_t page_no)
+{
+    if (!slot) return;
+    pthread_mutex_lock(&slot->latch);
+    for (int i = 0; i < PB_INNER_SLOTS; i++) {
+        if (slot->dir[i].is_resident && slot->dir[i].page_no == page_no) {
+            slot->dir[i].is_resident = 0;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&slot->latch);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Write-back (Phase 3)                                                */
+/* ------------------------------------------------------------------ */
+
+void pb_mark_page0_dirty(PBOuterSlot *slot)
+{
+    if (!slot) return;
+    pthread_mutex_lock(&slot->latch);
+    slot->page0_dirty = 1;
+    pthread_mutex_unlock(&slot->latch);
+}
+
+void pb_mark_relation_dirty(PBOuterSlot *slot, const RelationDef *rel)
+{
+    if (!slot || !rel) return;
+    pthread_mutex_lock(&slot->latch);
+    /* Same technique pb_unpin_relation uses — see its comment. */
+    const PBInnerFrame *frame = (const PBInnerFrame *)rel;
+    int idx = (int)(frame - slot->inner);
+    if (idx >= 0 && idx < PB_INNER_SLOTS) slot->inner[idx].is_dirty = 1;
+    pthread_mutex_unlock(&slot->latch);
+}
+
+int pb_flush_slot_dirty(PBOuterSlot *slot)
+{
+    if (!slot || !slot->sf) return MYDB_ERR;
+    pthread_mutex_lock(&slot->latch);
+    int rc = flush_slot_dirty_locked(slot);
+    pthread_mutex_unlock(&slot->latch);
+    return rc;
+}
+
+int pb_discard_slot_dirty(PBOuterSlot *slot)
+{
+    if (!slot || !slot->sf) return MYDB_ERR;
+    pthread_mutex_lock(&slot->latch);
+    int rc = discard_slot_dirty_locked(slot);
+    pthread_mutex_unlock(&slot->latch);
+    return rc;
 }

@@ -200,6 +200,17 @@ int cat_open(const char *path, Catalog *out)
     return MYDB_OK;
 }
 
+int cat_reload(Catalog *cat)
+{
+    if (!cat || cat->fd < 0) return MYDB_ERR;
+
+    uint8_t buf[CATALOG_FILE_SIZE];
+    if (pread(cat->fd, buf, CATALOG_FILE_SIZE, 0) != (ssize_t)CATALOG_FILE_SIZE)
+        return MYDB_ERR;
+
+    return unpack(buf, cat);
+}
+
 int cat_close(Catalog *cat)
 {
     if (!cat || cat->fd < 0) return MYDB_ERR;
@@ -285,7 +296,9 @@ int cat_track_alloc(Catalog *cat, int64_t delta_bytes)
         return MYDB_OK; /* zero delta — nothing to do */
     }
 
-    return cat_save(cat);
+    /* Phase 4: no longer persists here — see the doc comment in
+     * partition.h. */
+    return MYDB_OK;
 }
 
 int cat_alloc_table_id(Catalog *cat, uint32_t *out_id)

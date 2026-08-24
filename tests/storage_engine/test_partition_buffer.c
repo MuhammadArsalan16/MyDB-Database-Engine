@@ -1,0 +1,904 @@
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+
+#include "common.h"
+#include "partition_buffer.h"
+#include "storage.h"
+
+/* ------------------------------------------------------------------ */
+/*  Phase 2 of the PartitionBuffer redesign (PARTITION_BUFFER_DESIGN.md):
+ *  direct coverage of §7 (outer-slot eviction) and §8 (inner lazy-load/
+ *  eviction) — the algorithms test_pm_api.c only exercises indirectly
+ *  through pm_find_relation/pm_release_relation on a single schema.
+ *  This file drives PartitionBuffer's own API directly, with multiple
+ *  schemas and enough relations per schema to actually fill and overflow
+ *  both the 8-slot outer cache and the 32-frame inner cache.
+ *
+ *  PartitionBuffer (~6.8MB, dominated by 8 outer slots x 32 inner frames
+ *  each embedding a full RelationDef) and StorageEngine (~67MB, dominated
+ *  by the buffer pool) are both always heap-allocated in the real code
+ *  (pctx_init calloc's them) — never stack locals. This file follows the
+ *  same discipline throughout.
+ * ------------------------------------------------------------------ */
+
+#define TEST_PART_DIR    "/tmp/mydb_test_partition_buffer_part"
+#define TEST_PID         73
+#define TEST_OWNER       73
+#define TEST_QUOTA       (100ULL * 1024 * 1024)
+#define TEST_CATALOG_FILE TEST_PART_DIR "/__catalog.mydb"
+
+static int tests_run    = 0;
+static int tests_passed = 0;
+
+#define CHECK(cond, msg) do { \
+    tests_run++; \
+    if (cond) { tests_passed++; printf("  PASS: %s\n", msg); } \
+    else       { printf("  FAIL: %s (line %d)\n", msg, __LINE__); } \
+} while(0)
+
+/* Build a minimal RelationDef with the given name, two int columns,
+ * pk on column 0. Returns by value. Copied per this codebase's established
+ * convention — no shared test header exists, each file re-declares its own. */
+static RelationDef make_simple_def(const char *name)
+{
+    RelationDef r;
+    memset(&r, 0, sizeof(r));
+    strncpy(r.relation_name, name, MAX_TABLE_NAME - 1);
+    r.num_columns = 2;
+    strncpy(r.columns[0].name, "id",  MAX_COLUMN_NAME - 1);
+    r.columns[0].type           = TYPE_INT;
+    r.columns[0].is_primary_key = 1;
+    r.columns[0].is_not_null    = 1;
+    strncpy(r.columns[1].name, "age", MAX_COLUMN_NAME - 1);
+    r.columns[1].type           = TYPE_INT;
+    r.pk_col_idx = 0;
+    r.root_page_no = 99;
+    r.auto_incr_counter = 1;
+    return r;
+}
+
+static void schema_path(int idx, char *buf, size_t cap)
+{
+    snprintf(buf, cap, "%s/s%d_schema.mydb", TEST_PART_DIR, idx);
+}
+
+static void relname(int i, char *buf, size_t cap)
+{
+    snprintf(buf, cap, "r%d", i);
+}
+
+/* Removes every path this file could possibly have created — safe to call
+ * even if only some of them exist. */
+static void cleanup(void)
+{
+    char path[512];
+    for (int i = 0; i < 16; i++) {
+        schema_path(i, path, sizeof(path));
+        unlink(path);
+    }
+    unlink(TEST_CATALOG_FILE);
+    rmdir(TEST_PART_DIR);
+}
+
+/* Create schema index `idx` with n_relations relations named r0..r(n-1). */
+static int make_schema(int idx, int n_relations)
+{
+    char path[512];
+    schema_path(idx, path, sizeof(path));
+
+    SchemaFile sf;
+    if (schema_create(path, TEST_PID, (uint32_t)(idx + 1), "sX", &sf) != MYDB_OK)
+        return MYDB_ERR;
+    for (int i = 0; i < n_relations; i++) {
+        char name[16];
+        relname(i, name, sizeof(name));
+        RelationDef d = make_simple_def(name);
+        if (schema_add_relation(&sf, &d) != MYDB_OK) {
+            schema_close(&sf);
+            return MYDB_ERR;
+        }
+    }
+    schema_close(&sf);
+    return MYDB_OK;
+}
+
+/* Create __catalog.mydb on disk (closed) — a real file for pb_open_catalog
+ * to load into PB[0]. */
+static int make_catalog_file(void)
+{
+    Catalog cat;
+    if (cat_create(TEST_CATALOG_FILE, TEST_PID, TEST_OWNER, TEST_QUOTA, &cat) != MYDB_OK)
+        return MYDB_ERR;
+    cat_close(&cat);
+    return MYDB_OK;
+}
+
+/* Rename an on-disk schema's header.schema_name — make_schema() always
+ * writes "sX"; tests needing multiple distinguishable schemas patch the
+ * name in afterward rather than teaching make_schema a naming scheme. */
+static void rename_schema(int idx, const char *new_name)
+{
+    char path[512];
+    schema_path(idx, path, sizeof(path));
+    SchemaFile tmp;
+    schema_open(path, &tmp);
+    strncpy(tmp.header.schema_name, new_name, sizeof(tmp.header.schema_name) - 1);
+    schema_save_page0(&tmp);
+    schema_close(&tmp);
+}
+
+/* Direct is-this-page-cached check against dir[] — the observable way to
+ * tell "was this frame actually evicted" apart from "still resident,
+ * still returns the same content on a hit" from outside partition_buffer.c. */
+static int is_page_cached(PBOuterSlot *slot, uint8_t page_no)
+{
+    for (int i = 0; i < PB_INNER_SLOTS; i++)
+        if (slot->dir[i].is_resident && slot->dir[i].page_no == page_no)
+            return 1;
+    return 0;
+}
+
+static uint8_t page_no_of(PBOuterSlot *slot, const char *relation_name)
+{
+    RelationEntry *e = schema_find_relation_stat(slot->sf, relation_name);
+    return e ? e->page_no : 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Lifecycle                                                          */
+/* ------------------------------------------------------------------ */
+
+static void test_init_destroy(void)
+{
+    printf("\n[test_init_destroy]\n");
+
+    PartitionBuffer *pb = (PartitionBuffer *)malloc(sizeof(PartitionBuffer));
+    CHECK(pb_init(pb) == MYDB_OK, "pb_init succeeds");
+    CHECK(pb->n_loaded == 0,      "starts empty");
+    CHECK(pb_active_schema(pb) == NULL, "no active schema when empty");
+
+    pb_destroy(pb);   /* must not crash on an empty buffer */
+    CHECK(1, "pb_destroy on empty buffer does not crash");
+    free(pb);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Outer slot (§7)                                                     */
+/* ------------------------------------------------------------------ */
+
+static void test_get_load_and_hit(void)
+{
+    printf("\n[test_get_load_and_hit]\n");
+    cleanup();
+    mkdir(TEST_PART_DIR, 0755);
+    CHECK(make_schema(0, 1) == MYDB_OK, "fixture schema created");
+
+    PartitionBuffer *pb = (PartitionBuffer *)malloc(sizeof(PartitionBuffer));
+    StorageEngine   *se = (StorageEngine *)malloc(sizeof(StorageEngine));
+    pb_init(pb);
+    storage_init(se);
+    char path[512]; schema_path(0, path, sizeof(path));
+
+    SchemaFile *sf1 = pb_get(pb, "sX", path, se);
+    CHECK(sf1 != NULL,      "load succeeds");
+    CHECK(pb->n_loaded == 1, "n_loaded bumped");
+
+    SchemaFile *sf2 = pb_get(pb, "sX", path, se);
+    CHECK(sf1 == sf2,       "cache hit returns the same pointer");
+    CHECK(pb->n_loaded == 1, "still just 1 loaded — hit did not re-insert");
+
+    pb_destroy(pb);
+    free(pb); free(se);
+    cleanup();
+}
+
+static void test_outer_eviction_basic(void)
+{
+    printf("\n[test_outer_eviction_basic]\n");
+    cleanup();
+    mkdir(TEST_PART_DIR, 0755);
+    for (int i = 0; i < 9; i++) CHECK(make_schema(i, 1) == MYDB_OK, "fixture schema created");
+
+    PartitionBuffer *pb = (PartitionBuffer *)malloc(sizeof(PartitionBuffer));
+    StorageEngine   *se = (StorageEngine *)malloc(sizeof(StorageEngine));
+    pb_init(pb);
+    storage_init(se);
+
+    /* Load e0..e7 (indices 0..7) — fills all 8 outer slots. e0 stays LRU
+     * since nothing touches it again; each subsequent load makes the new
+     * one MRU. */
+    for (int i = 0; i < 8; i++) {
+        char path[512], uniq_name[16];
+        schema_path(i, path, sizeof(path));
+        snprintf(uniq_name, sizeof(uniq_name), "e%d", i);
+        rename_schema(i, uniq_name);
+
+        SchemaFile *loaded = pb_get(pb, uniq_name, path, se);
+        CHECK(loaded != NULL, "schema loads");
+    }
+    CHECK(pb->n_loaded == 8, "8 slots full");
+
+    /* 9th distinct schema (e8) — must evict LRU (e0). */
+    char path8[512];
+    schema_path(8, path8, sizeof(path8));
+    rename_schema(8, "e8");
+
+    SchemaFile *loaded9 = pb_get(pb, "e8", path8, se);
+    CHECK(loaded9 != NULL, "9th schema loads by evicting the LRU slot");
+    CHECK(pb->n_loaded == 8, "still 8 loaded — eviction kept the count at cap");
+    CHECK(pb_find(pb, "e0") == NULL, "LRU schema e0 was evicted");
+    CHECK(pb_find(pb, "e8") != NULL, "new schema e8 is now cached");
+
+    pb_destroy(pb);
+    free(pb); free(se);
+    cleanup();
+}
+
+/* Same 9-schema setup as above, but e0 (the LRU candidate) has a pinned
+ * inner frame — eviction must skip it and take the next LRU (e1) instead. */
+static void test_outer_eviction_skips_pinned(void)
+{
+    printf("\n[test_outer_eviction_skips_pinned]\n");
+    cleanup();
+    mkdir(TEST_PART_DIR, 0755);
+    for (int i = 0; i < 9; i++) CHECK(make_schema(i, 1) == MYDB_OK, "fixture schema created");
+
+    PartitionBuffer *pb = (PartitionBuffer *)malloc(sizeof(PartitionBuffer));
+    StorageEngine   *se = (StorageEngine *)malloc(sizeof(StorageEngine));
+    pb_init(pb);
+    storage_init(se);
+
+    for (int i = 0; i < 8; i++) {
+        char path[512], uniq_name[16];
+        schema_path(i, path, sizeof(path));
+        snprintf(uniq_name, sizeof(uniq_name), "e%d", i);
+        rename_schema(i, uniq_name);
+        pb_get(pb, uniq_name, path, se);
+    }
+
+    /* Pin r0 in e0 (the would-be LRU eviction victim) and hold it. */
+    PBOuterSlot *slot0 = pb_find_outer_slot(pb, "e0");
+    RelationDef *pinned = pb_pin_relation(slot0, "r0");
+    CHECK(pinned != NULL, "pin r0 in e0 succeeds");
+
+    char path8[512];
+    schema_path(8, path8, sizeof(path8));
+    rename_schema(8, "e8");
+
+    SchemaFile *loaded9 = pb_get(pb, "e8", path8, se);
+    CHECK(loaded9 != NULL, "9th schema still loads");
+    CHECK(pb_find(pb, "e0") != NULL, "pinned schema e0 survives eviction attempt");
+    CHECK(pb_find(pb, "e1") == NULL, "e1 (next LRU, unpinned) evicted instead");
+
+    pb_unpin_relation(slot0, pinned);
+    pb_destroy(pb);
+    free(pb); free(se);
+    cleanup();
+}
+
+/* All 8 outer slots have a pinned inner frame — the 9th load must fail
+ * fast (NULL), not force-wait or crash. */
+static void test_outer_fail_fast_when_all_pinned(void)
+{
+    printf("\n[test_outer_fail_fast_when_all_pinned]\n");
+    cleanup();
+    mkdir(TEST_PART_DIR, 0755);
+    for (int i = 0; i < 9; i++) CHECK(make_schema(i, 1) == MYDB_OK, "fixture schema created");
+
+    PartitionBuffer *pb = (PartitionBuffer *)malloc(sizeof(PartitionBuffer));
+    StorageEngine   *se = (StorageEngine *)malloc(sizeof(StorageEngine));
+    pb_init(pb);
+    storage_init(se);
+
+    RelationDef *pinned[8];
+    for (int i = 0; i < 8; i++) {
+        char path[512], uniq_name[16];
+        schema_path(i, path, sizeof(path));
+        snprintf(uniq_name, sizeof(uniq_name), "e%d", i);
+        rename_schema(i, uniq_name);
+        pb_get(pb, uniq_name, path, se);
+
+        PBOuterSlot *s = pb_find_outer_slot(pb, uniq_name);
+        pinned[i] = pb_pin_relation(s, "r0");
+        CHECK(pinned[i] != NULL, "pin r0 succeeds");
+    }
+
+    char path8[512];
+    schema_path(8, path8, sizeof(path8));
+    rename_schema(8, "e8");
+
+    SchemaFile *result = pb_get(pb, "e8", path8, se);
+    CHECK(result == NULL, "fails fast — every outer slot has a pinned frame");
+    CHECK(pb->n_loaded == 8, "no existing slot was disturbed");
+
+    for (int i = 0; i < 8; i++) {
+        char uniq_name[16];
+        snprintf(uniq_name, sizeof(uniq_name), "e%d", i);
+        PBOuterSlot *s = pb_find_outer_slot(pb, uniq_name);
+        pb_unpin_relation(s, pinned[i]);
+    }
+    pb_destroy(pb);
+    free(pb); free(se);
+    cleanup();
+}
+
+/* ------------------------------------------------------------------ */
+/*  Inner cache (§8)                                                    */
+/* ------------------------------------------------------------------ */
+
+static void test_inner_eviction(void)
+{
+    printf("\n[test_inner_eviction]\n");
+    cleanup();
+    mkdir(TEST_PART_DIR, 0755);
+    CHECK(make_schema(0, 33) == MYDB_OK, "33-relation fixture schema created");
+
+    PartitionBuffer *pb = (PartitionBuffer *)malloc(sizeof(PartitionBuffer));
+    StorageEngine   *se = (StorageEngine *)malloc(sizeof(StorageEngine));
+    pb_init(pb);
+    storage_init(se);
+    char path[512]; schema_path(0, path, sizeof(path));
+    pb_get(pb, "sX", path, se);
+    PBOuterSlot *slot = pb_find_outer_slot(pb, "sX");
+
+    uint8_t pno[33];
+    for (int i = 0; i < 33; i++) {
+        char name[16]; relname(i, name, sizeof(name));
+        pno[i] = page_no_of(slot, name);
+    }
+
+    /* Fill the 32-frame cache exactly — pin+release r0..r31 in order. */
+    for (int i = 0; i < 32; i++) {
+        char name[16]; relname(i, name, sizeof(name));
+        RelationDef *r = pb_pin_relation(slot, name);
+        CHECK(r != NULL, "relation pins");
+        pb_unpin_relation(slot, r);
+    }
+    CHECK(is_page_cached(slot, pno[0]),  "r0 still cached — cache exactly full, nothing evicted yet");
+    CHECK(is_page_cached(slot, pno[31]), "r31 (most recently touched) cached");
+
+    /* r32 is the 33rd distinct relation — must evict the inner LRU (r0,
+     * touched first and never touched again). */
+    RelationDef *r32 = pb_pin_relation(slot, "r32");
+    CHECK(r32 != NULL, "r32 loads via inner eviction");
+    CHECK(!is_page_cached(slot, pno[0]),  "r0 (LRU) evicted to make room");
+    CHECK(is_page_cached(slot, pno[31]),  "r31 untouched by the eviction");
+    CHECK(is_page_cached(slot, pno[32]),  "r32 now cached");
+
+    pb_unpin_relation(slot, r32);
+    pb_destroy(pb);
+    free(pb); free(se);
+    cleanup();
+}
+
+/* r0 stays pinned throughout while 32 other relations cycle through —
+ * inner eviction must never touch it, same invariant as
+ * test_outer_eviction_skips_pinned but at the frame level. This is the
+ * concrete, executable form of the StorageScan cross-call retention
+ * invariant found during Phase 2 planning: a caller's pin (standing in
+ * for a live Cursor's underlying RelationGuard) must survive unrelated
+ * eviction pressure for as long as it's held. */
+static void test_inner_eviction_skips_pinned(void)
+{
+    printf("\n[test_inner_eviction_skips_pinned]\n");
+    cleanup();
+    mkdir(TEST_PART_DIR, 0755);
+    CHECK(make_schema(0, 33) == MYDB_OK, "33-relation fixture schema created");
+
+    PartitionBuffer *pb = (PartitionBuffer *)malloc(sizeof(PartitionBuffer));
+    StorageEngine   *se = (StorageEngine *)malloc(sizeof(StorageEngine));
+    pb_init(pb);
+    storage_init(se);
+    char path[512]; schema_path(0, path, sizeof(path));
+    pb_get(pb, "sX", path, se);
+    PBOuterSlot *slot = pb_find_outer_slot(pb, "sX");
+
+    uint8_t pno0 = page_no_of(slot, "r0");
+
+    RelationDef *held = pb_pin_relation(slot, "r0");
+    CHECK(held != NULL, "r0 pinned and held");
+
+    /* Cycle through r1..r32 (32 more distinct relations) — with r0 also
+     * occupying a frame, this forces eviction among the 31 unpinned
+     * frames + r0's permanently-occupied one, repeatedly. */
+    for (int i = 1; i <= 32; i++) {
+        char name[16]; relname(i, name, sizeof(name));
+        RelationDef *r = pb_pin_relation(slot, name);
+        CHECK(r != NULL, "unrelated relation pins despite r0 being held");
+        pb_unpin_relation(slot, r);
+    }
+
+    CHECK(is_page_cached(slot, pno0), "r0 survived — never evicted while pinned");
+
+    pb_unpin_relation(slot, held);
+    pb_destroy(pb);
+    free(pb); free(se);
+    cleanup();
+}
+
+static void test_inner_fail_fast_when_all_pinned(void)
+{
+    printf("\n[test_inner_fail_fast_when_all_pinned]\n");
+    cleanup();
+    mkdir(TEST_PART_DIR, 0755);
+    CHECK(make_schema(0, 33) == MYDB_OK, "33-relation fixture schema created");
+
+    PartitionBuffer *pb = (PartitionBuffer *)malloc(sizeof(PartitionBuffer));
+    StorageEngine   *se = (StorageEngine *)malloc(sizeof(StorageEngine));
+    pb_init(pb);
+    storage_init(se);
+    char path[512]; schema_path(0, path, sizeof(path));
+    pb_get(pb, "sX", path, se);
+    PBOuterSlot *slot = pb_find_outer_slot(pb, "sX");
+
+    RelationDef *held[32];
+    for (int i = 0; i < 32; i++) {
+        char name[16]; relname(i, name, sizeof(name));
+        held[i] = pb_pin_relation(slot, name);
+        CHECK(held[i] != NULL, "relation pins and stays held");
+    }
+
+    RelationDef *r32 = pb_pin_relation(slot, "r32");
+    CHECK(r32 == NULL, "fails fast — all 32 inner frames are pinned");
+
+    for (int i = 0; i < 32; i++) pb_unpin_relation(slot, held[i]);
+    pb_destroy(pb);
+    free(pb); free(se);
+    cleanup();
+}
+
+static void test_invalidate_page(void)
+{
+    printf("\n[test_invalidate_page]\n");
+    cleanup();
+    mkdir(TEST_PART_DIR, 0755);
+    CHECK(make_schema(0, 1) == MYDB_OK, "fixture schema created");
+
+    PartitionBuffer *pb = (PartitionBuffer *)malloc(sizeof(PartitionBuffer));
+    StorageEngine   *se = (StorageEngine *)malloc(sizeof(StorageEngine));
+    pb_init(pb);
+    storage_init(se);
+    char path[512]; schema_path(0, path, sizeof(path));
+    pb_get(pb, "sX", path, se);
+    PBOuterSlot *slot = pb_find_outer_slot(pb, "sX");
+
+    RelationDef *r = pb_pin_relation(slot, "r0");
+    pb_unpin_relation(slot, r);
+    uint8_t pno = page_no_of(slot, "r0");
+    CHECK(is_page_cached(slot, pno), "resident after pin+release");
+
+    pb_invalidate_page(slot, pno);
+    CHECK(!is_page_cached(slot, pno), "invalidated — no longer resident");
+
+    /* Invalidation clears the cache entry, not the on-disk page — a
+     * fresh pin still succeeds via reload. */
+    RelationDef *r2 = pb_pin_relation(slot, "r0");
+    CHECK(r2 != NULL, "re-pin after invalidate reloads from disk");
+    pb_unpin_relation(slot, r2);
+
+    pb_destroy(pb);
+    free(pb); free(se);
+    cleanup();
+}
+
+/* Removing a schema must reset its outer slot's cache state — otherwise
+ * a later schema reusing the same physical slot index would inherit
+ * stale dir[]/inner[] entries from whatever occupied it before. */
+static void test_remove_resets_cache(void)
+{
+    printf("\n[test_remove_resets_cache]\n");
+    cleanup();
+    mkdir(TEST_PART_DIR, 0755);
+    CHECK(make_schema(0, 1) == MYDB_OK, "fixture schema rm1 created");
+    CHECK(make_schema(1, 1) == MYDB_OK, "fixture schema rm2 created");
+
+    PartitionBuffer *pb = (PartitionBuffer *)malloc(sizeof(PartitionBuffer));
+    StorageEngine   *se = (StorageEngine *)malloc(sizeof(StorageEngine));
+    pb_init(pb);
+    storage_init(se);
+
+    char path0[512], path1[512];
+    schema_path(0, path0, sizeof(path0));
+    schema_path(1, path1, sizeof(path1));
+    rename_schema(0, "rm1");
+
+    pb_get(pb, "rm1", path0, se);
+    PBOuterSlot *slot1 = pb_find_outer_slot(pb, "rm1");
+    RelationDef *r = pb_pin_relation(slot1, "r0");
+    pb_unpin_relation(slot1, r);
+    uint8_t pno_a = page_no_of(slot1, "r0");
+    CHECK(is_page_cached(slot1, pno_a), "cached before remove");
+
+    pb_remove(pb, "rm1");
+    CHECK(pb_find(pb, "rm1") == NULL, "removed");
+    CHECK(pb->n_loaded == 0,          "count dropped to 0");
+
+    /* n_loaded == 0 means the next load takes the free-slot path, which
+     * scans from index 0 — deterministically reusing the exact physical
+     * slot rm1 just vacated. */
+    rename_schema(1, "rm2");
+
+    pb_get(pb, "rm2", path1, se);
+    PBOuterSlot *slot2 = pb_find_outer_slot(pb, "rm2");
+    CHECK(!is_page_cached(slot2, pno_a),
+          "no stale residency carried over from the removed schema");
+
+    pb_destroy(pb);
+    free(pb); free(se);
+    cleanup();
+}
+
+/* ------------------------------------------------------------------ */
+/*  Write-back (Phase 3)                                               */
+/* ------------------------------------------------------------------ */
+
+static void test_mark_dirty_flags(void)
+{
+    printf("\n[test_mark_dirty_flags]\n");
+    cleanup();
+    mkdir(TEST_PART_DIR, 0755);
+    CHECK(make_schema(0, 1) == MYDB_OK, "fixture schema created");
+
+    PartitionBuffer *pb = (PartitionBuffer *)malloc(sizeof(PartitionBuffer));
+    StorageEngine   *se = (StorageEngine *)malloc(sizeof(StorageEngine));
+    pb_init(pb);
+    storage_init(se);
+    char path[512]; schema_path(0, path, sizeof(path));
+    pb_get(pb, "sX", path, se);
+    PBOuterSlot *slot = pb_find_outer_slot(pb, "sX");
+
+    CHECK(slot->page0_dirty == 0, "page0 starts clean");
+    pb_mark_page0_dirty(slot);
+    CHECK(slot->page0_dirty == 1, "pb_mark_page0_dirty sets the flag");
+
+    RelationDef *r = pb_pin_relation(slot, "r0");
+    int frame = (int)((PBInnerFrame *)r - slot->inner);
+    CHECK(slot->inner[frame].is_dirty == 0, "frame starts clean");
+    pb_mark_relation_dirty(slot, r);
+    CHECK(slot->inner[frame].is_dirty == 1, "pb_mark_relation_dirty sets only this frame's flag");
+    pb_unpin_relation(slot, r);
+
+    pb_destroy(pb);
+    free(pb); free(se);
+    cleanup();
+}
+
+static void test_flush_slot_dirty_persists_and_clears(void)
+{
+    printf("\n[test_flush_slot_dirty_persists_and_clears]\n");
+    cleanup();
+    mkdir(TEST_PART_DIR, 0755);
+    CHECK(make_schema(0, 1) == MYDB_OK, "fixture schema created");
+
+    PartitionBuffer *pb = (PartitionBuffer *)malloc(sizeof(PartitionBuffer));
+    StorageEngine   *se = (StorageEngine *)malloc(sizeof(StorageEngine));
+    pb_init(pb);
+    storage_init(se);
+    char path[512]; schema_path(0, path, sizeof(path));
+    pb_get(pb, "sX", path, se);
+    PBOuterSlot *slot = pb_find_outer_slot(pb, "sX");
+
+    CHECK(schema_bump_relation_rows(slot->sf, "r0", 5) == MYDB_OK,
+          "num_rows bumped in memory only");
+    pb_mark_page0_dirty(slot);
+
+    RelationDef *r = pb_pin_relation(slot, "r0");
+    int frame = (int)((PBInnerFrame *)r - slot->inner);
+    r->auto_incr_counter = 77;
+    pb_mark_relation_dirty(slot, r);
+    pb_unpin_relation(slot, r);
+
+    CHECK(pb_flush_slot_dirty(slot) == MYDB_OK, "flush succeeds");
+    CHECK(slot->page0_dirty == 0,          "page0_dirty cleared after flush");
+    CHECK(slot->inner[frame].is_dirty == 0, "frame is_dirty cleared after flush");
+
+    /* Verify persistence via a completely independent, freshly-opened
+     * SchemaFile — proves the write actually reached disk, not just the
+     * cached in-memory copy. */
+    SchemaFile check;
+    CHECK(schema_open(path, &check) == MYDB_OK, "fresh reopen for verification");
+    RelationEntry *e = schema_find_relation_stat(&check, "r0");
+    CHECK(e != NULL && e->num_rows == 5, "num_rows persisted to disk");
+    RelationDef loaded;
+    CHECK(e && schema_load_relation_page(&check, e->page_no, &loaded) == MYDB_OK,
+          "def page loads");
+    CHECK(loaded.auto_incr_counter == 77, "auto_incr_counter persisted to disk");
+    schema_close(&check);
+
+    pb_destroy(pb);
+    free(pb); free(se);
+    cleanup();
+}
+
+static void test_discard_slot_dirty_reverts_and_clears(void)
+{
+    printf("\n[test_discard_slot_dirty_reverts_and_clears]\n");
+    cleanup();
+    mkdir(TEST_PART_DIR, 0755);
+    CHECK(make_schema(0, 1) == MYDB_OK, "fixture schema created");
+
+    PartitionBuffer *pb = (PartitionBuffer *)malloc(sizeof(PartitionBuffer));
+    StorageEngine   *se = (StorageEngine *)malloc(sizeof(StorageEngine));
+    pb_init(pb);
+    storage_init(se);
+    char path[512]; schema_path(0, path, sizeof(path));
+    pb_get(pb, "sX", path, se);
+    PBOuterSlot *slot = pb_find_outer_slot(pb, "sX");
+
+    CHECK(schema_bump_relation_rows(slot->sf, "r0", 5) == MYDB_OK,
+          "num_rows bumped in memory only");
+    pb_mark_page0_dirty(slot);
+
+    RelationDef *r = pb_pin_relation(slot, "r0");
+    int frame = (int)((PBInnerFrame *)r - slot->inner);
+    r->auto_incr_counter = 999;
+    pb_mark_relation_dirty(slot, r);
+    /* Release before discard — mirrors real usage: pm_rollback runs after
+     * the statement's RelationGuard has already released its pin. */
+    pb_unpin_relation(slot, r);
+
+    CHECK(pb_discard_slot_dirty(slot) == MYDB_OK, "discard succeeds");
+    CHECK(slot->page0_dirty == 0,          "page0_dirty cleared after discard");
+    CHECK(slot->inner[frame].is_dirty == 0, "frame is_dirty cleared after discard");
+
+    RelationEntry *e = schema_find_relation_stat(slot->sf, "r0");
+    CHECK(e != NULL && e->num_rows == 0,
+          "num_rows reverted in memory — page0 reloaded from disk, not persisted");
+
+    /* Frame was marked non-resident, not flushed — a fresh pin must
+     * reload the original on-disk value (1), not the discarded 999. */
+    RelationDef *r2 = pb_pin_relation(slot, "r0");
+    CHECK(r2 != NULL, "re-pin after discard reloads from disk");
+    CHECK(r2->auto_incr_counter == 1,
+          "discarded auto_incr_counter change was never written — reload sees the original");
+    pb_unpin_relation(slot, r2);
+
+    pb_destroy(pb);
+    free(pb); free(se);
+    cleanup();
+}
+
+/* Same 9-schema setup as test_outer_eviction_basic, but e0 (the LRU
+ * eviction candidate) is dirtied first — eviction must flush before
+ * closing the handle, not just drop the change on the floor. */
+static void test_outer_eviction_flushes_dirty_slot(void)
+{
+    printf("\n[test_outer_eviction_flushes_dirty_slot]\n");
+    cleanup();
+    mkdir(TEST_PART_DIR, 0755);
+    for (int i = 0; i < 9; i++) CHECK(make_schema(i, 1) == MYDB_OK, "fixture schema created");
+
+    PartitionBuffer *pb = (PartitionBuffer *)malloc(sizeof(PartitionBuffer));
+    StorageEngine   *se = (StorageEngine *)malloc(sizeof(StorageEngine));
+    pb_init(pb);
+    storage_init(se);
+
+    for (int i = 0; i < 8; i++) {
+        char path[512], uniq_name[16];
+        schema_path(i, path, sizeof(path));
+        snprintf(uniq_name, sizeof(uniq_name), "e%d", i);
+        rename_schema(i, uniq_name);
+        pb_get(pb, uniq_name, path, se);
+    }
+
+    PBOuterSlot *slot0 = pb_find_outer_slot(pb, "e0");
+    CHECK(schema_bump_relation_rows(slot0->sf, "r0", 3) == MYDB_OK,
+          "e0's num_rows bumped in memory only");
+    pb_mark_page0_dirty(slot0);
+
+    char path8[512];
+    schema_path(8, path8, sizeof(path8));
+    rename_schema(8, "e8");
+
+    SchemaFile *loaded9 = pb_get(pb, "e8", path8, se);
+    CHECK(loaded9 != NULL, "9th schema loads, evicting dirty e0");
+    CHECK(pb_find(pb, "e0") == NULL, "e0 evicted despite being dirty");
+
+    char path0[512];
+    schema_path(0, path0, sizeof(path0));
+    SchemaFile check;
+    CHECK(schema_open(path0, &check) == MYDB_OK, "reopen e0's file for verification");
+    RelationEntry *e = schema_find_relation_stat(&check, "r0");
+    CHECK(e != NULL && e->num_rows == 3,
+          "dirty num_rows was flushed before outer eviction closed the handle");
+    schema_close(&check);
+
+    pb_destroy(pb);
+    free(pb); free(se);
+    cleanup();
+}
+
+/* Same 33-relation setup as test_inner_eviction, but r0 (the inner-LRU
+ * eviction victim) is dirtied first — §8 eviction must flush the frame
+ * before reclaiming it. */
+static void test_inner_eviction_flushes_dirty_frame(void)
+{
+    printf("\n[test_inner_eviction_flushes_dirty_frame]\n");
+    cleanup();
+    mkdir(TEST_PART_DIR, 0755);
+    CHECK(make_schema(0, 33) == MYDB_OK, "33-relation fixture schema created");
+
+    PartitionBuffer *pb = (PartitionBuffer *)malloc(sizeof(PartitionBuffer));
+    StorageEngine   *se = (StorageEngine *)malloc(sizeof(StorageEngine));
+    pb_init(pb);
+    storage_init(se);
+    char path[512]; schema_path(0, path, sizeof(path));
+    pb_get(pb, "sX", path, se);
+    PBOuterSlot *slot = pb_find_outer_slot(pb, "sX");
+
+    uint8_t pno0 = page_no_of(slot, "r0");
+
+    RelationDef *r0 = pb_pin_relation(slot, "r0");
+    CHECK(r0 != NULL, "r0 pins");
+    r0->auto_incr_counter = 55;
+    pb_mark_relation_dirty(slot, r0);
+    pb_unpin_relation(slot, r0);   /* mirrors pm_insert's deferred-write path */
+
+    /* Cycle r1..r32 through the cache — forces r0 (now LRU and unpinned)
+     * out via §8 eviction. */
+    for (int i = 1; i <= 32; i++) {
+        char name[16]; relname(i, name, sizeof(name));
+        RelationDef *r = pb_pin_relation(slot, name);
+        CHECK(r != NULL, "unrelated relation pins");
+        pb_unpin_relation(slot, r);
+    }
+    CHECK(!is_page_cached(slot, pno0), "r0 evicted from the inner cache");
+
+    RelationDef loaded;
+    CHECK(schema_load_relation_page(slot->sf, pno0, &loaded) == MYDB_OK,
+          "load r0's page directly from disk");
+    CHECK(loaded.auto_incr_counter == 55,
+          "dirty auto_incr_counter was flushed before inner eviction reclaimed the frame");
+
+    pb_destroy(pb);
+    free(pb); free(se);
+    cleanup();
+}
+
+/* ------------------------------------------------------------------ */
+/*  Catalog (PB[0]) — Phase 4                                          */
+/* ------------------------------------------------------------------ */
+
+static void test_open_catalog(void)
+{
+    printf("\n[test_open_catalog]\n");
+    cleanup();
+    mkdir(TEST_PART_DIR, 0755);
+    CHECK(make_catalog_file() == MYDB_OK, "fixture catalog file created");
+
+    PartitionBuffer *pb = (PartitionBuffer *)malloc(sizeof(PartitionBuffer));
+    pb_init(pb);
+
+    CHECK(pb_catalog(pb) == NULL, "no catalog loaded yet");
+    CHECK(pb_open_catalog(pb, TEST_CATALOG_FILE) == MYDB_OK, "pb_open_catalog succeeds");
+
+    Catalog *cat = pb_catalog(pb);
+    CHECK(cat != NULL, "pb_catalog returns non-NULL once loaded");
+    CHECK(cat && cat->header.partition_id == TEST_PID, "loaded catalog has the right partition_id");
+    CHECK(cat && cat->header.quota_bytes == TEST_QUOTA, "loaded catalog has the right quota");
+
+    pb_destroy(pb);
+    free(pb);
+    cleanup();
+}
+
+static void test_catalog_mark_dirty_flag(void)
+{
+    printf("\n[test_catalog_mark_dirty_flag]\n");
+    cleanup();
+    mkdir(TEST_PART_DIR, 0755);
+    CHECK(make_catalog_file() == MYDB_OK, "fixture catalog file created");
+
+    PartitionBuffer *pb = (PartitionBuffer *)malloc(sizeof(PartitionBuffer));
+    pb_init(pb);
+    pb_open_catalog(pb, TEST_CATALOG_FILE);
+
+    CHECK(pb->catalog.is_dirty == 0, "PB[0] starts clean");
+    pb_mark_catalog_dirty(pb);
+    CHECK(pb->catalog.is_dirty == 1, "pb_mark_catalog_dirty sets the flag");
+
+    pb_destroy(pb);
+    free(pb);
+    cleanup();
+}
+
+static void test_flush_catalog_dirty_persists_and_clears(void)
+{
+    printf("\n[test_flush_catalog_dirty_persists_and_clears]\n");
+    cleanup();
+    mkdir(TEST_PART_DIR, 0755);
+    CHECK(make_catalog_file() == MYDB_OK, "fixture catalog file created");
+
+    PartitionBuffer *pb = (PartitionBuffer *)malloc(sizeof(PartitionBuffer));
+    pb_init(pb);
+    pb_open_catalog(pb, TEST_CATALOG_FILE);
+
+    Catalog *cat = pb_catalog(pb);
+    CHECK(cat_track_alloc(cat, 5 * PAGE_SIZE) == MYDB_OK,
+          "used_bytes bumped in memory only (cat_track_alloc no longer persists)");
+    pb_mark_catalog_dirty(pb);
+
+    CHECK(pb_flush_catalog_dirty(pb) == MYDB_OK, "flush succeeds");
+    CHECK(pb->catalog.is_dirty == 0, "is_dirty cleared after flush");
+
+    /* Verify persistence via a completely independent, freshly-opened
+     * Catalog — proves the write actually reached disk. */
+    Catalog check;
+    CHECK(cat_open(TEST_CATALOG_FILE, &check) == MYDB_OK, "fresh reopen for verification");
+    CHECK(check.header.used_bytes == 5 * PAGE_SIZE, "used_bytes persisted to disk");
+    cat_close(&check);
+
+    pb_destroy(pb);
+    free(pb);
+    cleanup();
+}
+
+static void test_discard_catalog_dirty_reverts_and_clears(void)
+{
+    printf("\n[test_discard_catalog_dirty_reverts_and_clears]\n");
+    cleanup();
+    mkdir(TEST_PART_DIR, 0755);
+    CHECK(make_catalog_file() == MYDB_OK, "fixture catalog file created");
+
+    PartitionBuffer *pb = (PartitionBuffer *)malloc(sizeof(PartitionBuffer));
+    pb_init(pb);
+    pb_open_catalog(pb, TEST_CATALOG_FILE);
+
+    Catalog *cat = pb_catalog(pb);
+    cat_track_alloc(cat, 5 * PAGE_SIZE);
+    pb_mark_catalog_dirty(pb);
+
+    CHECK(pb_discard_catalog_dirty(pb) == MYDB_OK, "discard succeeds");
+    CHECK(pb->catalog.is_dirty == 0, "is_dirty cleared after discard");
+    CHECK(pb_catalog(pb)->header.used_bytes == 0,
+          "used_bytes reverted in memory — reloaded from disk, not persisted");
+
+    /* Disk itself was never touched. */
+    Catalog check;
+    CHECK(cat_open(TEST_CATALOG_FILE, &check) == MYDB_OK, "fresh reopen for verification");
+    CHECK(check.header.used_bytes == 0, "discarded change was never written to disk");
+    cat_close(&check);
+
+    pb_destroy(pb);
+    free(pb);
+    cleanup();
+}
+
+/* ------------------------------------------------------------------ */
+/*  Main                                                               */
+/* ------------------------------------------------------------------ */
+
+int main(void)
+{
+    printf("=== test_partition_buffer ===\n");
+
+    test_init_destroy();
+
+    test_get_load_and_hit();
+    test_outer_eviction_basic();
+    test_outer_eviction_skips_pinned();
+    test_outer_fail_fast_when_all_pinned();
+
+    test_inner_eviction();
+    test_inner_eviction_skips_pinned();
+    test_inner_fail_fast_when_all_pinned();
+    test_invalidate_page();
+    test_remove_resets_cache();
+
+    test_mark_dirty_flags();
+    test_flush_slot_dirty_persists_and_clears();
+    test_discard_slot_dirty_reverts_and_clears();
+    test_outer_eviction_flushes_dirty_slot();
+    test_inner_eviction_flushes_dirty_frame();
+
+    test_open_catalog();
+    test_catalog_mark_dirty_flag();
+    test_flush_catalog_dirty_persists_and_clears();
+    test_discard_catalog_dirty_reverts_and_clears();
+
+    printf("\nResults: %d/%d passed\n", tests_passed, tests_run);
+    return (tests_passed == tests_run) ? 0 : 1;
+}

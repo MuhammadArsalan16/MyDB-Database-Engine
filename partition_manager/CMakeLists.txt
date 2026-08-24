@@ -24,6 +24,7 @@ target_include_directories(partition_manager PUBLIC
 target_link_libraries(partition_manager PUBLIC
     storage_engine
     system_schema
+    Threads::Threads
 )
 
 target_compile_options(partition_manager PRIVATE -Wall -Wextra -Wpedantic)

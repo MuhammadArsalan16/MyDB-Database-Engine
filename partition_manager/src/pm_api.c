@@ -14,7 +14,7 @@
  *
  * Every pm_* function receives a PartitionCtx* which carries:
  *   ctx->storage    — StorageEngine (stateless I/O, one per partition)
- *   ctx->catalog    — Catalog (__catalog.mydb, quota + schema list)
+ *   pctx_catalog(ctx)       → Catalog* (PB[0]: __catalog.mydb, quota + schema list)
  *   ctx->txn_mgr    — TransactionManager (begin/commit/rollback)
  *   pctx_active_schema(ctx) → SchemaFile* (__schema.mydb, RelationDef pages)
  *
@@ -71,8 +71,8 @@ static int value_compare(const Value *a, const Value *b)
 
 static int quota_headroom(PartitionCtx *ctx, uint32_t headroom_pages)
 {
-    Catalog *c = &ctx->catalog;
-    if (c->fd < 0) return MYDB_OK;   /* analyst: no quota to enforce */
+    Catalog *c = pctx_catalog(ctx);
+    if (!c) return MYDB_OK;   /* analyst: no quota to enforce */
     if (c->header.used_bytes > c->header.quota_bytes) return MYDB_ERR_FULL;
     uint64_t need = (uint64_t)headroom_pages * PAGE_SIZE;
     if (c->header.quota_bytes - c->header.used_bytes < need)
@@ -108,7 +108,19 @@ static void reconcile_growth(PartitionCtx *ctx, const char *relation_name,
     SchemaFile *sf = pctx_active_schema(ctx);
     if (sf) {
         schema_bump_relation_pages(sf, relation_name, delta);
-        cat_track_alloc(&ctx->catalog, (int64_t)delta * PAGE_SIZE);
+        /* Phase 3: schema_bump_relation_pages no longer persists itself —
+         * mark Page 0 dirty; pm_commit/pm_rollback (or eviction) resolve it. */
+        PBOuterSlot *outer = pctx_active_outer_slot(ctx);
+        if (outer) pb_mark_page0_dirty(outer);
+
+        /* Phase 4: cat_track_alloc no longer persists itself either — same
+         * write-back treatment, same reasoning, right next to the Page 0
+         * mark above. pm_commit/pm_rollback resolve PB[0] alongside it. */
+        Catalog *cat = pctx_catalog(ctx);
+        if (cat) {
+            cat_track_alloc(cat, (int64_t)delta * PAGE_SIZE);
+            pb_mark_catalog_dirty(ctx->schema_cache);
+        }
     }
 }
 
@@ -161,11 +173,18 @@ static int fk_check_ref_exists(PartitionCtx *ctx,
 
         if (row->cols[fk_col].is_null) continue;
 
+        /* Phase 2: a genuine pin, released immediately after use — this
+         * looks up a DIFFERENT relation than whatever the caller already
+         * holds pinned, so it needs its own accounting (see
+         * PARTITION_BUFFER_DESIGN.md §6/§8; the Phase 1 "caller's pin
+         * already protects it" bypass only ever applied to re-resolving
+         * the SAME relation, never a referenced one). */
         RelationDef *ref = pm_find_relation(ctx, fk->ref_relation_name);
         if (!ref) return MYDB_ERR_FK_VIOLATION;
 
         Value fk_val = row->cols[fk_col];
         Row *ref_row = storage_get_by_pk(&ctx->storage, ref, &fk_val);
+        pm_release_relation(ctx, ref);
         if (!ref_row) return MYDB_ERR_FK_VIOLATION;
     }
     return MYDB_OK;
@@ -186,9 +205,21 @@ static int fk_check_not_referenced(PartitionCtx *ctx,
 
     for (int i = 0; i < MAX_RELATIONS_PER_SCHEMA; i++) {
         if (!sf->relations[i].is_valid) continue;
-        RelationDef *ref_rel = &sf->defs[i];
 
-        for (int j = 0; j < ref_rel->num_foreign_keys; j++) {
+        /* Genuine pin — a different relation than whatever the caller
+         * holds, held for this whole candidate's inspection (its own FK
+         * list, and the scan below), released once at the bottom before
+         * moving to the next candidate. Single release point (not one per
+         * early return) since C has no RAII — see relation_guard.hpp's
+         * doc comment for why the C++ side gets to do this with a guard
+         * and this side has to do it by hand. */
+        RelationDef *ref_rel = pm_find_relation(ctx, sf->relations[i].relation_name);
+        if (!ref_rel) continue;   /* shouldn't happen — directory says valid */
+
+        int hard_err  = 0;
+        int violation = 0;
+
+        for (int j = 0; j < ref_rel->num_foreign_keys && !hard_err && !violation; j++) {
             const ForeignKey *fk = &ref_rel->foreign_keys[j];
 
             if (strncmp(fk->ref_relation_name, r->relation_name,
@@ -200,17 +231,21 @@ static int fk_check_not_referenced(PartitionCtx *ctx,
             if (fk_col < 0) continue;
 
             Cursor *cur = storage_scan(&ctx->storage, ref_rel);
-            if (!cur) return MYDB_ERR;
+            if (!cur) { hard_err = 1; break; }
 
             Row *row;
             while ((row = cursor_next(cur)) != NULL) {
                 if (value_compare(&row->cols[fk_col], pk_val) == 0) {
-                    cursor_close(cur);
-                    return MYDB_ERR_FK_VIOLATION;
+                    violation = 1;
+                    break;
                 }
             }
             cursor_close(cur);
         }
+
+        pm_release_relation(ctx, ref_rel);
+        if (hard_err)  return MYDB_ERR;
+        if (violation) return MYDB_ERR_FK_VIOLATION;
     }
     return MYDB_OK;
 }
@@ -239,9 +274,20 @@ static int fk_apply_on_delete(PartitionCtx *ctx,
 
     for (int i = 0; i < MAX_RELATIONS_PER_SCHEMA; i++) {
         if (!sf->relations[i].is_valid) continue;
-        RelationDef *ref_rel = &sf->defs[i];
 
-        for (int j = 0; j < ref_rel->num_foreign_keys; j++) {
+        /* Genuine pin, held across this whole candidate's FK list plus the
+         * scan/collect/apply work below (including the CASCADE recursion
+         * into pm_delete/pm_update — those take their own nested pin on
+         * this same frame via their own internal re-lookup, which is
+         * exactly why pin_count is a counter, not a boolean: this frame
+         * is legitimately held twice at once during a cascade). Single
+         * release point at the bottom, not one per early exit. */
+        RelationDef *ref_rel = pm_find_relation(ctx, sf->relations[i].relation_name);
+        if (!ref_rel) continue;   /* shouldn't happen — directory says valid */
+
+        int rc_i = MYDB_OK;
+
+        for (int j = 0; j < ref_rel->num_foreign_keys && rc_i == MYDB_OK; j++) {
             const ForeignKey *fk = &ref_rel->foreign_keys[j];
 
             if (strncmp(fk->ref_relation_name, r->relation_name,
@@ -257,16 +303,18 @@ static int fk_apply_on_delete(PartitionCtx *ctx,
             /* ---- RESTRICT: scan and fail on first match ---- */
             if (action == FK_ON_DELETE_RESTRICT) {
                 Cursor *cur = storage_scan(&ctx->storage, ref_rel);
-                if (!cur) return MYDB_ERR;
+                if (!cur) { rc_i = MYDB_ERR; break; }
 
                 Row *row;
+                int found = 0;
                 while ((row = cursor_next(cur)) != NULL) {
                     if (value_compare(&row->cols[fk_col], pk_val) == 0) {
-                        cursor_close(cur);
-                        return MYDB_ERR_FK_VIOLATION;
+                        found = 1;
+                        break;
                     }
                 }
                 cursor_close(cur);
+                if (found) { rc_i = MYDB_ERR_FK_VIOLATION; break; }
                 continue;
             }
 
@@ -276,16 +324,17 @@ static int fk_apply_on_delete(PartitionCtx *ctx,
              *
              *     Heap-allocated growing array — no arbitrary row cap.
              *     Starts at 64, doubles on overflow.  Freed before every
-             *     return path (success or failure). ---- */
+             *     exit from this iteration. ---- */
             int   rid_cap = 64;
             int   nfound  = 0;
             RID  *rids    = (RID *)malloc((size_t)rid_cap * sizeof(RID));
-            if (!rids) return MYDB_ERR;
+            if (!rids) { rc_i = MYDB_ERR; break; }
 
             Cursor *cur = storage_scan(&ctx->storage, ref_rel);
-            if (!cur) { free(rids); return MYDB_ERR; }
+            if (!cur) { free(rids); rc_i = MYDB_ERR; break; }
 
             Row *row;
+            int  collect_err = 0;
             while ((row = cursor_next(cur)) != NULL) {
                 if (value_compare(&row->cols[fk_col], pk_val) != 0) continue;
 
@@ -294,19 +343,15 @@ static int fk_apply_on_delete(PartitionCtx *ctx,
                     rid_cap *= 2;
                     RID *tmp = (RID *)realloc(rids,
                                               (size_t)rid_cap * sizeof(RID));
-                    if (!tmp) {
-                        cursor_close(cur);
-                        free(rids);
-                        return MYDB_ERR;
-                    }
+                    if (!tmp) { collect_err = 1; break; }
                     rids = tmp;
                 }
                 rids[nfound++] = row->rid;
             }
             cursor_close(cur);
+            if (collect_err) { free(rids); rc_i = MYDB_ERR; break; }
 
-            /* Apply the action for every collected RID.
-             * Use fk_rc + break so rids is always freed before returning. */
+            /* Apply the action for every collected RID. */
             int fk_rc = MYDB_OK;
             for (int k = 0; k < nfound; k++) {
                 if (action == FK_ON_DELETE_CASCADE) {
@@ -327,8 +372,11 @@ static int fk_apply_on_delete(PartitionCtx *ctx,
                 }
             }
             free(rids);
-            if (fk_rc != MYDB_OK) return fk_rc;
+            if (fk_rc != MYDB_OK) { rc_i = fk_rc; break; }
         }
+
+        pm_release_relation(ctx, ref_rel);
+        if (rc_i != MYDB_OK) return rc_i;
     }
     return MYDB_OK;
 }
@@ -340,15 +388,39 @@ static int fk_apply_on_delete(PartitionCtx *ctx,
 RelationDef *pm_find_relation(PartitionCtx *ctx, const char *relation_name)
 {
     if (!ctx || !relation_name) return NULL;
-    SchemaFile *sf = pctx_active_schema(ctx);
-    if (!sf) return NULL;
-    return schema_find_relation(sf, relation_name);
+    /* Phase 2: real pin/release against the evictable inner cache
+     * (PARTITION_BUFFER_DESIGN.md §7/§8) — pctx_active_outer_slot reaches
+     * the PBOuterSlot (dir[]/inner[]/pin_count/latch), not just the
+     * SchemaFile* header/directory pctx_active_schema returns. */
+    PBOuterSlot *slot = pctx_active_outer_slot(ctx);
+    if (!slot) return NULL;
+    return pb_pin_relation(slot, relation_name);
 }
 
 const RelationDef *pm_find_relation_const(PartitionCtx *ctx,
                                            const char *relation_name)
 {
     return (const RelationDef *)pm_find_relation(ctx, relation_name);
+}
+
+int pm_release_relation(PartitionCtx *ctx, const RelationDef *rel)
+{
+    if (!ctx || !rel) return MYDB_ERR;
+    PBOuterSlot *slot = pctx_active_outer_slot(ctx);
+    if (!slot) return MYDB_ERR;
+    return pb_unpin_relation(slot, rel);
+}
+
+int pm_relation_slot_index(PartitionCtx *ctx, const char *relation_name)
+{
+    if (!ctx || !relation_name) return -1;
+    SchemaFile *sf = pctx_active_schema(ctx);
+    if (!sf) return -1;
+    RelationEntry *e = schema_find_relation_stat(sf, relation_name);
+    if (!e) return -1;
+    /* relations[] (unlike the old defs[]) is still a flat, non-relocating
+     * array on SchemaFile — this arithmetic stays valid post-Phase-2. */
+    return (int)(e - sf->relations);
 }
 
 /* ------------------------------------------------------------------ */
@@ -362,10 +434,11 @@ int pm_create_schema(PartitionCtx *ctx, const char *name)
 
     /* Owner check: only partition owners can create schemas. Analysts
      * (no partition) get MYDB_ERR_PERM here. */
-    if (ctx->catalog.fd < 0) return MYDB_ERR_PERM;
+    Catalog *cat = pctx_catalog(ctx);
+    if (!cat) return MYDB_ERR_PERM;
 
     /* Reject duplicates against the partition catalog. */
-    if (cat_find_schema(&ctx->catalog, name) != NULL)
+    if (cat_find_schema(cat, name) != NULL)
         return MYDB_ERR_DUPLICATE;
 
     /* Build <partition>/<name>/ and <partition>/<name>/__schema.mydb. */
@@ -386,11 +459,11 @@ int pm_create_schema(PartitionCtx *ctx, const char *name)
      * counter before either file is touched — schema_create and
      * cat_add_schema each stamp this same value into their own record. */
     uint32_t schema_id;
-    int rc = cat_alloc_schema_id(&ctx->catalog, &schema_id);
+    int rc = cat_alloc_schema_id(cat, &schema_id);
     if (rc != MYDB_OK) return rc;
 
     SchemaFile sf;
-    rc = schema_create(path, ctx->catalog.header.partition_id, schema_id,
+    rc = schema_create(path, cat->header.partition_id, schema_id,
                        name, &sf);
     if (rc != MYDB_OK) {
         rmdir(dir);   /* best-effort cleanup if dir was newly created */
@@ -398,7 +471,7 @@ int pm_create_schema(PartitionCtx *ctx, const char *name)
     }
     schema_close(&sf);
 
-    rc = cat_add_schema(&ctx->catalog, name, schema_id);
+    rc = cat_add_schema(cat, name, schema_id);
     if (rc != MYDB_OK) {
         unlink(path);
         rmdir(dir);
@@ -410,7 +483,8 @@ int pm_create_schema(PartitionCtx *ctx, const char *name)
 int pm_drop_schema(PartitionCtx *ctx, const char *name)
 {
     if (!ctx || !name || name[0] == '\0') return MYDB_ERR;
-    if (ctx->catalog.fd < 0) return MYDB_ERR_PERM;
+    Catalog *cat = pctx_catalog(ctx);
+    if (!cat) return MYDB_ERR_PERM;
 
     /* Reject dropping the currently active schema — caller must USE
      * another database (or none) before dropping this one. */
@@ -419,7 +493,7 @@ int pm_drop_schema(PartitionCtx *ctx, const char *name)
         return MYDB_ERR;   /* exec_drop_database checks and surfaces a message */
 
     /* Schema must be registered in the partition catalog. */
-    if (cat_find_schema(&ctx->catalog, name) == NULL)
+    if (cat_find_schema(cat, name) == NULL)
         return MYDB_ERR_NOT_FOUND;
 
     /* If the schema is cached in Cache 2, evict it now so we don't leave a
@@ -467,12 +541,17 @@ int pm_drop_schema(PartitionCtx *ctx, const char *name)
     /* Remove the now-empty schema directory. */
     rmdir(schema_dir);
 
-    /* Credit freed data pages back to the partition quota. */
-    if (freed_bytes > 0)
-        cat_track_alloc(&ctx->catalog, -(int64_t)freed_bytes);
+    /* Credit freed data pages back to the partition quota. Phase 4:
+     * cat_track_alloc no longer persists — mark PB[0] dirty and flush
+     * immediately (DDL has no autocommit wrapper to defer to). */
+    if (freed_bytes > 0) {
+        cat_track_alloc(cat, -(int64_t)freed_bytes);
+        pb_mark_catalog_dirty(ctx->schema_cache);
+        pb_flush_catalog_dirty(ctx->schema_cache);
+    }
 
     /* Remove the schema slot from __catalog.mydb. */
-    return cat_remove_schema(&ctx->catalog, name);
+    return cat_remove_schema(cat, name);
 }
 
 /* ------------------------------------------------------------------ */
@@ -487,7 +566,9 @@ int pm_create_table(PartitionCtx *ctx, RelationDef *rel)
     SchemaFile *sf = pctx_active_schema(ctx);
     if (!sf) return MYDB_ERR_PERM;
 
-    if (schema_find_relation(sf, rel->relation_name) != NULL)
+    /* Existence-only check — the directory (relations[]) answers this
+     * without needing to pin/load the RelationDef page itself. */
+    if (schema_find_relation_stat(sf, rel->relation_name) != NULL)
         return MYDB_ERR_DUPLICATE;
 
     /* Pre-check quota: clustered root + one root per secondary index. */
@@ -503,7 +584,8 @@ int pm_create_table(PartitionCtx *ctx, RelationDef *rel)
     /* Allocate the persistent table_id from the partition's durable
      * counter before storage ever touches disk — storage_create_table
      * just stamps this value into the relation file's own header. */
-    int rc = cat_alloc_table_id(&ctx->catalog, &rel->table_id);
+    Catalog *cat = pctx_catalog(ctx);
+    int rc = cat_alloc_table_id(cat, &rel->table_id);
     if (rc != MYDB_OK) return rc;
 
     /* Create the relation file and allocate its B+ tree root pages.
@@ -511,9 +593,12 @@ int pm_create_table(PartitionCtx *ctx, RelationDef *rel)
     rc = storage_create_table(&ctx->storage, rel);
     if (rc != MYDB_OK) return rc;
 
-    /* Persist the relation in the active schema. schema_add_relation
-     * takes a snapshot of *rel into its defs[] slot — subsequent
-     * mutations (auto_incr_counter, etc.) flow through schema_flush_relation. */
+    /* Persist the relation in the active schema (writes the def page to
+     * disk and registers the directory entry — Phase 2: schema_file.c no
+     * longer keeps its own cached copy). A later pm_find_relation lazily
+     * loads it into PartitionBuffer's inner cache on first access;
+     * subsequent mutations (auto_incr_counter, etc.) flow through
+     * schema_flush_relation. */
     rc = schema_add_relation(sf, rel);
     if (rc != MYDB_OK) return rc;
 
@@ -521,15 +606,32 @@ int pm_create_table(PartitionCtx *ctx, RelationDef *rel)
      * relation.  Bump num_pages for the root pages just allocated. */
     schema_bump_relation_pages(sf, rel->relation_name, (int32_t)need_pages);
 
-    /* Credit the allocated pages to the partition quota. */
-    cat_track_alloc(&ctx->catalog, (int64_t)need_pages * PAGE_SIZE);
+    /* Phase 3: schema_bump_relation_pages no longer persists itself. This
+     * DDL path (unlike DML) has no autocommit wrapper to flush it later,
+     * so flush immediately — matches schema_add_relation's own immediacy
+     * a few lines above, keeping CREATE TABLE fully durable by the time
+     * this function returns, same as before Phase 3. */
+    {
+        PBOuterSlot *outer = pctx_active_outer_slot(ctx);
+        if (outer) { pb_mark_page0_dirty(outer); pb_flush_slot_dirty(outer); }
+    }
+
+    /* Credit the allocated pages to the partition quota. Phase 4:
+     * cat_track_alloc no longer persists — mark PB[0] dirty; flushed
+     * below alongside num_relations, in one save. */
+    if (cat) {
+        cat_track_alloc(cat, (int64_t)need_pages * PAGE_SIZE);
+        pb_mark_catalog_dirty(ctx->schema_cache);
+    }
 
     /* Keep the partition catalog's SchemaEntry.num_relations in sync so
-     * DESCRIBE PARTITION shows the correct table count. */
-    SchemaEntry *se = cat_find_schema(&ctx->catalog, pctx_active_schema_name(ctx));
-    if (se) {
-        se->num_relations++;
-        cat_save(&ctx->catalog);
+     * DESCRIBE PARTITION shows the correct table count. This DDL path has
+     * no autocommit wrapper, so flush immediately — one save covers both
+     * the quota credit above and num_relations here. */
+    if (cat) {
+        SchemaEntry *se = cat_find_schema(cat, pctx_active_schema_name(ctx));
+        if (se) se->num_relations++;
+        pb_flush_catalog_dirty(ctx->schema_cache);
     }
 
     return MYDB_OK;
@@ -543,10 +645,19 @@ int pm_drop_table(PartitionCtx *ctx, RelationDef *rel)
     SchemaFile *sf = pctx_active_schema(ctx);
     if (!sf) return MYDB_ERR_PERM;
 
-    /* Reclaim the partition quota for the file's pages before deleting. */
+    /* Reclaim the partition quota for the file's pages before deleting.
+     * Also snapshot page_no now — schema_remove_relation clears this
+     * directory entry, and the page_no is needed afterward to invalidate
+     * any cached inner frame for it (see below). Phase 4: cat_track_alloc
+     * no longer persists — mark PB[0] dirty; flushed below alongside
+     * num_relations, in one save. */
+    Catalog *cat = pctx_catalog(ctx);
     RelationEntry *e = schema_find_relation_stat(sf, rel->relation_name);
-    if (e && e->num_pages > 0)
-        cat_track_alloc(&ctx->catalog, -(int64_t)e->num_pages * PAGE_SIZE);
+    if (cat && e && e->num_pages > 0) {
+        cat_track_alloc(cat, -(int64_t)e->num_pages * PAGE_SIZE);
+        pb_mark_catalog_dirty(ctx->schema_cache);
+    }
+    uint8_t dropped_page_no = e ? e->page_no : 0;
 
     int rc = storage_drop_table(&ctx->storage, sf->header.schema_name,
                                 rel->relation_name);
@@ -555,11 +666,23 @@ int pm_drop_table(PartitionCtx *ctx, RelationDef *rel)
     rc = schema_remove_relation(sf, rel->relation_name);
     if (rc != MYDB_OK) return rc;
 
-    /* Keep the partition catalog's SchemaEntry.num_relations in sync. */
-    SchemaEntry *se = cat_find_schema(&ctx->catalog, pctx_active_schema_name(ctx));
-    if (se && se->num_relations > 0) {
-        se->num_relations--;
-        cat_save(&ctx->catalog);
+    /* schema_remove_relation frees dropped_page_no for reuse by a future
+     * unrelated CREATE TABLE. Without invalidating it here, a cached
+     * inner frame still marked resident for that page_no would hand the
+     * new relation back this dropped one's stale definition instead of
+     * its own (PARTITION_BUFFER_DESIGN.md — same-page-number aliasing). */
+    if (dropped_page_no != 0) {
+        PBOuterSlot *slot = pctx_active_outer_slot(ctx);
+        if (slot) pb_invalidate_page(slot, dropped_page_no);
+    }
+
+    /* Keep the partition catalog's SchemaEntry.num_relations in sync.
+     * This DDL path has no autocommit wrapper, so flush immediately —
+     * one save covers both the quota reclaim above and num_relations here. */
+    if (cat) {
+        SchemaEntry *se = cat_find_schema(cat, pctx_active_schema_name(ctx));
+        if (se && se->num_relations > 0) se->num_relations--;
+        pb_flush_catalog_dirty(ctx->schema_cache);
     }
 
     return MYDB_OK;
@@ -573,27 +696,47 @@ int pm_add_index(PartitionCtx *ctx, RelationDef *rel, int col_idx)
     SchemaFile *sf = pctx_active_schema(ctx);
     if (!sf) return MYDB_ERR_PERM;
 
-    /* Work through the authoritative in-schema copy */
-    RelationDef *r = schema_find_relation(sf, rel->relation_name);
+    /* Work through the authoritative, pinned in-schema copy — held for the
+     * whole function, released once at the single exit point below. */
+    RelationDef *r = pm_find_relation(ctx, rel->relation_name);
     if (!r) return MYDB_ERR_NOT_FOUND;
 
-    if (quota_headroom(ctx, 1) != MYDB_OK) return MYDB_ERR_FULL;
+    int rc;
+    if (quota_headroom(ctx, 1) != MYDB_OK) { rc = MYDB_ERR_FULL; goto done; }
 
     /* Allocate root page, wire up BTree handle, and backfill all existing
      * rows into the new secondary index.  storage_add_index mutates r
      * in-place (sets secondary_root_page_no, increments num_secondary_indexes). */
-    int rc = storage_add_index(&ctx->storage, r, col_idx);
-    if (rc != MYDB_OK) return rc;
+    rc = storage_add_index(&ctx->storage, r, col_idx);
+    if (rc != MYDB_OK) goto done;
 
-    /* Persist the updated RelationDef before backfill so a crash after
-     * a partial backfill leaves the index visible (and rebuildable). */
-    rc = schema_flush_relation(sf, r->relation_name);
-    if (rc != MYDB_OK) return rc;
+    /* Mark the updated RelationDef and Page 0 dirty, then flush
+     * immediately — this DDL path (unlike DML) has no autocommit
+     * wrapper to flush it later. Persisting before backfill (same
+     * ordering as before Phase 3) means a crash after a partial backfill
+     * still leaves the index visible and rebuildable. */
+    {
+        PBOuterSlot *outer = pctx_active_outer_slot(ctx);
+        if (outer) pb_mark_relation_dirty(outer, r);
+        schema_bump_relation_pages(sf, r->relation_name, 1);
+        if (outer) { pb_mark_page0_dirty(outer); pb_flush_slot_dirty(outer); }
+    }
+    /* Phase 4: cat_track_alloc no longer persists — mark PB[0] dirty and
+     * flush immediately, same "no autocommit wrapper" reasoning as the
+     * schema-side flush just above. */
+    {
+        Catalog *cat = pctx_catalog(ctx);
+        if (cat) {
+            cat_track_alloc(cat, (int64_t)PAGE_SIZE);
+            pb_mark_catalog_dirty(ctx->schema_cache);
+            pb_flush_catalog_dirty(ctx->schema_cache);
+        }
+    }
+    rc = MYDB_OK;
 
-    schema_bump_relation_pages(sf, r->relation_name, 1);
-    cat_track_alloc(&ctx->catalog, (int64_t)PAGE_SIZE);
-
-    return MYDB_OK;
+done:
+    pm_release_relation(ctx, r);
+    return rc;
 }
 
 /* ------------------------------------------------------------------ */
@@ -613,8 +756,21 @@ int pm_commit(PartitionCtx *ctx)
     /* Flush all dirty pages to disk before acknowledging the commit. */
     storage_flush_all_dirty(&ctx->storage);
 
-    /* Fsync the active schema file so RelationDef mutations (row counts,
-     * auto_incr_counter, num_pages) survive a crash. */
+    /* Phase 3: metadata mutations (row counts, auto_incr_counter,
+     * num_pages) are write-back now — schema_update_stats, the
+     * schema_bump_relation_pages/rows pair, and schema_flush_relation's
+     * callers only mark PBOuterSlot dirty, they don't persist. Flush the
+     * active slot's dirty Page 0 + inner frames HERE, before fsync —
+     * otherwise fsync below has nothing new to harden and this whole
+     * function would silently stop being durable for metadata. */
+    PBOuterSlot *outer = pctx_active_outer_slot(ctx);
+    if (outer) pb_flush_slot_dirty(outer);
+
+    /* Phase 4: same treatment for PB[0] (the partition catalog) — quota
+     * bookkeeping (cat_track_alloc) is deferred the same way. */
+    if (ctx->schema_cache) pb_flush_catalog_dirty(ctx->schema_cache);
+
+    /* Fsync the active schema file so the flush above survives a crash. */
     SchemaFile *sf = pctx_active_schema(ctx);
     if (sf && sf->fd >= 0)
         fsync(sf->fd);
@@ -633,6 +789,22 @@ int pm_rollback(PartitionCtx *ctx)
      * on next access the buffer pool reloads pre-transaction data from disk. */
     storage_evict_all(&ctx->storage);
 
+    /* Phase 3: the write-back counterpart for metadata — discard the
+     * active slot's dirty Page 0 (reload from disk) and dirty inner
+     * frames (mark non-resident, next access reloads fresh), mirroring
+     * storage_evict_all's data-page discard above. Closes a real,
+     * pre-existing gap: before Phase 3, schema_bump_relation_rows/etc.
+     * persisted immediately and unconditionally, so a BEGIN; INSERT;
+     * ROLLBACK sequence reverted the row's data but left num_rows
+     * incremented anyway — nothing here ever undid it. */
+    PBOuterSlot *outer = pctx_active_outer_slot(ctx);
+    if (outer) pb_discard_slot_dirty(outer);
+
+    /* Phase 4: same discard treatment for PB[0] — reverts a rolled-back
+     * transaction's uncommitted used_bytes bump, closing the same class
+     * of pre-existing gap Phase 3 closed for num_rows. */
+    if (ctx->schema_cache) pb_discard_catalog_dirty(ctx->schema_cache);
+
     return trx_rollback(&ctx->txn_mgr);
 }
 
@@ -645,12 +817,17 @@ int pm_insert(PartitionCtx *ctx, RelationDef *rel, Row *row)
     if (!ctx || !rel || !row) return MYDB_ERR;
 
     /* Read the writable RelationDef from the active schema — caller's
-     * pointer may be a parser-side const view. */
+     * pointer may be a parser-side const view. Phase 2: a genuine pin,
+     * held for the whole function, released once at the single exit
+     * point below (done:) regardless of which path got us there. */
     RelationDef *r = pm_find_relation(ctx, rel->relation_name);
     if (!r) return MYDB_ERR_NOT_FOUND;
 
-    if (quota_headroom(ctx, DML_QUOTA_HEADROOM_PAGES) != MYDB_OK)
-        return MYDB_ERR_FULL;
+    int rc;
+    if (quota_headroom(ctx, DML_QUOTA_HEADROOM_PAGES) != MYDB_OK) {
+        rc = MYDB_ERR_FULL;
+        goto done;
+    }
 
     int auto_txn = autocommit_begin(ctx);
 
@@ -659,16 +836,20 @@ int pm_insert(PartitionCtx *ctx, RelationDef *rel, Row *row)
         if (r->columns[i].is_not_null && !r->columns[i].is_auto_increment) {
             if (row->cols[i].is_null) {
                 autocommit_end(ctx, auto_txn, MYDB_ERR);
-                return MYDB_ERR_NULL_VIOLATION;
+                rc = MYDB_ERR_NULL_VIOLATION;
+                goto done;
             }
         }
     }
 
     /* FK referential integrity */
-    int fk_rc = fk_check_ref_exists(ctx, r, row);
-    if (fk_rc != MYDB_OK) {
-        autocommit_end(ctx, auto_txn, fk_rc);
-        return fk_rc;
+    {
+        int fk_rc = fk_check_ref_exists(ctx, r, row);
+        if (fk_rc != MYDB_OK) {
+            autocommit_end(ctx, auto_txn, fk_rc);
+            rc = fk_rc;
+            goto done;
+        }
     }
 
     /* AUTO_INCREMENT */
@@ -694,12 +875,12 @@ int pm_insert(PartitionCtx *ctx, RelationDef *rel, Row *row)
     memcpy(sec_root_before, r->secondary_root_page_no, sizeof(sec_root_before));
 
     RID rid;
-    int rc = storage_insert(&ctx->storage, r, row,
-                             trx_current_id(&ctx->txn_mgr), &rid);
+    rc = storage_insert(&ctx->storage, r, row,
+                        trx_current_id(&ctx->txn_mgr), &rid);
     if (rc != MYDB_OK) {
         reconcile_growth(ctx, rel->relation_name, pages_before);
         autocommit_end(ctx, auto_txn, rc);
-        return rc;
+        goto done;
     }
 
     reconcile_growth(ctx, rel->relation_name, pages_before);
@@ -708,15 +889,28 @@ int pm_insert(PartitionCtx *ctx, RelationDef *rel, Row *row)
     for (int i = 0; i < r->num_secondary_indexes && !root_changed; i++)
         root_changed = (r->secondary_root_page_no[i] != sec_root_before[i]);
 
-    SchemaFile *sf = pctx_active_schema(ctx);
-    if (sf) {
-        schema_bump_relation_rows(sf, rel->relation_name, 1);
-        if (r->columns[pk].is_auto_increment || root_changed)
-            schema_flush_relation(sf, rel->relation_name);
+    {
+        SchemaFile *sf = pctx_active_schema(ctx);
+        if (sf) {
+            schema_bump_relation_rows(sf, rel->relation_name, 1);
+            /* Phase 3: neither call persists itself anymore — mark dirty
+             * and let autocommit_end's pm_commit (below) flush it, same
+             * as every other dirty state this transaction touched. */
+            PBOuterSlot *outer = pctx_active_outer_slot(ctx);
+            if (outer) {
+                pb_mark_page0_dirty(outer);
+                if (r->columns[pk].is_auto_increment || root_changed)
+                    pb_mark_relation_dirty(outer, r);
+            }
+        }
     }
 
     autocommit_end(ctx, auto_txn, MYDB_OK);
-    return MYDB_OK;
+    rc = MYDB_OK;
+
+done:
+    pm_release_relation(ctx, r);
+    return rc;
 }
 
 /* ------------------------------------------------------------------ */
@@ -727,35 +921,51 @@ int pm_delete(PartitionCtx *ctx, RelationDef *rel, RID rid)
 {
     if (!ctx || !rel) return MYDB_ERR;
 
+    /* Phase 2: genuine pin, held for the whole function, released once at
+     * the single exit point below. */
     RelationDef *r = pm_find_relation(ctx, rel->relation_name);
     if (!r) return MYDB_ERR_NOT_FOUND;
 
     int auto_txn = autocommit_begin(ctx);
+    int rc;
 
     /* Read the row to get its PK for FK referential integrity checks. */
     Row *old_row = storage_get_by_rid(&ctx->storage, r, rid);
     if (!old_row) {
         autocommit_end(ctx, auto_txn, MYDB_ERR);
-        return MYDB_ERR;
+        rc = MYDB_ERR;
+        goto done;
     }
     Value pk_val = old_row->cols[r->pk_col_idx];
 
     /* FK referential integrity — apply ON DELETE action (RESTRICT / CASCADE
      * / SET_NULL) for every FK that references this row. */
-    int fk_rc = fk_apply_on_delete(ctx, r, &pk_val);
-    if (fk_rc != MYDB_OK) {
-        autocommit_end(ctx, auto_txn, fk_rc);
-        return fk_rc;
+    {
+        int fk_rc = fk_apply_on_delete(ctx, r, &pk_val);
+        if (fk_rc != MYDB_OK) {
+            autocommit_end(ctx, auto_txn, fk_rc);
+            rc = fk_rc;
+            goto done;
+        }
     }
 
-    int rc = storage_delete(&ctx->storage, r, rid);
+    rc = storage_delete(&ctx->storage, r, rid);
 
     if (rc == MYDB_OK) {
         SchemaFile *sf = pctx_active_schema(ctx);
-        if (sf) schema_bump_relation_rows(sf, rel->relation_name, -1);
+        if (sf) {
+            schema_bump_relation_rows(sf, rel->relation_name, -1);
+            /* Phase 3: no longer persists itself — mark dirty; autocommit_end's
+             * pm_commit (below) flushes it. */
+            PBOuterSlot *outer = pctx_active_outer_slot(ctx);
+            if (outer) pb_mark_page0_dirty(outer);
+        }
     }
 
     autocommit_end(ctx, auto_txn, rc);
+
+done:
+    pm_release_relation(ctx, r);
     return rc;
 }
 
@@ -767,11 +977,16 @@ int pm_update(PartitionCtx *ctx, RelationDef *rel, RID rid, Row *new_row)
 {
     if (!ctx || !rel || !new_row) return MYDB_ERR;
 
+    /* Phase 2: genuine pin, held for the whole function, released once at
+     * the single exit point below. */
     RelationDef *r = pm_find_relation(ctx, rel->relation_name);
     if (!r) return MYDB_ERR_NOT_FOUND;
 
-    if (quota_headroom(ctx, DML_QUOTA_HEADROOM_PAGES) != MYDB_OK)
-        return MYDB_ERR_FULL;
+    int rc;
+    if (quota_headroom(ctx, DML_QUOTA_HEADROOM_PAGES) != MYDB_OK) {
+        rc = MYDB_ERR_FULL;
+        goto done;
+    }
 
     int auto_txn = autocommit_begin(ctx);
 
@@ -779,7 +994,8 @@ int pm_update(PartitionCtx *ctx, RelationDef *rel, RID rid, Row *new_row)
     for (int i = 0; i < r->num_columns; i++) {
         if (r->columns[i].is_not_null && new_row->cols[i].is_null) {
             autocommit_end(ctx, auto_txn, MYDB_ERR);
-            return MYDB_ERR_NULL_VIOLATION;
+            rc = MYDB_ERR_NULL_VIOLATION;
+            goto done;
         }
     }
 
@@ -787,7 +1003,8 @@ int pm_update(PartitionCtx *ctx, RelationDef *rel, RID rid, Row *new_row)
     Row *old_row = storage_get_by_rid(&ctx->storage, r, rid);
     if (!old_row) {
         autocommit_end(ctx, auto_txn, MYDB_ERR);
-        return MYDB_ERR;
+        rc = MYDB_ERR;
+        goto done;
     }
     Value old_pk = old_row->cols[r->pk_col_idx];
 
@@ -797,7 +1014,8 @@ int pm_update(PartitionCtx *ctx, RelationDef *rel, RID rid, Row *new_row)
         int fk_rc = fk_check_ref_exists(ctx, r, new_row);
         if (fk_rc != MYDB_OK) {
             autocommit_end(ctx, auto_txn, fk_rc);
-            return fk_rc;
+            rc = fk_rc;
+            goto done;
         }
     }
 
@@ -807,7 +1025,8 @@ int pm_update(PartitionCtx *ctx, RelationDef *rel, RID rid, Row *new_row)
         int fk_rc = fk_check_not_referenced(ctx, r, &old_pk);
         if (fk_rc != MYDB_OK) {
             autocommit_end(ctx, auto_txn, fk_rc);
-            return fk_rc;
+            rc = fk_rc;
+            goto done;
         }
     }
 
@@ -822,8 +1041,8 @@ int pm_update(PartitionCtx *ctx, RelationDef *rel, RID rid, Row *new_row)
     uint32_t sec_root_before[MAX_SECONDARY_IDX];
     memcpy(sec_root_before, r->secondary_root_page_no, sizeof(sec_root_before));
 
-    int rc = storage_update(&ctx->storage, r, rid, new_row,
-                             trx_current_id(&ctx->txn_mgr));
+    rc = storage_update(&ctx->storage, r, rid, new_row,
+                        trx_current_id(&ctx->txn_mgr));
 
     reconcile_growth(ctx, rel->relation_name, pages_before);
 
@@ -833,12 +1052,17 @@ int pm_update(PartitionCtx *ctx, RelationDef *rel, RID rid, Row *new_row)
             root_changed = (r->secondary_root_page_no[i] != sec_root_before[i]);
 
         if (root_changed) {
-            SchemaFile *sf = pctx_active_schema(ctx);
-            if (sf) schema_flush_relation(sf, rel->relation_name);
+            /* Phase 3: no longer persists itself — mark dirty; autocommit_end's
+             * pm_commit (below) flushes it. */
+            PBOuterSlot *outer = pctx_active_outer_slot(ctx);
+            if (outer) pb_mark_relation_dirty(outer, r);
         }
     }
 
     autocommit_end(ctx, auto_txn, rc);
+
+done:
+    pm_release_relation(ctx, r);
     return rc;
 }
 
@@ -849,43 +1073,76 @@ int pm_update(PartitionCtx *ctx, RelationDef *rel, RID rid, Row *new_row)
 Row *pm_get_by_pk(PartitionCtx *ctx, RelationDef *rel, Value *pk)
 {
     if (!ctx || !rel || !pk) return NULL;
+    /* Phase 2: a genuine pin, but held only for this call, not the
+     * returned Row's lifetime — Row is a plain data copy (see storage.c),
+     * not a pointer into the cache, so it has no dependency on the frame
+     * staying resident after this function returns. Guaranteed to be a
+     * cache hit (same relation the caller already holds pinned), so no
+     * eviction risk here — see pm_scan*'s comment below for the same
+     * reasoning applied to a Cursor instead of a Row. */
     RelationDef *r = pm_find_relation(ctx, rel->relation_name);
     if (!r) return NULL;
-    return storage_get_by_pk(&ctx->storage, r, pk);
+    Row *row = storage_get_by_pk(&ctx->storage, r, pk);
+    pm_release_relation(ctx, r);
+    return row;
 }
 
 Row *pm_get_by_index(PartitionCtx *ctx, RelationDef *rel,
                      int col_idx, Value *key)
 {
     if (!ctx || !rel || !key) return NULL;
+    /* Phase 2: pinned only for this call — see pm_get_by_pk's comment
+     * above; a Row is a plain data copy, no lifetime dependency on the
+     * frame past this function's return. */
     RelationDef *r = pm_find_relation(ctx, rel->relation_name);
     if (!r) return NULL;
-    return storage_get_by_index(&ctx->storage, r, col_idx, key);
+    Row *row = storage_get_by_index(&ctx->storage, r, col_idx, key);
+    pm_release_relation(ctx, r);
+    return row;
 }
 
 Cursor *pm_scan(PartitionCtx *ctx, RelationDef *rel)
 {
     if (!ctx || !rel) return NULL;
+    /* Phase 2: pinned only for this call, even though the returned Cursor
+     * holds this same RelationDef* internally across many future
+     * cursor_next() calls (storage.c's StorageScan.rel — see
+     * PARTITION_BUFFER_DESIGN.md's exploration notes). That's safe to
+     * release immediately: the frame's actual protection for the
+     * cursor's whole lifetime comes from the CALLER's own separately-held
+     * pin (its RelationGuard, alive for the whole scan loop), not from
+     * this internal one — this call is guaranteed a cache hit on the
+     * exact same relation the caller already holds. */
     RelationDef *r = pm_find_relation(ctx, rel->relation_name);
     if (!r) return NULL;
-    return storage_scan(&ctx->storage, r);
+    Cursor *cur = storage_scan(&ctx->storage, r);
+    pm_release_relation(ctx, r);
+    return cur;
 }
 
 Cursor *pm_scan_from(PartitionCtx *ctx, RelationDef *rel, Value *lo)
 {
     if (!ctx || !rel || !lo) return NULL;
+    /* Phase 2: pinned only for this call — see pm_scan's comment above,
+     * same reasoning applies identically here. */
     RelationDef *r = pm_find_relation(ctx, rel->relation_name);
     if (!r) return NULL;
-    return storage_scan_from(&ctx->storage, r, lo);
+    Cursor *cur = storage_scan_from(&ctx->storage, r, lo);
+    pm_release_relation(ctx, r);
+    return cur;
 }
 
 Cursor *pm_scan_by_index(PartitionCtx *ctx, RelationDef *rel,
                           int col_idx, Value *lo)
 {
     if (!ctx || !rel) return NULL;
+    /* Phase 2: pinned only for this call — see pm_scan's comment above,
+     * same reasoning applies identically here. */
     RelationDef *r = pm_find_relation(ctx, rel->relation_name);
     if (!r) return NULL;
-    return storage_scan_by_index(&ctx->storage, r, col_idx, lo);
+    Cursor *cur = storage_scan_by_index(&ctx->storage, r, col_idx, lo);
+    pm_release_relation(ctx, r);
+    return cur;
 }
 
 /* ======================================================================
