@@ -33,6 +33,18 @@ add_executable(test_wal_segment_pool wal/test_wal_segment_pool.c)
 target_link_libraries(test_wal_segment_pool PRIVATE wal)
 add_test(NAME test_wal_segment_pool COMMAND test_wal_segment_pool)
 
+# WAL Phase 3 — the 16MB ring buffer + txn_append_record LSN assignment
+# (MYDB_WAL_IMPLEMENTATION.md §8.6). No ATT/DPT, no Flusher thread yet.
+add_executable(test_wal_ring_buffer wal/test_wal_ring_buffer.c)
+target_link_libraries(test_wal_ring_buffer PRIVATE wal)
+add_test(NAME test_wal_ring_buffer COMMAND test_wal_ring_buffer)
+
+# WAL Phase 4 — the real Flusher thread (MYDB_WAL_DESIGN.md §7). The
+# first genuinely concurrent test in this codebase.
+add_executable(test_wal_flusher wal/test_wal_flusher.c)
+target_link_libraries(test_wal_flusher PRIVATE wal)
+add_test(NAME test_wal_flusher COMMAND test_wal_flusher)
+
 # Session-state modules that moved to partition_manager in v3.
 # Their test files still live under tests/storage_engine/ (moved with git mv
 # would need an update here — for now keep the path, link partition_manager).

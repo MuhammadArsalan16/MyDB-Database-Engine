@@ -1,6 +1,7 @@
 #ifndef WAL_TYPES_H
 #define WAL_TYPES_H
 
+#include <stddef.h>
 #include <stdint.h>
 #include "common.h"
 
@@ -45,6 +46,35 @@ typedef struct {
     uint8_t  reserved[3];
     uint32_t checksum;         /* CRC32 over header + body                */
 } WalRecordHeader;
+
+/* ------------------------------------------------------------------
+ * Serialize/deserialize + checksum. Added in Phase 3 (wal_ring_buffer.c
+ * is the first real consumer) — deferred out of Phase 1 since there was
+ * no file/frame I/O yet to serialize into.
+ *
+ * Unlike WalPageHeader/WalSegmentHeader (checksum over the header's own
+ * fixed bytes only), WalRecordHeader.checksum covers header AND body —
+ * two regions that are not contiguous in the final on-disk layout
+ * (checksum itself sits between them, at header offset 40). Both
+ * functions build a small scratch buffer (header-minus-checksum ++
+ * body) purely to compute one CRC32 over that combined span, then write
+ * the real fixed layout (header incl. checksum at its own offset,
+ * followed by body) into buf. buf must have room for
+ * WAL_RECORD_HEADER_SIZE + body_len bytes; body_len must be <=
+ * WAL_MAX_ROW_BODY (the scratch buffer is sized for the worst case).
+ *
+ * wal_record_header_serialize fills buf and stamps hdr->checksum too, so
+ * callers who need to inspect what was written (e.g. to know a frame's
+ * new end_lsn) can read it straight back off *hdr without re-parsing buf.
+ * Caller sets every field of *hdr except checksum first.
+ *
+ * wal_record_header_deserialize validates the checksum before filling
+ * *out. Returns MYDB_OK or MYDB_ERR_BAD_CHECKSUM.
+ * ------------------------------------------------------------------ */
+void wal_record_header_serialize(WalRecordHeader *hdr, const void *body,
+                                  size_t body_len, uint8_t *buf);
+int  wal_record_header_deserialize(const uint8_t *buf, size_t body_len,
+                                    WalRecordHeader *out);
 
 /* ------------------------------------------------------------------
  * Fixed-shape record bodies.
