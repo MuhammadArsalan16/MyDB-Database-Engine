@@ -19,7 +19,8 @@
 /*    40..47  : used_bytes (uint64)                                   */
 /*    48      : num_schemas (uint8)                                   */
 /*    49..52  : next_table_id (uint32) — durable table_id generator   */
-/*    53..127 : reserved (75 B) — headroom for future fields          */
+/*    53..56  : next_schema_id (uint32) — durable schema_id generator */
+/*    57..127 : reserved (71 B) — headroom for future fields          */
 /*    128..2687: 64 × SchemaEntry, 40 B each                          */
 /*    2688..  : reserved block (1400 B)                               */
 /*    4088..  : FNV-1a checksum over bytes 0..4087 (4 B)              */
@@ -35,7 +36,8 @@
  *    0..31  : schema_name (32 B, NUL-padded)
  *    32     : num_relations (uint8)
  *    33     : is_valid (uint8)
- *    34..39 : reserved (6 B) */
+ *    34..37 : schema_id (uint32) — mirrors schema file's SchemaHeader.schema_id
+ *    38..39 : reserved (2 B) */
 
 static uint64_t now_yyyymmddhhmmss(void)
 {
@@ -64,8 +66,9 @@ static void serialize_header(uint8_t *buf, const CatalogHeader *h)
     memcpy(buf + 32, &h->quota_bytes,   8);
     memcpy(buf + 40, &h->used_bytes,    8);
     buf[48] = h->num_schemas;
-    memcpy(buf + 49, &h->next_table_id, 4);
-    /* bytes 53..63 zeroed by caller */
+    memcpy(buf + 49, &h->next_table_id,  4);
+    memcpy(buf + 53, &h->next_schema_id, 4);
+    /* bytes 57..63 zeroed by caller */
 }
 
 static void deserialize_header(const uint8_t *buf, CatalogHeader *h)
@@ -77,7 +80,8 @@ static void deserialize_header(const uint8_t *buf, CatalogHeader *h)
     memcpy(&h->quota_bytes,   buf + 32, 8);
     memcpy(&h->used_bytes,    buf + 40, 8);
     h->num_schemas = buf[48];
-    memcpy(&h->next_table_id, buf + 49, 4);
+    memcpy(&h->next_table_id,  buf + 49, 4);
+    memcpy(&h->next_schema_id, buf + 53, 4);
 }
 
 static void serialize_schema(uint8_t *buf, const SchemaEntry *s)
@@ -85,7 +89,8 @@ static void serialize_schema(uint8_t *buf, const SchemaEntry *s)
     memcpy(buf + 0, s->schema_name, 32);
     buf[32] = s->num_relations;
     buf[33] = s->is_valid;
-    /* bytes 34..39 zeroed by caller */
+    memcpy(buf + 34, &s->schema_id, 4);
+    /* bytes 38..39 zeroed by caller */
 }
 
 static void deserialize_schema(const uint8_t *buf, SchemaEntry *s)
@@ -94,6 +99,7 @@ static void deserialize_schema(const uint8_t *buf, SchemaEntry *s)
     s->schema_name[31] = '\0';        /* defensive NUL */
     s->num_relations = buf[32];
     s->is_valid      = buf[33];
+    memcpy(&s->schema_id, buf + 34, 4);
 }
 
 static void pack(const Catalog *cat, uint8_t *buf)
@@ -157,6 +163,7 @@ int cat_create(const char *path, uint32_t partition_id, uint32_t owner_id,
     out->header.num_schemas   = 0;
     out->header.next_table_id = 1;   /* 0 stays reserved (matches the
                                        * buffer pool's temp-id convention) */
+    out->header.next_schema_id = 1;  /* same reserved-0 convention */
 
     int rc = cat_save(out);
     if (rc != MYDB_OK) {
@@ -217,7 +224,7 @@ int cat_save(Catalog *cat)
     return MYDB_OK;
 }
 
-int cat_add_schema(Catalog *cat, const char *schema_name)
+int cat_add_schema(Catalog *cat, const char *schema_name, uint32_t schema_id)
 {
     if (!cat || !schema_name) return MYDB_ERR;
     if (strlen(schema_name) >= sizeof(cat->schemas[0].schema_name))
@@ -239,6 +246,7 @@ int cat_add_schema(Catalog *cat, const char *schema_name)
     strncpy(s->schema_name, schema_name, sizeof(s->schema_name) - 1);
     s->num_relations = 0;
     s->is_valid      = 1;
+    s->schema_id     = schema_id;
 
     cat->header.num_schemas++;
     return cat_save(cat);
@@ -285,6 +293,14 @@ int cat_alloc_table_id(Catalog *cat, uint32_t *out_id)
     if (!cat || !out_id) return MYDB_ERR;
 
     *out_id = cat->header.next_table_id++;
+    return cat_save(cat);
+}
+
+int cat_alloc_schema_id(Catalog *cat, uint32_t *out_id)
+{
+    if (!cat || !out_id) return MYDB_ERR;
+
+    *out_id = cat->header.next_schema_id++;
     return cat_save(cat);
 }
 

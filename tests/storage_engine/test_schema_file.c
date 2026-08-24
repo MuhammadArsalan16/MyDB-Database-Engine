@@ -8,6 +8,7 @@
 
 #define TEST_FILE  "/tmp/mydb_test_schema_file.mydb"
 #define TEST_PID   17
+#define TEST_SID   42
 #define TEST_NAME  "mydb"
 
 static int tests_run    = 0;
@@ -60,9 +61,10 @@ static void test_create_open_round_trip(void)
     cleanup();
 
     SchemaFile sf;
-    CHECK(schema_create(TEST_FILE, TEST_PID, TEST_NAME, &sf) == MYDB_OK,
+    CHECK(schema_create(TEST_FILE, TEST_PID, TEST_SID, TEST_NAME, &sf) == MYDB_OK,
           "schema_create succeeds");
     CHECK(sf.header.partition_id == TEST_PID,        "partition_id stored");
+    CHECK(sf.header.schema_id == TEST_SID,           "schema_id stored");
     CHECK(strcmp(sf.header.schema_name, TEST_NAME) == 0,
                                                      "schema_name stored");
     CHECK(sf.header.num_relations == 0,              "num_relations starts 0");
@@ -72,6 +74,7 @@ static void test_create_open_round_trip(void)
     SchemaFile sf2;
     CHECK(schema_open(TEST_FILE, &sf2) == MYDB_OK,   "schema_open succeeds");
     CHECK(sf2.header.partition_id == TEST_PID,       "partition_id persisted");
+    CHECK(sf2.header.schema_id == TEST_SID,          "schema_id persisted");
     CHECK(strcmp(sf2.header.schema_name, TEST_NAME) == 0,
                                                      "schema_name persisted");
     CHECK(sf2.header.num_relations == 0,             "num_relations persisted");
@@ -84,11 +87,11 @@ static void test_create_existing_fails(void)
     cleanup();
 
     SchemaFile sf;
-    schema_create(TEST_FILE, TEST_PID, TEST_NAME, &sf);
+    schema_create(TEST_FILE, TEST_PID, TEST_SID, TEST_NAME, &sf);
     schema_close(&sf);
 
     SchemaFile sf2;
-    CHECK(schema_create(TEST_FILE, TEST_PID, TEST_NAME, &sf2) == MYDB_ERR,
+    CHECK(schema_create(TEST_FILE, TEST_PID, TEST_SID, TEST_NAME, &sf2) == MYDB_ERR,
           "schema_create on existing file fails");
 }
 
@@ -111,7 +114,7 @@ static void test_bad_magic_rejected(void)
     cleanup();
 
     SchemaFile sf;
-    schema_create(TEST_FILE, TEST_PID, TEST_NAME, &sf);
+    schema_create(TEST_FILE, TEST_PID, TEST_SID, TEST_NAME, &sf);
     schema_close(&sf);
 
     corrupt_byte(TEST_FILE, 0, 0xFF);                /* break magic[0] */
@@ -125,7 +128,7 @@ static void test_bad_file_type_rejected(void)
     cleanup();
 
     SchemaFile sf;
-    schema_create(TEST_FILE, TEST_PID, TEST_NAME, &sf);
+    schema_create(TEST_FILE, TEST_PID, TEST_SID, TEST_NAME, &sf);
     schema_close(&sf);
 
     corrupt_byte(TEST_FILE, 6, 99);                  /* file_type byte */
@@ -139,7 +142,7 @@ static void test_bad_version_rejected(void)
     cleanup();
 
     SchemaFile sf;
-    schema_create(TEST_FILE, TEST_PID, TEST_NAME, &sf);
+    schema_create(TEST_FILE, TEST_PID, TEST_SID, TEST_NAME, &sf);
     schema_close(&sf);
 
     corrupt_byte(TEST_FILE, 4, 99);                  /* version byte */
@@ -153,7 +156,7 @@ static void test_bad_checksum_rejected(void)
     cleanup();
 
     SchemaFile sf;
-    schema_create(TEST_FILE, TEST_PID, TEST_NAME, &sf);
+    schema_create(TEST_FILE, TEST_PID, TEST_SID, TEST_NAME, &sf);
     schema_close(&sf);
 
     /* tamper with a reserved byte inside Page 0 — checksum should catch it */
@@ -172,7 +175,7 @@ static void test_add_relation_basic(void)
     cleanup();
 
     SchemaFile sf;
-    schema_create(TEST_FILE, TEST_PID, TEST_NAME, &sf);
+    schema_create(TEST_FILE, TEST_PID, TEST_SID, TEST_NAME, &sf);
 
     RelationDef def = make_simple_def("students");
     CHECK(schema_add_relation(&sf, &def) == MYDB_OK, "add_relation succeeds");
@@ -202,7 +205,7 @@ static void test_add_duplicate_rejected(void)
     cleanup();
 
     SchemaFile sf;
-    schema_create(TEST_FILE, TEST_PID, TEST_NAME, &sf);
+    schema_create(TEST_FILE, TEST_PID, TEST_SID, TEST_NAME, &sf);
 
     RelationDef d1 = make_simple_def("orders");
     RelationDef d2 = make_simple_def("orders");
@@ -219,7 +222,7 @@ static void test_full_capacity(void)
     cleanup();
 
     SchemaFile sf;
-    schema_create(TEST_FILE, TEST_PID, TEST_NAME, &sf);
+    schema_create(TEST_FILE, TEST_PID, TEST_SID, TEST_NAME, &sf);
 
     /* fill every slot */
     for (int i = 0; i < MAX_RELATIONS_PER_SCHEMA; i++) {
@@ -249,7 +252,7 @@ static void test_remove_and_reuse(void)
     cleanup();
 
     SchemaFile sf;
-    schema_create(TEST_FILE, TEST_PID, TEST_NAME, &sf);
+    schema_create(TEST_FILE, TEST_PID, TEST_SID, TEST_NAME, &sf);
 
     RelationDef a = make_simple_def("alpha");
     RelationDef b = make_simple_def("beta");
@@ -280,7 +283,7 @@ static void test_remove_missing(void)
     cleanup();
 
     SchemaFile sf;
-    schema_create(TEST_FILE, TEST_PID, TEST_NAME, &sf);
+    schema_create(TEST_FILE, TEST_PID, TEST_SID, TEST_NAME, &sf);
     CHECK(schema_remove_relation(&sf, "ghost") == MYDB_ERR_NOT_FOUND,
           "remove missing returns NOT_FOUND");
     schema_close(&sf);
@@ -296,7 +299,7 @@ static void test_persistence_round_trip(void)
     cleanup();
 
     SchemaFile sf;
-    schema_create(TEST_FILE, TEST_PID, TEST_NAME, &sf);
+    schema_create(TEST_FILE, TEST_PID, TEST_SID, TEST_NAME, &sf);
     RelationDef d = make_simple_def("persisted");
     schema_add_relation(&sf, &d);
     schema_update_stats(&sf, "persisted", 100, 5, 3);
@@ -404,7 +407,7 @@ static void test_full_relation_def_round_trip(void)
     r.root_page_no      = 7;
 
     SchemaFile sf;
-    schema_create(TEST_FILE, TEST_PID, TEST_NAME, &sf);
+    schema_create(TEST_FILE, TEST_PID, TEST_SID, TEST_NAME, &sf);
     CHECK(schema_add_relation(&sf, &r) == MYDB_OK,
           "add full RelationDef succeeds");
     schema_close(&sf);
@@ -434,7 +437,7 @@ static void test_flush_relation(void)
     cleanup();
 
     SchemaFile sf;
-    schema_create(TEST_FILE, TEST_PID, TEST_NAME, &sf);
+    schema_create(TEST_FILE, TEST_PID, TEST_SID, TEST_NAME, &sf);
     RelationDef d = make_simple_def("counters");
     schema_add_relation(&sf, &d);
 
@@ -461,7 +464,7 @@ static void test_flush_missing(void)
     cleanup();
 
     SchemaFile sf;
-    schema_create(TEST_FILE, TEST_PID, TEST_NAME, &sf);
+    schema_create(TEST_FILE, TEST_PID, TEST_SID, TEST_NAME, &sf);
     CHECK(schema_flush_relation(&sf, "nope") == MYDB_ERR_NOT_FOUND,
           "flush missing returns NOT_FOUND");
     schema_close(&sf);
@@ -477,7 +480,7 @@ static void test_size_bytes_multi(void)
     cleanup();
 
     SchemaFile sf;
-    schema_create(TEST_FILE, TEST_PID, TEST_NAME, &sf);
+    schema_create(TEST_FILE, TEST_PID, TEST_SID, TEST_NAME, &sf);
     RelationDef a = make_simple_def("a");
     RelationDef b = make_simple_def("b");
     RelationDef c = make_simple_def("c");
@@ -511,7 +514,7 @@ static void test_bump_pages_positive(void)
     cleanup();
 
     SchemaFile sf;
-    schema_create(TEST_FILE, TEST_PID, TEST_NAME, &sf);
+    schema_create(TEST_FILE, TEST_PID, TEST_SID, TEST_NAME, &sf);
     RelationDef d = make_simple_def("users");
     schema_add_relation(&sf, &d);
 
@@ -537,7 +540,7 @@ static void test_bump_pages_negative_clamps(void)
     cleanup();
 
     SchemaFile sf;
-    schema_create(TEST_FILE, TEST_PID, TEST_NAME, &sf);
+    schema_create(TEST_FILE, TEST_PID, TEST_SID, TEST_NAME, &sf);
     RelationDef d = make_simple_def("orders");
     schema_add_relation(&sf, &d);
     schema_bump_relation_pages(&sf, "orders", +3);
@@ -562,7 +565,7 @@ static void test_bump_pages_unknown_relation(void)
     cleanup();
 
     SchemaFile sf;
-    schema_create(TEST_FILE, TEST_PID, TEST_NAME, &sf);
+    schema_create(TEST_FILE, TEST_PID, TEST_SID, TEST_NAME, &sf);
 
     CHECK(schema_bump_relation_pages(&sf, "ghost", +1) == MYDB_ERR_NOT_FOUND,
           "unknown relation → MYDB_ERR_NOT_FOUND");

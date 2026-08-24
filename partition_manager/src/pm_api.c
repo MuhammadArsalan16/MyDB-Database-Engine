@@ -382,15 +382,23 @@ int pm_create_schema(PartitionCtx *ctx, const char *name)
             return MYDB_ERR;
     }
 
+    /* Allocate the persistent schema_id from the partition's durable
+     * counter before either file is touched — schema_create and
+     * cat_add_schema each stamp this same value into their own record. */
+    uint32_t schema_id;
+    int rc = cat_alloc_schema_id(&ctx->catalog, &schema_id);
+    if (rc != MYDB_OK) return rc;
+
     SchemaFile sf;
-    int rc = schema_create(path, ctx->catalog.header.partition_id, name, &sf);
+    rc = schema_create(path, ctx->catalog.header.partition_id, schema_id,
+                       name, &sf);
     if (rc != MYDB_OK) {
         rmdir(dir);   /* best-effort cleanup if dir was newly created */
         return rc;
     }
     schema_close(&sf);
 
-    rc = cat_add_schema(&ctx->catalog, name);
+    rc = cat_add_schema(&ctx->catalog, name, schema_id);
     if (rc != MYDB_OK) {
         unlink(path);
         rmdir(dir);

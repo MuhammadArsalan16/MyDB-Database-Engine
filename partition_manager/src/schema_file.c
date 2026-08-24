@@ -13,13 +13,14 @@
 /*                                                                    */
 /*    0..7      : FileHeaderId (magic / version / file_type=3)        */
 /*    8..11     : partition_id (uint32)                               */
-/*    12..43    : schema_name (32 B)                                  */
-/*    44..51    : created_at (uint64)                                 */
-/*    52..59    : last_modified (uint64)                              */
-/*    60..67    : size_bytes (uint64) — written as 0, recomputed      */
+/*    12..15    : schema_id (uint32) — mirrors catalog SchemaEntry.schema_id */
+/*    16..47    : schema_name (32 B)                                  */
+/*    48..55    : created_at (uint64)                                 */
+/*    56..63    : last_modified (uint64)                              */
+/*    64..71    : size_bytes (uint64) — written as 0, recomputed      */
 /*                on load (§8 implementation note)                    */
-/*    68        : num_relations (uint8)                               */
-/*    69..127   : reserved (59 B) — headroom for future fields        */
+/*    72        : num_relations (uint8)                               */
+/*    73..127   : reserved (55 B) — headroom for future fields        */
 /*    128..3711 : 64 x RelationEntry, 56 B each                       */
 /*    3712..16367: reserved (12656 B)                                 */
 /*    16368..16375: reserved (8 B)                                    */
@@ -326,23 +327,25 @@ static void serialize_header(uint8_t *buf, const SchemaHeader *h)
 {
     file_header_write_id(buf, FILETYPE_SCHEMA);
     memcpy(buf + 8,  &h->partition_id,  4);
-    memcpy(buf + 12, h->schema_name,   32);
-    memcpy(buf + 44, &h->created_at,    8);
-    memcpy(buf + 52, &h->last_modified, 8);
-    /* size_bytes (60..67) is intentionally zeroed — recomputed on load */
-    buf[68] = h->num_relations;
-    /* bytes 69..71 zeroed by caller */
+    memcpy(buf + 12, &h->schema_id,     4);
+    memcpy(buf + 16, h->schema_name,   32);
+    memcpy(buf + 48, &h->created_at,    8);
+    memcpy(buf + 56, &h->last_modified, 8);
+    /* size_bytes (64..71) is intentionally zeroed — recomputed on load */
+    buf[72] = h->num_relations;
+    /* bytes 73..75 zeroed by caller */
 }
 
 static void deserialize_header(const uint8_t *buf, SchemaHeader *h)
 {
     memcpy(&h->partition_id,  buf + 8,  4);
-    memcpy(h->schema_name,    buf + 12, 32);
+    memcpy(&h->schema_id,     buf + 12, 4);
+    memcpy(h->schema_name,    buf + 16, 32);
     h->schema_name[31] = '\0';                /* defensive NUL */
-    memcpy(&h->created_at,    buf + 44, 8);
-    memcpy(&h->last_modified, buf + 52, 8);
+    memcpy(&h->created_at,    buf + 48, 8);
+    memcpy(&h->last_modified, buf + 56, 8);
     h->size_bytes    = 0;                     /* will be recomputed */
-    h->num_relations = buf[68];
+    h->num_relations = buf[72];
 }
 
 static void serialize_relation_entry(uint8_t *buf, const RelationEntry *e)
@@ -467,7 +470,7 @@ static int write_page(int fd, uint8_t page_no, const uint8_t *buf)
 /*  Public API                                                        */
 /* ------------------------------------------------------------------ */
 
-int schema_create(const char *path, uint32_t partition_id,
+int schema_create(const char *path, uint32_t partition_id, uint32_t schema_id,
                   const char *schema_name, SchemaFile *out)
 {
     if (!path || !schema_name || !out) return MYDB_ERR;
@@ -488,6 +491,7 @@ int schema_create(const char *path, uint32_t partition_id,
     strncpy(out->path, path, sizeof(out->path) - 1);
 
     out->header.partition_id  = partition_id;
+    out->header.schema_id     = schema_id;
     strncpy(out->header.schema_name, schema_name,
             sizeof(out->header.schema_name) - 1);
     out->header.created_at    = now_yyyymmddhhmmss();
