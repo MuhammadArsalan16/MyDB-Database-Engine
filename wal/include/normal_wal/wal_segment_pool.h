@@ -30,7 +30,7 @@
  *     wal_segment_pool_write_page(). When IT decides that segment is
  *     full ("if segment full: close segment, claim next SEG_FREE, open
  *     new segment" — its own decision, using its own cursor, not this
- *     module's job to predict), it calls wal_segment_pool_finalize() to
+ *     module's job to predict), it calls wal_segment_pool_mark_done() to
  *     transition SEG_ACTIVE -> SEG_DONE, then wal_segment_pool_claim_next()
  *     for the next one. This module only supplies those primitives; the
  *     rollover *decision* and cursor bookkeeping belong to the Flusher
@@ -137,7 +137,7 @@ int wal_segment_pool_read_page(WalSegmentPool *pool, uint32_t slot_index,
  * next one. The one exception to "never reads header content": right
  * before finalizing, reads the just-filled last page back
  * (wal_segment_pool_read_page + wal_page_header_deserialize) purely to
- * copy its end_lsn field into finalize()'s end_lsn argument — the only
+ * copy its end_lsn field into mark_done()'s end_lsn argument — the only
  * reliable source for a segment's true highest LSN, since page_lsn alone
  * is only the *first* record's LSN, not the last (see wal_page.h's
  * end_lsn field comment). This is a field copy, not content
@@ -159,7 +159,7 @@ int wal_segment_pool_write(WalSegmentPool *pool,
  * the replacement — the decision of "is this segment full" is the
  * Flusher's, not this module's; this only performs the transition once
  * told to. Returns MYDB_ERR if the slot isn't currently SEG_ACTIVE. */
-int wal_segment_pool_finalize(WalSegmentPool *pool, uint32_t slot_index,
+int wal_segment_pool_mark_done(WalSegmentPool *pool, uint32_t slot_index,
                                uint64_t end_lsn, uint32_t data_pages);
 
 /* Reads a whole segment file's raw WAL_SEGMENT_FILE_SIZE bytes (header

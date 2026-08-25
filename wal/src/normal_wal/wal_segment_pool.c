@@ -222,7 +222,7 @@ int wal_segment_pool_claim_next(WalSegmentPool *pool, uint32_t *out_slot_index)
     return MYDB_OK;
 }
 
-int wal_segment_pool_finalize(WalSegmentPool *pool, uint32_t slot_index,
+int wal_segment_pool_mark_done(WalSegmentPool *pool, uint32_t slot_index,
                                uint64_t end_lsn, uint32_t data_pages)
 {
     if (!pool || slot_index >= WAL_SEGMENT_POOL_SLOTS) return MYDB_ERR;
@@ -338,7 +338,7 @@ int wal_segment_pool_write(WalSegmentPool *pool,
 
             uint32_t finished_slot       = *slot_index;
             uint32_t finished_data_pages = *page_no;
-            if (wal_segment_pool_finalize(pool, finished_slot, seg_end_lsn, finished_data_pages) != MYDB_OK)
+            if (wal_segment_pool_mark_done(pool, finished_slot, seg_end_lsn, finished_data_pages) != MYDB_OK)
                 return MYDB_ERR;
             if (wal_segment_pool_claim_next(pool, slot_index) != MYDB_OK)
                 return MYDB_ERR;
@@ -352,7 +352,7 @@ int wal_segment_pool_write(WalSegmentPool *pool,
      * yet to batch many writes behind one fsync (design doc §11). fsync()
      * flushes every dirty page of this fd, not just what this call wrote,
      * so this is correct even after a mid-call segment rollover (the
-     * finalized old segment was already fsync'd by finalize() itself;
+     * finalized old segment was already fsync'd by mark_done() itself;
      * this covers whatever landed in the current *slot_index since).
      * Remove this one line once the Flusher lands and does its own
      * batched fsync at the end of each flush cycle instead. */

@@ -57,15 +57,18 @@
 /*  File type constants (all files share MYDB_MAGIC; file_type field  */
 /*  at byte offset 6 of every file header distinguishes them)         */
 /* ------------------------------------------------------------------ */
-#define FILETYPE_DATABASE    1   /* __database.mydb        — engine registry */
-#define FILETYPE_CATALOG     2   /* __catalog.mydb         — partition catalog */
-#define FILETYPE_SCHEMA      3   /* __schema.mydb          — schema definition */
-#define FILETYPE_RELATION    4   /* <relation>.mydb        — B+ tree data file */
-#define FILETYPE_USERS       5   /* system_schema/users.mydb */
-#define FILETYPE_PRIVILEGES  6   /* system_schema/privileges.mydb */
-#define FILETYPE_STATS       7   /* __stats.mydb           — CBO optimizer stats */
-#define FILETYPE_WAL_PAGE    8   /* wal/wal_<N>.mydb page format */
-#define FILETYPE_WAL_SEGMENT 9   /* wal/wal_<N>.mydb segment header */
+#define FILETYPE_DATABASE            1   /* __database.mydb        — engine registry */
+#define FILETYPE_CATALOG             2   /* __catalog.mydb         — partition catalog */
+#define FILETYPE_SCHEMA              3   /* __schema.mydb          — schema definition */
+#define FILETYPE_RELATION            4   /* <relation>.mydb        — B+ tree data file */
+#define FILETYPE_USERS               5   /* system_schema/users.mydb */
+#define FILETYPE_PRIVILEGES          6   /* system_schema/privileges.mydb */
+#define FILETYPE_STATS               7   /* __stats.mydb           — CBO optimizer stats */
+#define FILETYPE_WAL_PAGE            8   /* wal/wal_<N>.mydb page format */
+#define FILETYPE_WAL_SEGMENT         9   /* wal/wal_<N>.mydb segment header */
+#define FILETYPE_LARGE_WAL_PAGE     10   /* large_wal/lw_<N>.mydb page format */
+#define FILETYPE_LARGE_WAL_SEGMENT  11   /* large_wal/lw_<N>.mydb segment header */
+#define FILETYPE_LARGE_WAL_INDEX    12   /* wal/large_wal_index.mydb */
 
 /* ------------------------------------------------------------------ */
 /*  On-disk format version. Bumped when any file layout changes in    */

@@ -5,11 +5,19 @@ add_library(wal STATIC
     src/normal_wal/wal_segment_pool.c
     src/normal_wal/wal_ring_buffer.c
     src/normal_wal/wal_flusher.c
+    src/large_wal/large_wal_page.c
+    src/large_wal/large_wal_segment.c
+    src/large_wal/large_wal_segment_pool.c
+    src/large_wal/large_wal_index.c
+    src/large_wal/large_wal_archiver.c
+    src/large_wal/large_wal_buffer.c
 )
 
-# WAL Phase 1: normal_wal's on-disk struct layer only (record/page/segment
-# header format + checksum). large_wal/ is added under this same target
-# once its own plan lands (MYDB_WAL_IMPLEMENTATION.md §10).
+# large_wal Phase 1: on-disk struct layer (page/segment header format +
+# checksum). Phase 2: the 4-slot rotation pool. Phase 3: the archive
+# section (holding area + index + archiver). Phase 4: the static staging
+# buffer. All mirror normal_wal's own equivalent phases where one exists
+# (MYDB_WAL_IMPLEMENTATION.md §10).
 target_include_directories(wal PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )

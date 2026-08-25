@@ -26,6 +26,39 @@ add_executable(test_wal_types wal/test_wal_types.c)
 target_link_libraries(test_wal_types PRIVATE wal)
 add_test(NAME test_wal_types COMMAND test_wal_types)
 
+# large_wal Phase 1 — on-disk struct layer only (page/segment header
+# format + checksum), mirroring normal_wal's own Phase 1 exactly
+# (MYDB_WAL_IMPLEMENTATION.md §10).
+add_executable(test_large_wal_types wal/test_large_wal_types.c)
+target_link_libraries(test_large_wal_types PRIVATE wal)
+add_test(NAME test_large_wal_types COMMAND test_large_wal_types)
+
+# large_wal Phase 2 — the 4-slot rotation pool of large_wal_<N>.mydb
+# segment files (MYDB_WAL_IMPLEMENTATION.md §10.1). Real file I/O under
+# /tmp; no copy-out/holding-area yet — "archive section" phase next.
+add_executable(test_large_wal_segment_pool wal/test_large_wal_segment_pool.c)
+target_link_libraries(test_large_wal_segment_pool PRIVATE wal)
+add_test(NAME test_large_wal_segment_pool COMMAND test_large_wal_segment_pool)
+
+# large_wal Phase 3 — the archive section: large_wal_index.mydb (content_lsn
+# -> segment location) and the archiver (rotation-pool copy-out to the
+# holding area, large_wal_get resolution, Gate A/B freeing). Real file I/O
+# under /tmp. (MYDB_WAL_IMPLEMENTATION.md §10.1/§10.6).
+add_executable(test_large_wal_index wal/test_large_wal_index.c)
+target_link_libraries(test_large_wal_index PRIVATE wal)
+add_test(NAME test_large_wal_index COMMAND test_large_wal_index)
+
+add_executable(test_large_wal_archiver wal/test_large_wal_archiver.c)
+target_link_libraries(test_large_wal_archiver PRIVATE wal)
+add_test(NAME test_large_wal_archiver COMMAND test_large_wal_archiver)
+
+# large_wal Phase 4 — the static staging buffer (MYDB_WAL_IMPLEMENTATION.md
+# §10.10): static-vs-heap sizing only, no page framing (deferred to the
+# writer-thread phase — see the plan).
+add_executable(test_large_wal_buffer wal/test_large_wal_buffer.c)
+target_link_libraries(test_large_wal_buffer PRIVATE wal)
+add_test(NAME test_large_wal_buffer COMMAND test_large_wal_buffer)
+
 # WAL Phase 2 — the pool of 10 physical wal_<N>.mydb segment files:
 # pre-allocation, round-robin claiming, raw page I/O, crash-reload
 # tail-scan (MYDB_WAL_IMPLEMENTATION.md §8.4). Real file I/O under /tmp.
