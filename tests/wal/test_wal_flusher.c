@@ -106,7 +106,7 @@ static void test_demand_signal(void)
     CHECK(wal_segment_pool_claim_next(&pool, &slot) == MYDB_OK, "claim succeeds");
 
     WalFlusher flusher;
-    CHECK(wal_flusher_start(&flusher, &rb, &pool, slot) == MYDB_OK, "flusher starts");
+    CHECK(wal_flusher_start(&flusher, &rb, &pool, slot, NULL) == MYDB_OK, "flusher starts");
 
     uint64_t last_lsn = 0;
     for (int i = 0; i < 10; i++) {
@@ -146,7 +146,7 @@ static void test_periodic_timeout(void)
     wal_segment_pool_claim_next(&pool, &slot);
 
     WalFlusher flusher;
-    CHECK(wal_flusher_start(&flusher, &rb, &pool, slot) == MYDB_OK, "flusher starts");
+    CHECK(wal_flusher_start(&flusher, &rb, &pool, slot, NULL) == MYDB_OK, "flusher starts");
 
     /* Append enough 144-byte records (no signal at all) to close at
      * least frame 0 — track the last lsn that landed in frame 0. */
@@ -210,7 +210,7 @@ static void test_concurrent_appenders(void)
     wal_segment_pool_claim_next(&pool, &slot);
 
     WalFlusher flusher;
-    CHECK(wal_flusher_start(&flusher, &rb, &pool, slot) == MYDB_OK, "flusher starts");
+    CHECK(wal_flusher_start(&flusher, &rb, &pool, slot, NULL) == MYDB_OK, "flusher starts");
 
     pthread_t threads[APPENDER_THREADS];
     AppenderArg args[APPENDER_THREADS];
@@ -259,7 +259,7 @@ static void test_stop_join(void)
     wal_segment_pool_claim_next(&pool, &slot);
 
     WalFlusher flusher;
-    wal_flusher_start(&flusher, &rb, &pool, slot);
+    wal_flusher_start(&flusher, &rb, &pool, slot, NULL);
 
     int rc = wal_flusher_stop(&flusher);
     CHECK(rc == MYDB_OK, "stop returns promptly, well under a full periodic cycle's worth of waiting");

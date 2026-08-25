@@ -69,6 +69,7 @@
 #define FILETYPE_LARGE_WAL_PAGE     10   /* large_wal/lw_<N>.mydb page format */
 #define FILETYPE_LARGE_WAL_SEGMENT  11   /* large_wal/lw_<N>.mydb segment header */
 #define FILETYPE_LARGE_WAL_INDEX    12   /* wal/large_wal_index.mydb */
+#define FILETYPE_LARGE_WAL_STATE    13   /* wal/large_wal_state.mydb */
 
 /* ------------------------------------------------------------------ */
 /*  On-disk format version. Bumped when any file layout changes in    */

@@ -108,7 +108,7 @@ static int open_existing_or_create_slot(LargeWalSegmentPool *pool, uint32_t slot
         close(fd);
         return MYDB_ERR;
     }
-    if (fsync(fd) < 0) {
+    if (fdatasync(fd) < 0) {
         close(fd);
         return MYDB_ERR;
     }
@@ -208,7 +208,8 @@ int large_wal_segment_pool_claim_next(LargeWalSegmentPool *pool, uint32_t *out_s
     large_wal_segment_header_serialize(&slot->header, page_buf);
 
     if (pwrite_all(slot->fd, page_buf, PAGE_SIZE, 0) != MYDB_OK) return MYDB_ERR;
-    if (fsync(slot->fd) < 0) return MYDB_ERR;
+    /* No fdatasync here — see the header's doc comment for why claim_next
+     * never needs one. */
 
     large_wal_segment_header_deserialize(page_buf, &slot->header);
 
@@ -217,8 +218,8 @@ int large_wal_segment_pool_claim_next(LargeWalSegmentPool *pool, uint32_t *out_s
     return MYDB_OK;
 }
 
-int large_wal_segment_pool_mark_done(LargeWalSegmentPool *pool, uint32_t slot_index,
-                                     uint64_t end_lsn, uint32_t data_pages)
+int large_wal_segment_pool_mark_done(LargeWalSegmentPool *pool, WalWorker *worker,
+                                     uint32_t slot_index, uint64_t end_lsn, uint32_t data_pages)
 {
     if (!pool || slot_index >= LARGE_WAL_SEGMENT_POOL_SLOTS) return MYDB_ERR;
 
@@ -234,7 +235,11 @@ int large_wal_segment_pool_mark_done(LargeWalSegmentPool *pool, uint32_t slot_in
     large_wal_segment_header_serialize(&slot->header, page_buf);
 
     if (pwrite_all(slot->fd, page_buf, PAGE_SIZE, 0) != MYDB_OK) return MYDB_ERR;
-    if (fsync(slot->fd) < 0) return MYDB_ERR;
+    if (worker) {
+        if (wal_worker_async_fdatasync(worker, slot->fd) != MYDB_OK) return MYDB_ERR;
+    } else {
+        if (fdatasync(slot->fd) < 0) return MYDB_ERR;
+    }
 
     large_wal_segment_header_deserialize(page_buf, &slot->header);
     return MYDB_OK;
@@ -258,7 +263,7 @@ int large_wal_segment_pool_free_slot(LargeWalSegmentPool *pool, uint32_t slot_in
     large_wal_segment_header_serialize(&slot->header, page_buf);
 
     if (pwrite_all(slot->fd, page_buf, PAGE_SIZE, 0) != MYDB_OK) return MYDB_ERR;
-    if (fsync(slot->fd) < 0) return MYDB_ERR;
+    if (fdatasync(slot->fd) < 0) return MYDB_ERR;
 
     large_wal_segment_header_deserialize(page_buf, &slot->header);
     return MYDB_OK;
@@ -304,7 +309,7 @@ int large_wal_segment_pool_read_segment(LargeWalSegmentPool *pool, uint32_t slot
  * anything inside buf.
  * ------------------------------------------------------------------ */
 
-int large_wal_segment_pool_write(LargeWalSegmentPool *pool,
+int large_wal_segment_pool_write(LargeWalSegmentPool *pool, WalWorker *worker,
                                   uint32_t *slot_index, uint32_t *page_no, uint32_t *offset,
                                   const uint8_t *buf, size_t buf_len)
 {
@@ -354,7 +359,7 @@ int large_wal_segment_pool_write(LargeWalSegmentPool *pool,
 
             uint32_t finished_slot       = *slot_index;
             uint32_t finished_data_pages = *page_no;
-            if (large_wal_segment_pool_mark_done(pool, finished_slot, seg_end_lsn, finished_data_pages) != MYDB_OK)
+            if (large_wal_segment_pool_mark_done(pool, worker, finished_slot, seg_end_lsn, finished_data_pages) != MYDB_OK)
                 return MYDB_ERR;
             if (large_wal_segment_pool_claim_next(pool, slot_index) != MYDB_OK)
                 return MYDB_ERR;
@@ -364,10 +369,24 @@ int large_wal_segment_pool_write(LargeWalSegmentPool *pool,
         }
     }
 
-    /* TEMPORARY: fsync every call, since there's no LARGE_WAL Writer
-     * thread / group-commit yet to batch many writes behind one fsync
-     * (design doc §11). Remove this one line once that thread lands. */
-    if (fsync(pool->slots[*slot_index].fd) < 0) return MYDB_ERR;
+    /* TEMPORARY: fdatasync every call — large_wal_writer (large_wal_writer.h)
+     * now exists, but each submit() is still a fully synchronous,
+     * single-record handoff (design doc §11's group-commit batching isn't
+     * built yet), so there's still no batching to fold this flush into.
+     * fdatasync, not fsync: segment files are posix_fallocate'd to their
+     * full fixed size once at creation and never resized again, so
+     * skipping metadata (timestamps etc.) not needed for correct data
+     * retrieval is strictly cheaper here with no durability difference —
+     * avoids dragging the filesystem journal into every flush on
+     * filesystems like ext4. Remove this one line once submit() batches
+     * multiple pending records behind one flush instead. */
+    if (fdatasync(pool->slots[*slot_index].fd) < 0) return MYDB_ERR;
+
+    /* If this call rolled over, mark_done() may have handed its fsync
+     * to worker instead of waiting for it (see mark_done's own doc
+     * comment) — confirm it's actually durable before telling our own
+     * caller this call succeeded. Cheap no-op if it didn't. */
+    if (worker && wal_worker_wait(worker) != MYDB_OK) return MYDB_ERR;
 
     return MYDB_OK;
 }

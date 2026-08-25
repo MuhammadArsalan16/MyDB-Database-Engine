@@ -118,7 +118,7 @@ int wal_ring_buffer_drain(WalRingBuffer *rb, WalSegmentPool *pool,
     while (*drain_frame != rb->write_frame) {
         uint8_t *frame = rb->buf + (size_t)(*drain_frame) * WAL_PAGE_SIZE;
 
-        if (wal_segment_pool_write(pool, seg_slot, seg_page_no, seg_offset,
+        if (wal_segment_pool_write(pool, NULL, seg_slot, seg_page_no, seg_offset,
                                     frame, WAL_PAGE_SIZE) != MYDB_OK)
             return MYDB_ERR;
 

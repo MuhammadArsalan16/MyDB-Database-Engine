@@ -112,7 +112,7 @@ static int open_existing_or_create_slot(WalSegmentPool *pool, uint32_t slot_no)
         close(fd);
         return MYDB_ERR;
     }
-    if (fsync(fd) < 0) {
+    if (fdatasync(fd) < 0) {
         close(fd);
         return MYDB_ERR;
     }
@@ -213,7 +213,8 @@ int wal_segment_pool_claim_next(WalSegmentPool *pool, uint32_t *out_slot_index)
     wal_segment_header_serialize(&slot->header, page_buf);
 
     if (pwrite_all(slot->fd, page_buf, WAL_PAGE_SIZE, 0) != MYDB_OK) return MYDB_ERR;
-    if (fsync(slot->fd) < 0) return MYDB_ERR;
+    /* No fdatasync here — see the header's doc comment for why claim_next
+     * never needs one. */
 
     wal_segment_header_deserialize(page_buf, &slot->header);
 
@@ -222,8 +223,8 @@ int wal_segment_pool_claim_next(WalSegmentPool *pool, uint32_t *out_slot_index)
     return MYDB_OK;
 }
 
-int wal_segment_pool_mark_done(WalSegmentPool *pool, uint32_t slot_index,
-                               uint64_t end_lsn, uint32_t data_pages)
+int wal_segment_pool_mark_done(WalSegmentPool *pool, WalWorker *worker,
+                               uint32_t slot_index, uint64_t end_lsn, uint32_t data_pages)
 {
     if (!pool || slot_index >= WAL_SEGMENT_POOL_SLOTS) return MYDB_ERR;
 
@@ -239,7 +240,11 @@ int wal_segment_pool_mark_done(WalSegmentPool *pool, uint32_t slot_index,
     wal_segment_header_serialize(&slot->header, page_buf);
 
     if (pwrite_all(slot->fd, page_buf, WAL_PAGE_SIZE, 0) != MYDB_OK) return MYDB_ERR;
-    if (fsync(slot->fd) < 0) return MYDB_ERR;
+    if (worker) {
+        if (wal_worker_async_fdatasync(worker, slot->fd) != MYDB_OK) return MYDB_ERR;
+    } else {
+        if (fdatasync(slot->fd) < 0) return MYDB_ERR;
+    }
 
     wal_segment_header_deserialize(page_buf, &slot->header);
     return MYDB_OK;
@@ -288,7 +293,7 @@ int wal_segment_pool_read_segment(WalSegmentPool *pool, uint32_t slot_index,
  * segment: WalPageHeader carries no page_no field at all).
  * ------------------------------------------------------------------ */
 
-int wal_segment_pool_write(WalSegmentPool *pool,
+int wal_segment_pool_write(WalSegmentPool *pool, WalWorker *worker,
                             uint32_t *slot_index, uint32_t *page_no, uint32_t *offset,
                             const uint8_t *buf, size_t buf_len)
 {
@@ -338,7 +343,7 @@ int wal_segment_pool_write(WalSegmentPool *pool,
 
             uint32_t finished_slot       = *slot_index;
             uint32_t finished_data_pages = *page_no;
-            if (wal_segment_pool_mark_done(pool, finished_slot, seg_end_lsn, finished_data_pages) != MYDB_OK)
+            if (wal_segment_pool_mark_done(pool, worker, finished_slot, seg_end_lsn, finished_data_pages) != MYDB_OK)
                 return MYDB_ERR;
             if (wal_segment_pool_claim_next(pool, slot_index) != MYDB_OK)
                 return MYDB_ERR;
@@ -348,15 +353,27 @@ int wal_segment_pool_write(WalSegmentPool *pool,
         }
     }
 
-    /* TEMPORARY: fsync every call, since there's no Flusher/group-commit
-     * yet to batch many writes behind one fsync (design doc §11). fsync()
-     * flushes every dirty page of this fd, not just what this call wrote,
-     * so this is correct even after a mid-call segment rollover (the
-     * finalized old segment was already fsync'd by mark_done() itself;
-     * this covers whatever landed in the current *slot_index since).
-     * Remove this one line once the Flusher lands and does its own
-     * batched fsync at the end of each flush cycle instead. */
-    if (fsync(pool->slots[*slot_index].fd) < 0) return MYDB_ERR;
+    /* TEMPORARY: fdatasync every call, since there's no Flusher/group-commit
+     * yet to batch many writes behind one flush (design doc §11).
+     * fdatasync() flushes every dirty page of this fd, not just what this
+     * call wrote, so this is correct even after a mid-call segment
+     * rollover (the finalized old segment was already fdatasync'd by
+     * mark_done() itself; this covers whatever landed in the current
+     * *slot_index since). Segment files are posix_fallocate'd to their
+     * full fixed size once at creation and never resized again, so
+     * fdatasync (which skips flushing metadata not needed for correct
+     * data retrieval, e.g. timestamps) is strictly cheaper than fsync
+     * here with no durability difference for our data — avoids dragging
+     * the filesystem journal into every WAL flush on filesystems like
+     * ext4. Remove this one line once the Flusher lands and does its own
+     * batched flush at the end of each flush cycle instead. */
+    if (fdatasync(pool->slots[*slot_index].fd) < 0) return MYDB_ERR;
+
+    /* If this call rolled over, mark_done() may have handed its fsync
+     * to worker instead of waiting for it (see mark_done's own doc
+     * comment) — confirm it's actually durable before telling our own
+     * caller this call succeeded. Cheap no-op if it didn't. */
+    if (worker && wal_worker_wait(worker) != MYDB_OK) return MYDB_ERR;
 
     return MYDB_OK;
 }

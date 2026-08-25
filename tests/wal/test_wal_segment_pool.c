@@ -233,13 +233,13 @@ static void test_write_at_explicit_offset(void)
      * this). */
     uint8_t chunk1[100];
     memset(chunk1, 0xAA, sizeof(chunk1));
-    int rc = wal_segment_pool_write(&pool, &slot_index, &page_no, &offset, chunk1, sizeof(chunk1));
+    int rc = wal_segment_pool_write(&pool, NULL, &slot_index, &page_no, &offset, chunk1, sizeof(chunk1));
     CHECK(rc == MYDB_OK, "first raw write succeeds");
     CHECK(page_no == 1 && offset == 100, "cursor advances to offset 100, same page");
 
     uint8_t chunk2[50];
     memset(chunk2, 0xBB, sizeof(chunk2));
-    rc = wal_segment_pool_write(&pool, &slot_index, &page_no, &offset, chunk2, sizeof(chunk2));
+    rc = wal_segment_pool_write(&pool, NULL, &slot_index, &page_no, &offset, chunk2, sizeof(chunk2));
     CHECK(rc == MYDB_OK, "second raw write (at the caller-supplied offset 100) succeeds");
     CHECK(page_no == 1 && offset == 150, "cursor advances to offset 150, still same page");
 
@@ -273,7 +273,7 @@ static void test_write_spans_multiple_pages(void)
     uint8_t *big = malloc(big_len);
     for (size_t i = 0; i < big_len; i++) big[i] = (uint8_t)(i & 0xFF);
 
-    int rc = wal_segment_pool_write(&pool, &slot_index, &page_no, &offset, big, big_len);
+    int rc = wal_segment_pool_write(&pool, NULL, &slot_index, &page_no, &offset, big, big_len);
     CHECK(rc == MYDB_OK, "one big write spanning 3 page-slots succeeds");
     CHECK(page_no == 3 && offset == 500,
           "cursor lands on page 3, offset 500 (pages 1,2 filled exactly, 3 partially)");
@@ -320,7 +320,7 @@ static void test_write_rolls_to_new_segment(void)
         build_page(big + (size_t)i * WAL_PAGE_SIZE, 100 + i, 12345, 0x5A);
     build_page(big + (size_t)last_page_count * WAL_PAGE_SIZE, 200, 999, 0x5B);
 
-    int rc = wal_segment_pool_write(&pool, &slot_index, &page_no, &offset, big, total_len);
+    int rc = wal_segment_pool_write(&pool, NULL, &slot_index, &page_no, &offset, big, total_len);
     CHECK(rc == MYDB_OK, "a write that fills the whole segment and spills one page over succeeds");
     CHECK(slot_index != first_slot, "cursor's slot_index changed — it rolled to a new segment");
     CHECK(page_no == 2 && offset == 0,

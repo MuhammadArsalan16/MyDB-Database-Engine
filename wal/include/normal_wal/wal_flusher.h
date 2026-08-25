@@ -6,6 +6,7 @@
 #include "common.h"
 #include "normal_wal/wal_ring_buffer.h"
 #include "normal_wal/wal_segment_pool.h"
+#include "wal_worker.h"
 
 /*
  * wal_flusher.h — the real Flusher thread (MYDB_WAL_DESIGN.md §7). The
@@ -42,6 +43,7 @@
 typedef struct {
     WalRingBuffer   *rb;
     WalSegmentPool  *pool;
+    WalWorker       *worker;   /* not owned; may be NULL — see wal_flusher_start */
 
     WalCursor  buf_cursor;      /* position in the WAL ring buffer — page_no is
                                     the last-drained ring frame index, lsn is
@@ -76,9 +78,11 @@ typedef struct {
 /* Allocates scratch, seeds seg_cursor/seg_no/seg_slot_index from the
  * already-claimed slot the caller passes (wal_segment_pool_claim_next
  * must have been called first — this function does not claim one
- * itself), starts the thread. */
+ * itself), starts the thread. worker (may be NULL) is stored and
+ * forwarded into every wal_segment_pool_write() call this Flusher makes
+ * — see wal_segment_pool.h's own worker parameter doc comment. */
 int wal_flusher_start(WalFlusher *f, WalRingBuffer *rb, WalSegmentPool *pool,
-                       uint32_t seg_slot_index);
+                       uint32_t seg_slot_index, WalWorker *worker);
 
 /* Sets stop_requested, signals demand_cond so the thread wakes
  * immediately rather than waiting out its timeout, pthread_join's,

@@ -43,7 +43,7 @@ static void *flusher_main(void *arg)
              * pool_write's offset param is uint32_t. Widen in, narrow
              * back — always < WAL_PAGE_SIZE (4096), safe either way. */
             uint32_t offset32 = f->seg_cursor.offset;
-            int rc = wal_segment_pool_write(f->pool, &f->seg_slot_index,
+            int rc = wal_segment_pool_write(f->pool, f->worker, &f->seg_slot_index,
                                              &f->seg_cursor.page_no, &offset32,
                                              frame, WAL_PAGE_SIZE);
             f->seg_cursor.offset = (uint16_t)offset32;
@@ -69,13 +69,14 @@ static void *flusher_main(void *arg)
 }
 
 int wal_flusher_start(WalFlusher *f, WalRingBuffer *rb, WalSegmentPool *pool,
-                       uint32_t seg_slot_index)
+                       uint32_t seg_slot_index, WalWorker *worker)
 {
     if (!f || !rb || !pool || seg_slot_index >= WAL_SEGMENT_POOL_SLOTS) return MYDB_ERR;
 
     memset(f, 0, sizeof(*f));
-    f->rb  = rb;
-    f->pool = pool;
+    f->rb     = rb;
+    f->pool   = pool;
+    f->worker = worker;
 
     f->seg_slot_index    = seg_slot_index;
     f->seg_no            = pool->slots[seg_slot_index].header.segment_no;

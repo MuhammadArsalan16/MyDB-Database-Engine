@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include "common.h"
 #include "normal_wal/wal_segment.h"
+#include "wal_worker.h"
 
 /*
  * wal_segment_pool.h — the pool of WAL_SEGMENT_POOL_SLOTS physical
@@ -83,7 +84,7 @@ typedef struct {
  *
  * wal_segment_pool_init: mkdir(wal_dir) if missing. For each of the 10
  * slots: if wal_<i>.mydb doesn't exist, create + posix_fallocate() to
- * WAL_SEGMENT_FILE_SIZE + write an initial SEG_FREE header + fsync; if it
+ * WAL_SEGMENT_FILE_SIZE + write an initial SEG_FREE header + fdatasync; if it
  * exists, open + validate + load its header. Reseeds next_segment_no
  * from whatever's on disk (see wal_segment_pool.c). Any slot reloaded in
  * SEG_ACTIVE state is tail-scanned automatically (its on-disk data_pages
@@ -93,11 +94,18 @@ int wal_segment_pool_init(WalSegmentPool *pool, const char *wal_dir, uint32_t pa
 int wal_segment_pool_shutdown(WalSegmentPool *pool);
 
 /* SEG_FREE -> SEG_ACTIVE: claims slot (next_segment_no %
- * WAL_SEGMENT_POOL_SLOTS), stamps its segment_no, rewrites + fsyncs the
- * header. *out_slot_index names the claimed slot. Returns MYDB_ERR if
- * that slot isn't currently SEG_FREE (expected once all 10 slots have
- * been claimed once and none has been freed yet — freeing is a later
- * phase's job). */
+ * WAL_SEGMENT_POOL_SLOTS), stamps its segment_no, rewrites the header.
+ * *out_slot_index names the claimed slot. Returns MYDB_ERR if that slot
+ * isn't currently SEG_FREE (expected once all 10 slots have been
+ * claimed once and none has been freed yet — freeing is a later
+ * phase's job).
+ *
+ * Deliberately never fdatasyncs: either write()'s own trailing flush
+ * covers this same fd moments later (the rollover path — the only
+ * caller that matters for latency), or the first real write into this
+ * segment covers it (a standalone claim), or a crash before either
+ * safely reverts this slot to SEG_FREE on reload (nothing was lost,
+ * because nothing was written under this claim yet). */
 int wal_segment_pool_claim_next(WalSegmentPool *pool, uint32_t *out_slot_index);
 
 /* Raw page I/O within an already-claimed slot. page_no is 1-based (0 is
@@ -110,7 +118,13 @@ int wal_segment_pool_write_page(WalSegmentPool *pool, uint32_t slot_index,
 int wal_segment_pool_read_page(WalSegmentPool *pool, uint32_t slot_index,
                                 uint32_t page_no, uint8_t *out_buf);
 
-/* wal_segment_pool_write — the abstraction the Flusher actually calls.
+/* wal_segment_pool_write, worker parameter: forwarded as-is into
+ * mark_done() if this call rolls over (letting the old segment's fsync
+ * overlap with this call's own new-segment writes) — may be NULL, in
+ * which case mark_done() falls back to a synchronous fdatasync exactly
+ * like before this parameter existed.
+ *
+ * wal_segment_pool_write — the abstraction the Flusher actually calls.
  * This function does NOT parse or construct WalPageHeader content — the
  * Flusher's buf is a run of bytes copied straight out of ring-buffer
  * frames, which are already page-shaped (header + data, LSNs already
@@ -144,23 +158,44 @@ int wal_segment_pool_read_page(WalSegmentPool *pool, uint32_t slot_index,
  * interpretation. Returns MYDB_ERR if claim_next fails mid-write (pool
  * exhausted).
  *
- * TEMPORARY: fsyncs before returning on every call (no Flusher/group-
- * commit yet to batch many calls behind one fsync — design doc §11).
- * One line to remove once that lands. */
-int wal_segment_pool_write(WalSegmentPool *pool,
+ * TEMPORARY: fdatasyncs before returning on every call — the Flusher
+ * exists now (wal_flusher.h) but calls this once per drained frame with
+ * no batching of its own yet (design doc §11's group-commit isn't built),
+ * so there's still no batching to fold this flush into. fdatasync, not
+ * fsync: these files are posix_fallocate'd to a fixed size once and
+ * never resized, so there's no essential size metadata for fdatasync to
+ * need to flush beyond the data itself — avoids dragging the filesystem
+ * journal into every flush on filesystems like ext4. This trailing fsync
+ * always stays synchronous regardless of worker — it's the last thing
+ * this call does, nothing left to overlap it with; only mark_done()'s
+ * fsync (a different file) benefits from being offloaded. If worker was
+ * given, waits on it (a cheap no-op if this call never rolled over)
+ * before returning, so a caller with a worker still gets the same
+ * "fully durable by the time this returns" guarantee as the no-worker
+ * path. One line to remove once the Flusher batches multiple frames
+ * behind one flush per cycle. */
+int wal_segment_pool_write(WalSegmentPool *pool, WalWorker *worker,
                             uint32_t *slot_index, uint32_t *page_no, uint32_t *offset,
                             const uint8_t *buf, size_t buf_len);
 
 /* SEG_ACTIVE -> SEG_DONE: stamps the caller-supplied final end_lsn/
  * data_pages (this module has no LSN concept of its own — the Flusher,
  * once it exists, is the one that knows both values from its own
- * bookkeeping), rewrites + fsyncs the header. The Flusher calls this
+ * bookkeeping), rewrites the header. The Flusher calls this
  * when *it* decides a segment is full, right before claim_next() for
  * the replacement — the decision of "is this segment full" is the
  * Flusher's, not this module's; this only performs the transition once
- * told to. Returns MYDB_ERR if the slot isn't currently SEG_ACTIVE. */
-int wal_segment_pool_mark_done(WalSegmentPool *pool, uint32_t slot_index,
-                               uint64_t end_lsn, uint32_t data_pages);
+ * told to. Returns MYDB_ERR if the slot isn't currently SEG_ACTIVE.
+ *
+ * worker == NULL: fdatasyncs synchronously before returning (today's
+ * behavior). worker != NULL: hands the fdatasync to the worker and
+ * returns immediately without waiting — write()'s rollover branch
+ * overlaps this with writing the new segment, waiting on the worker
+ * only once that's also done. Callers that pass a worker must
+ * eventually call wal_worker_wait() before relying on this segment's
+ * DONE state being durable. */
+int wal_segment_pool_mark_done(WalSegmentPool *pool, WalWorker *worker,
+                               uint32_t slot_index, uint64_t end_lsn, uint32_t data_pages);
 
 /* Reads a whole segment file's raw WAL_SEGMENT_FILE_SIZE bytes (header
  * page-slot included) into out_buf in one call — the Normal WAL

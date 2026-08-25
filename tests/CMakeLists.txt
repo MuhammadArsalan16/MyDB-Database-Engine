@@ -59,6 +59,33 @@ add_executable(test_large_wal_buffer wal/test_large_wal_buffer.c)
 target_link_libraries(test_large_wal_buffer PRIVATE wal)
 add_test(NAME test_large_wal_buffer COMMAND test_large_wal_buffer)
 
+# large_wal Phase 5 — large_wal_state.mydb (flush_lsn watermark, §10.9)
+# and the large_wal_writer thread (Appendix A): segment-fit check,
+# header stamping, one byte-for-byte segment write, index insert, and
+# widening the archiver's registry to cover claim_next() onward.
+add_executable(test_large_wal_state wal/test_large_wal_state.c)
+target_link_libraries(test_large_wal_state PRIVATE wal)
+add_test(NAME test_large_wal_state COMMAND test_large_wal_state)
+
+add_executable(test_large_wal_writer wal/test_large_wal_writer.c)
+target_link_libraries(test_large_wal_writer PRIVATE wal)
+add_test(NAME test_large_wal_writer COMMAND test_large_wal_writer)
+
+# (segment_no -> fd) table extracted out of large_wal_archiver once
+# large_wal_writer started registering into it too -- shared
+# infrastructure, not archiver-owned.
+add_executable(test_large_wal_registry wal/test_large_wal_registry.c)
+target_link_libraries(test_large_wal_registry PRIVATE wal)
+add_test(NAME test_large_wal_registry COMMAND test_large_wal_registry)
+
+# large_wal_manager (lifecycle/ownership, mirrors PartitionCtx) +
+# large_wal_api (external contract + large_wal_get's real logic, mirrors
+# pm_api.h) -- exercised together since large_wal_get/write only make
+# sense against a fully brought-up LargeWalManager.
+add_executable(test_large_wal_manager wal/test_large_wal_manager.c)
+target_link_libraries(test_large_wal_manager PRIVATE wal)
+add_test(NAME test_large_wal_manager COMMAND test_large_wal_manager)
+
 # WAL Phase 2 — the pool of 10 physical wal_<N>.mydb segment files:
 # pre-allocation, round-robin claiming, raw page I/O, crash-reload
 # tail-scan (MYDB_WAL_IMPLEMENTATION.md §8.4). Real file I/O under /tmp.
@@ -77,6 +104,28 @@ add_test(NAME test_wal_ring_buffer COMMAND test_wal_ring_buffer)
 add_executable(test_wal_flusher wal/test_wal_flusher.c)
 target_link_libraries(test_wal_flusher PRIVATE wal)
 add_test(NAME test_wal_flusher COMMAND test_wal_flusher)
+
+# wal_worker — the shared persistent background thread that overlaps a
+# segment rollover's two distinct-file fsyncs (old segment's mark_done,
+# new segment's trailing write) instead of paying for them sequentially.
+add_executable(test_wal_worker wal/test_wal_worker.c)
+target_link_libraries(test_wal_worker PRIVATE wal)
+add_test(NAME test_wal_worker COMMAND test_wal_worker)
+
+# normal_wal_manager (lifecycle/ownership, mirrors LargeWalManager): owns
+# WalRingBuffer + WalSegmentPool + WalFlusher, one init() call brings all
+# three up together.
+add_executable(test_normal_wal_manager wal/test_normal_wal_manager.c)
+target_link_libraries(test_normal_wal_manager PRIVATE wal)
+add_test(NAME test_normal_wal_manager COMMAND test_normal_wal_manager)
+
+# wal_manager — top-level, sibling to normal_wal/ and large_wal/: owns
+# the one shared WalWorker + both subsystems' own managers. NOT the
+# TxnManager->wal_manager routing/dispatch layer (still deferred) —
+# purely "owns the shared worker + both sub-managers."
+add_executable(test_wal_manager wal/test_wal_manager.c)
+target_link_libraries(test_wal_manager PRIVATE wal)
+add_test(NAME test_wal_manager COMMAND test_wal_manager)
 
 # Session-state modules that moved to partition_manager in v3.
 # Their test files still live under tests/storage_engine/ (moved with git mv

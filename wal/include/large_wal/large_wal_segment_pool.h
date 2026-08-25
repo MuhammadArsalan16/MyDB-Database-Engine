@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include "common.h"
 #include "large_wal/large_wal_segment.h"
+#include "wal_worker.h"
 
 /*
  * large_wal_segment_pool.h — the rotation pool of
@@ -25,19 +26,13 @@
  * wal_segment.h and wal_segment_pool.h.
  *
  * Files live in the SAME wal/ directory normal_wal's own pool already
- * uses, named large_wal_<slot_index>.mydb — not a separate top-level
- * folder (MYDB_WAL_DESIGN.md §6's original layout; an intermediate
- * implementation-doc revision had moved this to a dedicated large_wal/
- * folder with abbreviated lw_ filenames and was itself reverted).
+ * uses, named large_wal_<slot_index>.mydb
  *
  * Interface discipline: same as WalSegmentPool — transparent struct, but
- * external callers (the LARGE_WAL Writer thread, a later phase; the
- * LARGE_WAL Archiver, the "archive section" phase) go through the
+ * external callers, LARGE_WAL Writer thread and the
+ * LARGE_WAL Archiver, go through the
  * large_wal_segment_pool_*() functions below only.
  *
- * Still no ring buffer, no LSN-assignment concept of its own, no
- * TxnManager/PartitionCtx wiring — this pool takes an explicit wal_dir
- * path from its caller, staying fully standalone, same as normal_wal.
  */
 
 #define LARGE_WAL_SEGMENT_POOL_SLOTS      4
@@ -80,7 +75,7 @@ typedef struct {
  * large_wal_segment_pool_init: mkdir(wal_dir) if missing. For each of
  * the 4 slots: if large_wal_<i>.mydb doesn't exist, create +
  * posix_fallocate() to LARGE_WAL_SEGMENT_FILE_SIZE + write an initial
- * LSEG_FREE header + fsync; if it exists, open + validate + load its
+ * LSEG_FREE header + fdatasync; if it exists, open + validate + load its
  * header. Reseeds next_segment_no from whatever's on disk. Any slot
  * reloaded in LSEG_ACTIVE state is tail-scanned automatically (its
  * on-disk data_pages is stale by definition while active).
@@ -89,36 +84,52 @@ int large_wal_segment_pool_init(LargeWalSegmentPool *pool, const char *wal_dir, 
 int large_wal_segment_pool_shutdown(LargeWalSegmentPool *pool);
 
 /* LSEG_FREE -> LSEG_ACTIVE: claims slot (next_segment_no %
- * LARGE_WAL_SEGMENT_POOL_SLOTS), stamps its segment_no, rewrites +
- * fsyncs the header. *out_slot_index names the claimed slot. Returns
- * MYDB_ERR if that slot isn't currently LSEG_FREE (expected once all 4
- * slots have been claimed once and none has been freed yet — freeing is
- * the archive-section phase's job). */
+ * LARGE_WAL_SEGMENT_POOL_SLOTS), stamps its segment_no, rewrites the
+ * header. *out_slot_index names the claimed slot. Returns MYDB_ERR if
+ * that slot isn't currently LSEG_FREE (expected once all 4 slots have
+ * been claimed once and none has been freed yet — freeing is the
+ * archive-section phase's job).
+ *
+ * Deliberately never fdatasyncs: either write()'s own trailing flush
+ * covers this same fd moments later (the rollover path — the only
+ * caller that matters for latency), or the first real write into this
+ * segment covers it (a standalone claim), or a crash before either
+ * safely reverts this slot to LSEG_FREE on reload (nothing was lost,
+ * because nothing was written under this claim yet). */
 int large_wal_segment_pool_claim_next(LargeWalSegmentPool *pool, uint32_t *out_slot_index);
 
 /* Raw page I/O within an already-claimed slot. page_no is 1-based (0 is
  * the header's own page-slot) and must be < LARGE_WAL_SEGMENT_PAGES_PER_FILE.
  * No fsync here — infrastructure, not the durable path (that's the
- * writer-thread phase's concern, once it exists). */
+ * writer-thread's concern). */
 int large_wal_segment_pool_write_page(LargeWalSegmentPool *pool, uint32_t slot_index,
                                        uint32_t page_no, const uint8_t *buf);
 int large_wal_segment_pool_read_page(LargeWalSegmentPool *pool, uint32_t slot_index,
                                       uint32_t page_no, uint8_t *out_buf);
 
 /* LSEG_ACTIVE -> LSEG_DONE: stamps the caller-supplied final end_lsn/
- * data_pages, rewrites + fsyncs the header. Does NOT free the slot back
- * to LSEG_FREE or copy anything anywhere — that's the archive-section
+ * data_pages, rewrites the header. Does NOT free the slot back to
+ * LSEG_FREE or copy anything anywhere — that's the archive-section
  * phase's job (impl doc §10.1's copy-out step). A LSEG_DONE slot just
  * sits there, unusable for a new claim, until that phase exists.
- * Returns MYDB_ERR if the slot isn't currently LSEG_ACTIVE. */
-int large_wal_segment_pool_mark_done(LargeWalSegmentPool *pool, uint32_t slot_index,
-                                     uint64_t end_lsn, uint32_t data_pages);
+ * Returns MYDB_ERR if the slot isn't currently LSEG_ACTIVE.
+ *
+ * worker == NULL: fdatasyncs synchronously before returning (today's
+ * behavior). worker != NULL: hands the fdatasync to the worker and
+ * returns immediately without waiting — this is the durability of a
+ * segment that's about to be rolled away from, which write()'s
+ * rollover branch can safely overlap with writing the new segment,
+ * waiting on the worker only once that's also done. Callers that pass
+ * a worker must eventually call wal_worker_wait() before relying on
+ * this segment's DONE state being durable. */
+int large_wal_segment_pool_mark_done(LargeWalSegmentPool *pool, WalWorker *worker,
+                                     uint32_t slot_index, uint64_t end_lsn, uint32_t data_pages);
 
 /* LSEG_DONE -> LSEG_FREE: called by the archiver only after the
  * holding-area copy's fsync has confirmed (impl doc §10.1's ordering
  * rule — a slot must never be marked FREE/reusable before that, or a
  * segment_no could transiently exist validly in two places). Zeroes
- * segment_no/start_lsn/end_lsn/data_pages, rewrites + fsyncs the
+ * segment_no/start_lsn/end_lsn/data_pages, rewrites + fdatasyncs the
  * header. Returns MYDB_ERR if the slot isn't currently LSEG_DONE. */
 int large_wal_segment_pool_free_slot(LargeWalSegmentPool *pool, uint32_t slot_index);
 
@@ -168,12 +179,28 @@ int large_wal_segment_pool_read_segment(LargeWalSegmentPool *pool, uint32_t slot
  * the value. A field copy, not content interpretation. Returns
  * MYDB_ERR if claim_next fails mid-write (pool exhausted).
  *
- * TEMPORARY: fsyncs before returning on every call — same reasoning and
- * removal condition as wal_segment_pool_write's own temporary fsync
- * (design doc §11: no LARGE_WAL Writer thread / group-commit yet to
- * batch many calls behind one fsync). One line to remove once that
- * thread lands. */
-int large_wal_segment_pool_write(LargeWalSegmentPool *pool,
+ * worker: forwarded as-is into mark_done() if this call rolls over
+ * (letting the old segment's fsync overlap with this call's own new-
+ * segment writes) — may be NULL, in which case mark_done() falls back
+ * to a synchronous fdatasync exactly like before this parameter existed.
+ *
+ * TEMPORARY: fdatasyncs before returning on every call — same reasoning
+ * and removal condition as wal_segment_pool_write's own temporary
+ * fdatasync (design doc §11: large_wal_writer exists now, but each
+ * submit() is still a fully synchronous, single-record handoff — no
+ * group-commit batching yet to fold this flush into). fdatasync, not
+ * fsync: these files are posix_fallocate'd to a fixed size once and
+ * never resized, so there's no essential size metadata for fdatasync to
+ * need to flush beyond the data itself. This trailing fsync always
+ * stays synchronous on the calling thread regardless of worker — it's
+ * the last thing this call does, so there's nothing left to overlap it
+ * with; only mark_done()'s fsync (a different file) benefits from being
+ * offloaded. If worker was given, waits on it (wal_worker_wait — a
+ * cheap no-op if this call never rolled over) before returning, so a
+ * caller with a worker still gets the same "fully durable by the time
+ * this returns" guarantee as the no-worker path. One line to remove
+ * once submit() batches multiple pending records behind one flush. */
+int large_wal_segment_pool_write(LargeWalSegmentPool *pool, WalWorker *worker,
                                   uint32_t *slot_index, uint32_t *page_no, uint32_t *offset,
                                   const uint8_t *buf, size_t buf_len);
 
