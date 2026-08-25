@@ -14,7 +14,7 @@
  * one holding-area-only state, §10.1: "This is why rotation slots have
  * no ARCHIVING state at all").
  *
- * Page-level format (LargeWalPageHeader) lives in large_wal_page.h, not
+ * Page-level format (the shared WalPageHeader) lives in large_wal_page.h, not
  * here; the pool of rotation slots + holding area (fallocate, copy-out,
  * the in-memory (segment_no -> fd) table) live in a later
  * large_wal_segment_pool.h — each file owns only its own concern, same

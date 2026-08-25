@@ -17,9 +17,8 @@ uint32_t fnv1a(const void *data, size_t len)
  * simple and has no shared state to worry about once WAL's writer
  * threads call it concurrently later; buffers here are at most tens of
  * KB, so the per-bit cost is negligible. */
-uint32_t crc32(const void *data, size_t len)
+uint32_t crc32_update(uint32_t crc, const void *data, size_t len)
 {
-    uint32_t crc = 0xFFFFFFFFu;
     const uint8_t *p = data;
     for (size_t i = 0; i < len; i++) {
         crc ^= p[i];
@@ -28,5 +27,10 @@ uint32_t crc32(const void *data, size_t len)
             crc = (crc >> 1) ^ (0xEDB88320u & mask);
         }
     }
-    return ~crc;
+    return crc;
+}
+
+uint32_t crc32(const void *data, size_t len)
+{
+    return crc32_final(crc32_update(CRC32_INIT, data, len));
 }

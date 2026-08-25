@@ -5,6 +5,7 @@
 #include <stdint.h>
 #include "common.h"
 #include "large_wal/large_wal_segment.h"
+#include "large_wal/large_wal_registry.h"
 #include "wal_worker.h"
 
 /*
@@ -67,6 +68,12 @@ typedef struct {
     uint32_t  partition_id;
     uint64_t  next_segment_no;
     LargeWalSlot slots[LARGE_WAL_SEGMENT_POOL_SLOTS];
+
+    /* Not owned; may be NULL (a pool driven directly, e.g. by
+     * test_large_wal_segment_pool, needs no registry). When set,
+     * claim_next registers every segment_no it mints — see its own doc
+     * comment for why that belongs there and not in the caller. */
+    LargeWalRegistry *registry;
 } LargeWalSegmentPool;
 
 /* ------------------------------------------------------------------
@@ -80,7 +87,8 @@ typedef struct {
  * reloaded in LSEG_ACTIVE state is tail-scanned automatically (its
  * on-disk data_pages is stale by definition while active).
  * ------------------------------------------------------------------ */
-int large_wal_segment_pool_init(LargeWalSegmentPool *pool, const char *wal_dir, uint32_t partition_id);
+int large_wal_segment_pool_init(LargeWalSegmentPool *pool, const char *wal_dir,
+                                 uint32_t partition_id, LargeWalRegistry *registry);
 int large_wal_segment_pool_shutdown(LargeWalSegmentPool *pool);
 
 /* LSEG_FREE -> LSEG_ACTIVE: claims slot (next_segment_no %
@@ -95,7 +103,17 @@ int large_wal_segment_pool_shutdown(LargeWalSegmentPool *pool);
  * caller that matters for latency), or the first real write into this
  * segment covers it (a standalone claim), or a crash before either
  * safely reverts this slot to LSEG_FREE on reload (nothing was lost,
- * because nothing was written under this claim yet). */
+ * because nothing was written under this claim yet).
+ *
+ * Registers the new segment_no -> fd mapping in pool->registry (when
+ * one is set). This belongs here rather than in callers because
+ * claiming is exactly the moment a segment_no comes into existence, and
+ * because write() calls claim_next itself during its own rollover — a
+ * caller registering afterwards could only see the LAST segment a
+ * multi-boundary write passed through, silently leaving the ones in
+ * between unresolvable. The fd doesn't change (the 4 slot files are
+ * opened once at init and held for the process's life); it's the *key*
+ * that changes, since this slot now holds a different segment_no. */
 int large_wal_segment_pool_claim_next(LargeWalSegmentPool *pool, uint32_t *out_slot_index);
 
 /* Raw page I/O within an already-claimed slot. page_no is 1-based (0 is
@@ -152,11 +170,11 @@ int large_wal_segment_pool_read_segment(LargeWalSegmentPool *pool, uint32_t slot
                                          uint8_t *out_buf);
 
 /* large_wal_segment_pool_write — mirrors wal_segment_pool_write exactly:
- * a blind byte mover, never parses or constructs LargeWalPageHeader
- * content — the caller's buf already carries whatever headers/LSNs it
- * needs (the eventual LARGE_WAL Writer thread builds these, the same
- * way the Flusher builds ring-buffer frames). Only knows page/segment
- * *geometry* (PAGE_SIZE, LARGE_WAL_SEGMENT_PAGES_PER_FILE).
+ * a blind byte mover, never parses or constructs page-header content —
+ * the caller's buf already carries whatever headers/LSNs it needs (the
+ * LARGE_WAL Writer thread builds these, the same way the Flusher builds
+ * ring-buffer frames). Only knows page/segment *geometry* (PAGE_SIZE,
+ * LARGE_WAL_SEGMENT_PAGES_PER_FILE).
  *
  * slot_index/page_no/offset are the caller's own cursor position,
  * purely positional — never derived from anything inside buf — passed
@@ -169,15 +187,15 @@ int large_wal_segment_pool_read_segment(LargeWalSegmentPool *pool, uint32_t slot
  * page_no, or — if that was the segment's last page-slot —
  * auto-finalizes the segment and claims the next one. The one
  * exception to "never reads header content": right before finalizing,
- * reads the just-filled last page back and copies its own content_lsn
- * field into mark_done()'s end_lsn argument. Unlike normal WAL's
- * page_lsn/end_lsn split (needed because a normal WAL page packs
- * *multiple* small records, so "first" and "last" record LSN can
- * differ), a LargeWalPageHeader carries exactly one LSN per page —
- * content_lsn, the single large record this page is a slice of — so
- * there's no first-vs-last ambiguity to resolve here: content_lsn IS
- * the value. A field copy, not content interpretation. Returns
- * MYDB_ERR if claim_next fails mid-write (pool exhausted).
+ * reads the just-filled last page back and copies its own end_lsn field
+ * into mark_done()'s end_lsn argument — the only reliable source for a
+ * segment's true highest LSN, since a page's start_lsn names only the
+ * first record on it, not the last. Identical to normal_wal's own
+ * rollover path, now that both subsystems share WalPageHeader (which is
+ * exactly why that struct carries the start_lsn/end_lsn pair rather
+ * than a single per-page LSN). A field copy, not content
+ * interpretation. Returns MYDB_ERR if claim_next fails mid-write (pool
+ * exhausted).
  *
  * worker: forwarded as-is into mark_done() if this call rolls over
  * (letting the old segment's fsync overlap with this call's own new-

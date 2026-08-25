@@ -11,7 +11,7 @@
  * copies a large record's raw bytes in here before writing it out to
  * the current rotation-pool segment.
  *
- * Deliberately bare: no LargeWalPageHeader framing happens here. Only
+ * Deliberately bare: no page-header framing happens here. Only
  * the writer thread — the entity that actually tracks the live segment
  * cursor (current page_no/offset) — can correctly decide when a fresh
  * page boundary starts (stamp a new header) versus mid-page
@@ -43,8 +43,9 @@ typedef struct {
 
 /* Computes page_count = ceil(total_size / LARGE_WAL_PAGE_USABLE).
  * Rejects total_size == 0 (nothing to redirect) and page_count > 255
- * (LargeWalPageHeader.page_index and LargeWalIndexEntry.page_count are
- * both uint8_t — a real format ceiling, not arbitrary). Points buf at
+ * (LargeWalIndexEntry.page_count is uint8_t — a real format ceiling,
+ * not arbitrary; the page header's own page_index field used to be the
+ * other half of this justification, but that field is gone). Points buf at
  * static_buf when page_count <= LARGE_WAL_STATIC_PAGES, else mallocs
  * page_count * PAGE_SIZE. The caller copies the record's raw bytes into
  * buf itself — no packing happens here. */

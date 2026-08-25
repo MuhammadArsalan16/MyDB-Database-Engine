@@ -96,7 +96,7 @@ int wal_ring_buffer_append(WalRingBuffer *rb, WalRecordHeader *hdr,
     wal_record_header_serialize(hdr, body, body_len, dest);
 
     if (rb->write_frame_used == 0)
-        rb->write_frame_hdr.page_lsn = lsn;   /* first record in this frame */
+        rb->write_frame_hdr.start_lsn = lsn;   /* first record in this frame */
     rb->write_frame_hdr.end_lsn = lsn;         /* latest record in this frame */
     rb->write_frame_used += total_len;
 

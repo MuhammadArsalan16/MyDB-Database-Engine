@@ -47,12 +47,16 @@ static void cleanup(void)
  * same helper test_large_wal_segment_pool.c uses. */
 static void build_page(uint8_t *out, uint64_t content_lsn, uint8_t page_index, uint8_t fill, uint16_t data_len)
 {
-    LargeWalPageHeader hdr;
+    WalPageHeader hdr;
     memset(&hdr, 0, sizeof(hdr));
     hdr.id.file_type = FILETYPE_LARGE_WAL_PAGE;
-    hdr.content_lsn  = content_lsn;
-    hdr.page_index   = page_index;
+    hdr.start_lsn    = content_lsn;
+    hdr.end_lsn      = content_lsn;
     hdr.data_len     = data_len;
+    /* page_index is gone from the shared WalPageHeader; a non-zero one
+     * meant "this page continues a record started earlier", which is now
+     * exactly what the INCOMING_CONTINUATION flag says. */
+    hdr.flags        = page_index > 0 ? WAL_PAGE_FLAG_INCOMING_CONTINUATION : 0;
     memset(out, 0, PAGE_SIZE);
     memset(out + LARGE_WAL_PAGE_HEADER_ON_DISK_SIZE, fill, data_len);
     large_wal_page_header_serialize(&hdr, out);
@@ -77,7 +81,7 @@ static int verify_content(LargeWalRegistry *reg, uint64_t segment_no,
         uint8_t  page_buf[PAGE_SIZE];
         if (pread(fd, page_buf, PAGE_SIZE, (off_t)page_no * PAGE_SIZE) != PAGE_SIZE) return MYDB_ERR;
 
-        LargeWalPageHeader hdr;
+        WalPageHeader hdr;
         if (large_wal_page_header_deserialize(page_buf, &hdr) != MYDB_OK) return MYDB_ERR;
 
         memcpy(out_buf + written, page_buf + LARGE_WAL_PAGE_HEADER_ON_DISK_SIZE, hdr.data_len);
@@ -130,8 +134,8 @@ static void test_copy_out_frees_slot_and_content_readable(void)
     LargeWalSegmentPool pool;
     LargeWalRegistry      reg;
     LargeWalArchiver        arc;
-    CHECK(large_wal_segment_pool_init(&pool, TEST_WAL_DIR, 1) == MYDB_OK, "pool init succeeds");
     CHECK(large_wal_registry_init(&reg) == MYDB_OK, "registry init succeeds");
+    CHECK(large_wal_segment_pool_init(&pool, TEST_WAL_DIR, 1, &reg) == MYDB_OK, "pool init succeeds");
     CHECK(large_wal_archiver_init(&arc, TEST_WAL_DIR) == MYDB_OK, "archiver init succeeds");
 
     uint32_t slot_index; uint64_t segment_no, end_lsn; uint16_t len_a, len_b;
@@ -173,8 +177,8 @@ static void test_try_free_gated_on_both_conditions(void)
     LargeWalRegistry      reg;
     LargeWalArchiver        arc;
     LargeWalIndex             idx;
-    large_wal_segment_pool_init(&pool, TEST_WAL_DIR, 1);
     large_wal_registry_init(&reg);
+    large_wal_segment_pool_init(&pool, TEST_WAL_DIR, 1, &reg);
     large_wal_archiver_init(&arc, TEST_WAL_DIR);
     large_wal_index_open(&idx, TEST_WAL_DIR);
 

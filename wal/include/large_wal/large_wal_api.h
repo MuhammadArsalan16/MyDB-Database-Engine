@@ -34,7 +34,12 @@
 int large_wal_get(LargeWalManager *mgr, uint64_t content_lsn,
                    uint8_t *out_buf, uint32_t *out_len);
 
+/* content is a blob of one or more back-to-back serialized records;
+ * boundaries, LSNs and types are read from the records themselves. One
+ * index entry per record lands in out_entries (capacity out_cap), and
+ * *out_count reports how many were written — meaningful on failure too.
+ * See large_wal_writer.h's submit() for the full contract. */
 int large_wal_write(LargeWalManager *mgr, const uint8_t *content, uint32_t total_size,
-                     uint64_t content_lsn, uint8_t rec_type, LargeWalIndexEntry *out_entry);
+                     LargeWalIndexEntry *out_entries, uint32_t out_cap, uint32_t *out_count);
 
 #endif /* LARGE_WAL_API_H */

@@ -152,7 +152,7 @@ int wal_segment_pool_read_page(WalSegmentPool *pool, uint32_t slot_index,
  * before finalizing, reads the just-filled last page back
  * (wal_segment_pool_read_page + wal_page_header_deserialize) purely to
  * copy its end_lsn field into mark_done()'s end_lsn argument — the only
- * reliable source for a segment's true highest LSN, since page_lsn alone
+ * reliable source for a segment's true highest LSN, since start_lsn alone
  * is only the *first* record's LSN, not the last (see wal_page.h's
  * end_lsn field comment). This is a field copy, not content
  * interpretation. Returns MYDB_ERR if claim_next fails mid-write (pool

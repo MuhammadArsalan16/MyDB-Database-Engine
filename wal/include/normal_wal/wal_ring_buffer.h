@@ -6,7 +6,7 @@
 #include <stdint.h>
 #include "common.h"
 #include "normal_wal/wal_types.h"
-#include "normal_wal/wal_page.h"
+#include "wal_page.h"
 #include "normal_wal/wal_segment_pool.h"
 
 /*
@@ -94,7 +94,7 @@ void wal_ring_buffer_shutdown(WalRingBuffer *rb);
  * WAL_PAGE_USABLE); otherwise closes that frame (finalizes its
  * WalPageHeader into buf: data_len, checksum) and starts a fresh one,
  * same no-spanning rule as segment pages. Updates write_frame_hdr's
- * page_lsn (first record's lsn in this frame, set once) and end_lsn
+ * start_lsn (first record's lsn in this frame, set once) and end_lsn
  * (this record's lsn, updated every append into this frame). The whole
  * body runs under rb->lock.
  *

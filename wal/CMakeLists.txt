@@ -1,8 +1,8 @@
 add_library(wal STATIC
     src/wal_worker.c
     src/wal_manager.c
+    src/wal_page.c
     src/normal_wal/wal_types.c
-    src/normal_wal/wal_page.c
     src/normal_wal/wal_segment.c
     src/normal_wal/wal_segment_pool.c
     src/normal_wal/wal_ring_buffer.c

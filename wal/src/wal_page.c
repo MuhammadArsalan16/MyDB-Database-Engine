@@ -1,4 +1,4 @@
-#include "normal_wal/wal_page.h"
+#include "wal_page.h"
 #include "checksum.h"
 
 #include <string.h>
@@ -15,19 +15,19 @@
  * contract every other on-disk struct in this codebase follows.
  */
 
-/* WalPageHeader — 36 bytes. Checksum covers the 32 bytes preceding it
- * (id[8] + page_lsn[8] + data_len[2] + flags[2] + end_lsn[8] +
- * reserved[4]). */
-#define WAL_PAGE_HEADER_CHECKSUM_OFFSET 32
+/* WalPageHeader — 32 bytes. Checksum covers the 28 bytes preceding it
+ * (id[8] + start_lsn[8] + end_lsn[8] + data_len[2] + flags[1] +
+ * reserved[1]). */
+#define WAL_PAGE_HEADER_CHECKSUM_OFFSET 28
 
 void wal_page_header_serialize(const WalPageHeader *hdr, uint8_t *buf)
 {
     file_header_write_id(buf, hdr->id.file_type);
-    memcpy(buf + 8,  &hdr->page_lsn, 8);
-    memcpy(buf + 16, &hdr->data_len, 2);
-    memcpy(buf + 18, &hdr->flags,    2);
-    memcpy(buf + 20, &hdr->end_lsn,  8);
-    memcpy(buf + 28, hdr->reserved,  4);
+    memcpy(buf + 8,  &hdr->start_lsn, 8);
+    memcpy(buf + 16, &hdr->end_lsn,   8);
+    memcpy(buf + 24, &hdr->data_len,  2);
+    buf[26] = hdr->flags;
+    buf[27] = hdr->reserved;
 
     uint32_t cs = crc32(buf, WAL_PAGE_HEADER_CHECKSUM_OFFSET);
     memcpy(buf + WAL_PAGE_HEADER_CHECKSUM_OFFSET, &cs, 4);
@@ -44,11 +44,11 @@ int wal_page_header_deserialize(const uint8_t *buf, WalPageHeader *out)
         return MYDB_ERR_BAD_CHECKSUM;
 
     file_header_read_id(buf, &out->id);
-    memcpy(&out->page_lsn, buf + 8,  8);
-    memcpy(&out->data_len, buf + 16, 2);
-    memcpy(&out->flags,    buf + 18, 2);
-    memcpy(&out->end_lsn,  buf + 20, 8);
-    memcpy(out->reserved,  buf + 28, 4);
+    memcpy(&out->start_lsn, buf + 8,  8);
+    memcpy(&out->end_lsn,   buf + 16, 8);
+    memcpy(&out->data_len,  buf + 24, 2);
+    out->flags    = buf[26];
+    out->reserved = buf[27];
     out->checksum = stored;
     return MYDB_OK;
 }

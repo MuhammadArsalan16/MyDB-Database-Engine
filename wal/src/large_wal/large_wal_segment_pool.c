@@ -124,7 +124,8 @@ static int open_existing_or_create_slot(LargeWalSegmentPool *pool, uint32_t slot
  * Lifecycle
  * ------------------------------------------------------------------ */
 
-int large_wal_segment_pool_init(LargeWalSegmentPool *pool, const char *wal_dir, uint32_t partition_id)
+int large_wal_segment_pool_init(LargeWalSegmentPool *pool, const char *wal_dir,
+                                 uint32_t partition_id, LargeWalRegistry *registry)
 {
     if (!pool || !wal_dir) return MYDB_ERR;
     if (ensure_dir(wal_dir) != 0) return MYDB_ERR;
@@ -132,6 +133,7 @@ int large_wal_segment_pool_init(LargeWalSegmentPool *pool, const char *wal_dir, 
     memset(pool, 0, sizeof(*pool));
     snprintf(pool->wal_dir, sizeof(pool->wal_dir), "%s", wal_dir);
     pool->partition_id = partition_id;
+    pool->registry     = registry;
 
     for (uint32_t i = 0; i < LARGE_WAL_SEGMENT_POOL_SLOTS; i++) {
         int rc = open_existing_or_create_slot(pool, i);
@@ -196,22 +198,38 @@ int large_wal_segment_pool_claim_next(LargeWalSegmentPool *pool, uint32_t *out_s
 
     if (slot->header.state != LSEG_FREE) return MYDB_ERR;
 
-    slot->header.segment_no   = pool->next_segment_no;
-    slot->header.start_lsn    = 0;
-    slot->header.end_lsn      = 0;
-    slot->header.data_pages   = 0;
-    slot->header.state        = LSEG_ACTIVE;
-    slot->header.partition_id = pool->partition_id;
+    /* Mutate a local copy, not slot->header: if the write below fails we
+     * must leave the in-memory header exactly as it was, or memory and
+     * disk disagree about this slot's state and every later decision
+     * trusts the wrong one. slot->header is only committed once the
+     * write has actually succeeded. */
+    LargeWalSegmentHeader next = slot->header;
+    next.segment_no   = pool->next_segment_no;
+    next.start_lsn    = 0;
+    next.end_lsn      = 0;
+    next.data_pages   = 0;
+    next.state        = LSEG_ACTIVE;
+    next.partition_id = pool->partition_id;
 
     uint8_t page_buf[PAGE_SIZE];
     memset(page_buf, 0, PAGE_SIZE);
-    large_wal_segment_header_serialize(&slot->header, page_buf);
+    large_wal_segment_header_serialize(&next, page_buf);
 
     if (pwrite_all(slot->fd, page_buf, PAGE_SIZE, 0) != MYDB_OK) return MYDB_ERR;
     /* No fdatasync here — see the header's doc comment for why claim_next
      * never needs one. */
 
     large_wal_segment_header_deserialize(page_buf, &slot->header);
+
+    /* The segment_no now exists, so make it resolvable immediately —
+     * see the header's doc comment for why this lives here rather than
+     * in whoever called claim_next. owns_fd = 0: this fd belongs to the
+     * pool's own slot and is closed by pool shutdown, never by the
+     * registry. */
+    if (pool->registry &&
+        large_wal_registry_register(pool->registry, slot->header.segment_no,
+                                     slot->fd, /*owns_fd=*/0) != MYDB_OK)
+        return MYDB_ERR;
 
     pool->next_segment_no++;
     *out_slot_index = target;
@@ -226,13 +244,18 @@ int large_wal_segment_pool_mark_done(LargeWalSegmentPool *pool, WalWorker *worke
     LargeWalSlot *slot = &pool->slots[slot_index];
     if (slot->header.state != LSEG_ACTIVE) return MYDB_ERR;
 
-    slot->header.end_lsn    = end_lsn;
-    slot->header.data_pages = data_pages;
-    slot->header.state      = LSEG_DONE;
+    /* Local copy, committed to slot->header only after the write and
+     * sync both succeed — see claim_next's own note on why mutating
+     * slot->header up front would leave memory and disk disagreeing on
+     * any failure path. */
+    LargeWalSegmentHeader next = slot->header;
+    next.end_lsn    = end_lsn;
+    next.data_pages = data_pages;
+    next.state      = LSEG_DONE;
 
     uint8_t page_buf[PAGE_SIZE];
     memset(page_buf, 0, PAGE_SIZE);
-    large_wal_segment_header_serialize(&slot->header, page_buf);
+    large_wal_segment_header_serialize(&next, page_buf);
 
     if (pwrite_all(slot->fd, page_buf, PAGE_SIZE, 0) != MYDB_OK) return MYDB_ERR;
     if (worker) {
@@ -252,15 +275,17 @@ int large_wal_segment_pool_free_slot(LargeWalSegmentPool *pool, uint32_t slot_in
     LargeWalSlot *slot = &pool->slots[slot_index];
     if (slot->header.state != LSEG_DONE) return MYDB_ERR;
 
-    slot->header.segment_no = 0;
-    slot->header.start_lsn  = 0;
-    slot->header.end_lsn    = 0;
-    slot->header.data_pages = 0;
-    slot->header.state      = LSEG_FREE;
+    /* Local copy, committed only on success — see claim_next's note. */
+    LargeWalSegmentHeader next = slot->header;
+    next.segment_no = 0;
+    next.start_lsn  = 0;
+    next.end_lsn    = 0;
+    next.data_pages = 0;
+    next.state      = LSEG_FREE;
 
     uint8_t page_buf[PAGE_SIZE];
     memset(page_buf, 0, PAGE_SIZE);
-    large_wal_segment_header_serialize(&slot->header, page_buf);
+    large_wal_segment_header_serialize(&next, page_buf);
 
     if (pwrite_all(slot->fd, page_buf, PAGE_SIZE, 0) != MYDB_OK) return MYDB_ERR;
     if (fdatasync(slot->fd) < 0) return MYDB_ERR;
@@ -302,7 +327,7 @@ int large_wal_segment_pool_read_segment(LargeWalSegmentPool *pool, uint32_t slot
 
 /* ------------------------------------------------------------------
  * large_wal_segment_pool_write — the Writer-thread-facing abstraction.
- * A blind byte mover: never parses or constructs LargeWalPageHeader
+ * A blind byte mover: never parses or constructs page-header
  * content (the caller's buf already carries whatever headers/LSNs it
  * needs). Only knows page/segment geometry. slot_index/page_no/offset
  * are the caller's own cursor, purely positional — never derived from
@@ -318,6 +343,14 @@ int large_wal_segment_pool_write(LargeWalSegmentPool *pool, WalWorker *worker,
     if (!page_no_valid(*page_no)) return MYDB_ERR;
     if (*offset >= PAGE_SIZE) return MYDB_ERR;
 
+    /* Single exit through `out:` from here on. Once mark_done() below has
+     * handed a flush to worker, EVERY return path has to drain it:
+     * wal_worker_wait() is the only thing that clears the mailbox's done
+     * flag, so returning early without it wedges the next
+     * wal_worker_async_fdatasync() forever — for the whole partition,
+     * not just this call. */
+    int rc = MYDB_OK;
+
     size_t written = 0;
     while (written < buf_len) {
         uint32_t room_left = PAGE_SIZE - *offset;
@@ -325,8 +358,10 @@ int large_wal_segment_pool_write(LargeWalSegmentPool *pool, WalWorker *worker,
         uint32_t chunk = (remaining < (size_t)room_left) ? (uint32_t)remaining : room_left;
 
         off_t abs_offset = (off_t)(*page_no) * PAGE_SIZE + *offset;
-        if (pwrite_all(pool->slots[*slot_index].fd, buf + written, chunk, abs_offset) != MYDB_OK)
-            return MYDB_ERR;
+        if (pwrite_all(pool->slots[*slot_index].fd, buf + written, chunk, abs_offset) != MYDB_OK) {
+            rc = MYDB_ERR;
+            goto out;
+        }
 
         written += chunk;
         *offset += chunk;
@@ -343,26 +378,36 @@ int large_wal_segment_pool_write(LargeWalSegmentPool *pool, WalWorker *worker,
 
         if (*page_no + 1 >= LARGE_WAL_SEGMENT_PAGES_PER_FILE) {
             /* The segment is full too. The one non-"blind" step: read
-             * the page we just filled back and copy its own content_lsn
-             * field — a LargeWalPageHeader carries exactly one LSN per
-             * page (the single large record it's a slice of), so unlike
-             * normal WAL's page_lsn/end_lsn split there's no first-vs-
-             * last ambiguity to resolve. A field copy, not content
-             * interpretation. */
+             * the page we just filled back and copy its own end_lsn
+             * field — the only reliable source for the segment's true
+             * highest LSN, since a page can hold several records and
+             * start_lsn names only the first. A field copy, not content
+             * interpretation — identical to normal_wal's own rollover
+             * path (wal_segment_pool.c), now that both share
+             * WalPageHeader. */
             uint8_t  last_page[PAGE_SIZE];
             uint64_t seg_end_lsn = 0;
             if (large_wal_segment_pool_read_page(pool, *slot_index, *page_no, last_page) == MYDB_OK) {
-                LargeWalPageHeader hdr;
+                WalPageHeader hdr;
                 if (large_wal_page_header_deserialize(last_page, &hdr) == MYDB_OK)
-                    seg_end_lsn = hdr.content_lsn;
+                    seg_end_lsn = hdr.end_lsn;
             }
 
             uint32_t finished_slot       = *slot_index;
             uint32_t finished_data_pages = *page_no;
-            if (large_wal_segment_pool_mark_done(pool, worker, finished_slot, seg_end_lsn, finished_data_pages) != MYDB_OK)
-                return MYDB_ERR;
-            if (large_wal_segment_pool_claim_next(pool, slot_index) != MYDB_OK)
-                return MYDB_ERR;
+            if (large_wal_segment_pool_mark_done(pool, worker, finished_slot, seg_end_lsn, finished_data_pages) != MYDB_OK) {
+                rc = MYDB_ERR;
+                goto out;
+            }
+            /* mark_done may have just handed a flush to worker — from
+             * here on, bailing out without draining it would wedge the
+             * mailbox, hence goto rather than return. claim_next failing
+             * is the reachable case: the pool runs out of free slots
+             * whenever the archiver is behind. */
+            if (large_wal_segment_pool_claim_next(pool, slot_index) != MYDB_OK) {
+                rc = MYDB_ERR;
+                goto out;
+            }
             *page_no = 1;
         } else {
             (*page_no)++;
@@ -380,15 +425,19 @@ int large_wal_segment_pool_write(LargeWalSegmentPool *pool, WalWorker *worker,
      * avoids dragging the filesystem journal into every flush on
      * filesystems like ext4. Remove this one line once submit() batches
      * multiple pending records behind one flush instead. */
-    if (fdatasync(pool->slots[*slot_index].fd) < 0) return MYDB_ERR;
+    if (fdatasync(pool->slots[*slot_index].fd) < 0) rc = MYDB_ERR;
 
-    /* If this call rolled over, mark_done() may have handed its fsync
-     * to worker instead of waiting for it (see mark_done's own doc
-     * comment) — confirm it's actually durable before telling our own
-     * caller this call succeeded. Cheap no-op if it didn't. */
-    if (worker && wal_worker_wait(worker) != MYDB_OK) return MYDB_ERR;
+out:
+    /* If this call rolled over, mark_done() may have handed its fsync to
+     * worker instead of waiting for it (see mark_done's own doc comment)
+     * — confirm it's actually durable before telling our own caller this
+     * call succeeded. Cheap no-op if it didn't. Runs unconditionally,
+     * including on the error paths above: draining is what keeps the
+     * shared mailbox usable, and the worker's own result still counts
+     * toward what we report. */
+    if (worker && wal_worker_wait(worker) != MYDB_OK) rc = MYDB_ERR;
 
-    return MYDB_OK;
+    return rc;
 }
 
 /* ------------------------------------------------------------------
@@ -408,7 +457,7 @@ int large_wal_segment_pool_tail_scan(LargeWalSegmentPool *pool, uint32_t slot_in
         off_t offset = (off_t)page_no * PAGE_SIZE;
         if (pread_all(fd, buf, PAGE_SIZE, offset) != MYDB_OK) break;
 
-        LargeWalPageHeader hdr;
+        WalPageHeader hdr;
         /* An unwritten (still-zero, sparse) page fails file_header_
          * check_id's magic check inside deserialize — that failure is
          * exactly the stop condition, not an error to report upward. */

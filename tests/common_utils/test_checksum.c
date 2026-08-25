@@ -68,6 +68,39 @@ static void test_fnv1a_still_works(void)
     CHECK(a != c, "fnv1a distinguishes different inputs");
 }
 
+/* The incremental form must agree with the one-shot form over the
+ * concatenation — that equivalence is what lets WalRecordHeader checksum
+ * its header and body (two spans that aren't adjacent on disk) without
+ * copying them into one scratch buffer first. */
+static void test_crc32_incremental_matches_one_shot(void)
+{
+    printf("\n[test_crc32_incremental_matches_one_shot]\n");
+
+    const char *whole = "the quick brown fox jumps over the lazy dog";
+    size_t len = strlen(whole);
+
+    uint32_t one_shot = crc32(whole, len);
+
+    /* Split at several points, including both degenerate ends. */
+    int all_match = 1;
+    for (size_t split = 0; split <= len; split++) {
+        uint32_t c = CRC32_INIT;
+        c = crc32_update(c, whole, split);
+        c = crc32_update(c, whole + split, len - split);
+        if (crc32_final(c) != one_shot) all_match = 0;
+    }
+    CHECK(all_match, "crc32_update across every possible split equals the one-shot crc32");
+
+    uint32_t three = CRC32_INIT;
+    three = crc32_update(three, "the quick ", 10);
+    three = crc32_update(three, "brown fox ", 10);
+    three = crc32_update(three, whole + 20, len - 20);
+    CHECK(crc32_final(three) == one_shot, "three-way split also matches");
+
+    CHECK(crc32_final(crc32_update(CRC32_INIT, NULL, 0)) == crc32(NULL, 0),
+          "the empty case agrees too");
+}
+
 /* ------------------------------------------------------------------ */
 
 int main(void)
@@ -78,6 +111,7 @@ int main(void)
     test_crc32_empty();
     test_crc32_round_trip();
     test_crc32_detects_tamper();
+    test_crc32_incremental_matches_one_shot();
     test_fnv1a_still_works();
 
     printf("\nResults: %d/%d passed\n", tests_passed, tests_run);

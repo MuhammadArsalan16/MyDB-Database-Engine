@@ -37,7 +37,7 @@
  * Per-submit sequence (do_write, large_wal_writer.c): segment-fit check
  * first (roll over before packing, never mid-buffer, closing Phase 4's
  * "segment-fit" open item) -> pack fully into the owned buffer,
- * stamping real LargeWalPageHeaders (closing Phase 4's "header
+ * stamping real page headers (closing Phase 4's "header
  * stamping" open item, since the writer -- unlike the buffer alone --
  * knows exactly where these pages are landing) -> one byte-for-byte
  * large_wal_segment_pool_write() call, reused as-is -> index insert ->
@@ -70,12 +70,21 @@ typedef struct {
 
     LargeWalBuffer  buf;   /* OWNED — embedded, per §10.10 */
 
-    /* Live cursor, seeded at init() from whatever's already LSEG_ACTIVE
-     * (or a fresh claim if none) — Phase 2's own crash-reload tail-scan
-     * already makes data_pages accurate post-crash, so no new recovery
-     * logic is needed here. */
+    /* Live append cursor, seeded at init() from whatever's already
+     * LSEG_ACTIVE (or a fresh claim if none) — Phase 2's own
+     * crash-reload tail-scan already makes data_pages accurate
+     * post-crash, so no new recovery logic is needed here. */
     uint32_t  cur_slot_index;
     uint32_t  cur_page_no;
+    uint32_t  cur_offset;             /* bytes already used in cur_page_no's
+                                          content area (0 .. LARGE_WAL_PAGE_
+                                          USABLE-1). Non-zero means the next
+                                          record packs in behind the last
+                                          one on that same page rather than
+                                          starting a fresh page — the whole
+                                          point of tight packing, and what
+                                          gives LargeWalIndexEntry.offset a
+                                          real value. */
     uint64_t  cur_segment_last_lsn;   /* content_lsn of the last record
                                           written into cur_slot_index —
                                           used as end_lsn if a future
@@ -88,16 +97,17 @@ typedef struct {
     uint8_t          started;
     uint8_t          stop_requested;
 
-    /* single-slot request/response mailbox — content is a borrowed
-     * pointer, valid for the call's duration since submit() blocks */
+    /* single-slot request/response mailbox — content and out_entries are
+     * borrowed pointers, valid for the call's duration since submit()
+     * blocks */
     uint8_t                request_pending;
     uint8_t                request_done;
     int                      last_result;
     const uint8_t             *req_content;
     uint32_t                    req_total_size;
-    uint64_t                     req_content_lsn;
-    uint8_t                       req_rec_type;
-    LargeWalIndexEntry             req_out_entry;
+    LargeWalIndexEntry           *req_out_entries;
+    uint32_t                       req_out_cap;
+    uint32_t                       req_out_count;
 } LargeWalWriter;
 
 /* Seeds cur_slot_index/cur_page_no from whatever segment is already
@@ -119,13 +129,27 @@ int large_wal_writer_start(LargeWalWriter *w);
  * never called, or after an earlier stop() — a no-op in both cases. */
 int large_wal_writer_stop(LargeWalWriter *w);
 
-/* Blocking. Wakes the thread, waits for this one record to be packed,
+/* Blocking. Wakes the thread, waits for this batch to be packed,
  * written, indexed, and durably flush_lsn-advanced before returning.
- * *out_entry receives the resulting LargeWalIndexEntry on MYDB_OK.
  * Fails immediately (no hang) if the writer isn't started or is
- * stopping. */
+ * stopping.
+ *
+ * content is a blob of one or more back-to-back serialized records; the
+ * writer discovers their boundaries itself by walking each
+ * WalRecordHeader's own total_len, and reads each record's LSN and type
+ * straight out of that header. No descriptor array is needed — the
+ * writer has to parse those headers anyway to set the continuation
+ * flag, and a caller-supplied description could only ever duplicate (or
+ * contradict) what the blob already carries.
+ *
+ * out_entries receives one LargeWalIndexEntry per record, in blob
+ * order; out_cap is its length. *out_count reports how many records
+ * were written — and is meaningful on failure too: a batch spanning
+ * several segments is written run by run, so a mid-batch failure leaves
+ * the earlier records genuinely durable and indexed, and *out_count
+ * says exactly how many. */
 int large_wal_writer_submit(LargeWalWriter *w, const uint8_t *content, uint32_t total_size,
-                             uint64_t content_lsn, uint8_t rec_type,
-                             LargeWalIndexEntry *out_entry);
+                             LargeWalIndexEntry *out_entries, uint32_t out_cap,
+                             uint32_t *out_count);
 
 #endif /* LARGE_WAL_WRITER_H */

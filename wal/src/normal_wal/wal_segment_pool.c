@@ -1,5 +1,5 @@
 #include "normal_wal/wal_segment_pool.h"
-#include "normal_wal/wal_page.h"
+#include "wal_page.h"
 #include "common.h"
 
 #include <fcntl.h>
@@ -201,16 +201,22 @@ int wal_segment_pool_claim_next(WalSegmentPool *pool, uint32_t *out_slot_index)
 
     if (slot->header.state != SEG_FREE) return MYDB_ERR;
 
-    slot->header.segment_no   = pool->next_segment_no;
-    slot->header.start_lsn    = 0;
-    slot->header.end_lsn      = 0;
-    slot->header.data_pages   = 0;
-    slot->header.state        = SEG_ACTIVE;
-    slot->header.partition_id = pool->partition_id;
+    /* Mutate a local copy, not slot->header: if the write below fails we
+     * must leave the in-memory header exactly as it was, or memory and
+     * disk disagree about this slot's state and every later decision
+     * trusts the wrong one. slot->header is only committed once the
+     * write has actually succeeded. */
+    WalSegmentHeader next = slot->header;
+    next.segment_no   = pool->next_segment_no;
+    next.start_lsn    = 0;
+    next.end_lsn      = 0;
+    next.data_pages   = 0;
+    next.state        = SEG_ACTIVE;
+    next.partition_id = pool->partition_id;
 
     uint8_t page_buf[WAL_PAGE_SIZE];
     memset(page_buf, 0, WAL_PAGE_SIZE);
-    wal_segment_header_serialize(&slot->header, page_buf);
+    wal_segment_header_serialize(&next, page_buf);
 
     if (pwrite_all(slot->fd, page_buf, WAL_PAGE_SIZE, 0) != MYDB_OK) return MYDB_ERR;
     /* No fdatasync here — see the header's doc comment for why claim_next
@@ -231,13 +237,16 @@ int wal_segment_pool_mark_done(WalSegmentPool *pool, WalWorker *worker,
     WalSlot *slot = &pool->slots[slot_index];
     if (slot->header.state != SEG_ACTIVE) return MYDB_ERR;
 
-    slot->header.end_lsn    = end_lsn;
-    slot->header.data_pages = data_pages;
-    slot->header.state      = SEG_DONE;
+    /* Local copy, committed to slot->header only after the write and
+     * sync both succeed — see claim_next's own note. */
+    WalSegmentHeader next = slot->header;
+    next.end_lsn    = end_lsn;
+    next.data_pages = data_pages;
+    next.state      = SEG_DONE;
 
     uint8_t page_buf[WAL_PAGE_SIZE];
     memset(page_buf, 0, WAL_PAGE_SIZE);
-    wal_segment_header_serialize(&slot->header, page_buf);
+    wal_segment_header_serialize(&next, page_buf);
 
     if (pwrite_all(slot->fd, page_buf, WAL_PAGE_SIZE, 0) != MYDB_OK) return MYDB_ERR;
     if (worker) {
@@ -302,6 +311,14 @@ int wal_segment_pool_write(WalSegmentPool *pool, WalWorker *worker,
     if (!page_no_valid(*page_no)) return MYDB_ERR;
     if (*offset >= WAL_PAGE_SIZE) return MYDB_ERR;
 
+    /* Single exit through `out:` from here on. Once mark_done() below has
+     * handed a flush to worker, EVERY return path has to drain it:
+     * wal_worker_wait() is the only thing that clears the mailbox's done
+     * flag, so returning early without it wedges the next
+     * wal_worker_async_fdatasync() forever — for the whole partition,
+     * not just this call. */
+    int rc = MYDB_OK;
+
     size_t written = 0;
     while (written < buf_len) {
         uint32_t room_left = WAL_PAGE_SIZE - *offset;
@@ -309,8 +326,10 @@ int wal_segment_pool_write(WalSegmentPool *pool, WalWorker *worker,
         uint32_t chunk = (remaining < (size_t)room_left) ? (uint32_t)remaining : room_left;
 
         off_t abs_offset = (off_t)(*page_no) * WAL_PAGE_SIZE + *offset;
-        if (pwrite_all(pool->slots[*slot_index].fd, buf + written, chunk, abs_offset) != MYDB_OK)
-            return MYDB_ERR;
+        if (pwrite_all(pool->slots[*slot_index].fd, buf + written, chunk, abs_offset) != MYDB_OK) {
+            rc = MYDB_ERR;
+            goto out;
+        }
 
         written += chunk;
         *offset += chunk;
@@ -330,7 +349,7 @@ int wal_segment_pool_write(WalSegmentPool *pool, WalWorker *worker,
             /* The segment is full too. The one non-"blind" step: read
              * the page we just filled back and copy its own end_lsn
              * field — the only reliable source for the segment's true
-             * highest LSN, since page_lsn alone is only the first
+             * highest LSN, since start_lsn alone is only the first
              * record's LSN, not the last (wal_page.h). A field copy,
              * not content interpretation. */
             uint8_t  last_page[WAL_PAGE_SIZE];
@@ -343,10 +362,17 @@ int wal_segment_pool_write(WalSegmentPool *pool, WalWorker *worker,
 
             uint32_t finished_slot       = *slot_index;
             uint32_t finished_data_pages = *page_no;
-            if (wal_segment_pool_mark_done(pool, worker, finished_slot, seg_end_lsn, finished_data_pages) != MYDB_OK)
-                return MYDB_ERR;
-            if (wal_segment_pool_claim_next(pool, slot_index) != MYDB_OK)
-                return MYDB_ERR;
+            if (wal_segment_pool_mark_done(pool, worker, finished_slot, seg_end_lsn, finished_data_pages) != MYDB_OK) {
+                rc = MYDB_ERR;
+                goto out;
+            }
+            /* mark_done may have just handed a flush to worker — from
+             * here on, bailing out without draining it would wedge the
+             * mailbox, hence goto rather than return. */
+            if (wal_segment_pool_claim_next(pool, slot_index) != MYDB_OK) {
+                rc = MYDB_ERR;
+                goto out;
+            }
             *page_no = 1;
         } else {
             (*page_no)++;
@@ -367,15 +393,19 @@ int wal_segment_pool_write(WalSegmentPool *pool, WalWorker *worker,
      * the filesystem journal into every WAL flush on filesystems like
      * ext4. Remove this one line once the Flusher lands and does its own
      * batched flush at the end of each flush cycle instead. */
-    if (fdatasync(pool->slots[*slot_index].fd) < 0) return MYDB_ERR;
+    if (fdatasync(pool->slots[*slot_index].fd) < 0) rc = MYDB_ERR;
 
-    /* If this call rolled over, mark_done() may have handed its fsync
-     * to worker instead of waiting for it (see mark_done's own doc
-     * comment) — confirm it's actually durable before telling our own
-     * caller this call succeeded. Cheap no-op if it didn't. */
-    if (worker && wal_worker_wait(worker) != MYDB_OK) return MYDB_ERR;
+out:
+    /* If this call rolled over, mark_done() may have handed its fsync to
+     * worker instead of waiting for it (see mark_done's own doc comment)
+     * — confirm it's actually durable before telling our own caller this
+     * call succeeded. Cheap no-op if it didn't. Runs unconditionally,
+     * including on the error paths above: draining is what keeps the
+     * shared mailbox usable, and the worker's own result still counts
+     * toward what we report. */
+    if (worker && wal_worker_wait(worker) != MYDB_OK) rc = MYDB_ERR;
 
-    return MYDB_OK;
+    return rc;
 }
 
 /* ------------------------------------------------------------------

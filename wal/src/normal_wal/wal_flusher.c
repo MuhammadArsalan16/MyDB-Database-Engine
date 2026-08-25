@@ -1,5 +1,5 @@
 #include "normal_wal/wal_flusher.h"
-#include "normal_wal/wal_page.h"
+#include "wal_page.h"
 
 #include <stdlib.h>
 #include <string.h>

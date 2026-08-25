@@ -43,9 +43,19 @@ typedef struct {
     uint32_t table_id;         /* persistent, on-disk-stable identifier   */
     uint32_t page_no;
     uint8_t  rec_type;         /* WalRecType, stored as a byte            */
-    uint8_t  reserved[3];
+    uint8_t  flags;            /* WAL_RECORD_FLAG_*                       */
+    uint8_t  reserved[2];      /* was reserved[3]; one byte moved to flags */
     uint32_t checksum;         /* CRC32 over header + body                */
 } WalRecordHeader;
+
+/* Set when this record's bytes do not all fit on the page its header
+ * landed on — the remainder continues on the next page. Only LARGE_WAL
+ * ever sets it: normal_wal closes a frame rather than splitting a
+ * record. Stamped by the LARGE_WAL writer at pack time (not by whoever
+ * built the record), because whether a record spans depends on where it
+ * lands, which only the writer knows — see
+ * wal_record_header_patch_flags below. */
+#define WAL_RECORD_FLAG_CONTINUES_ON_NEW_PAGE 0x01
 
 /* ------------------------------------------------------------------
  * Serialize/deserialize + checksum. Added in Phase 3 (wal_ring_buffer.c
@@ -75,6 +85,18 @@ void wal_record_header_serialize(WalRecordHeader *hdr, const void *body,
                                   size_t body_len, uint8_t *buf);
 int  wal_record_header_deserialize(const uint8_t *buf, size_t body_len,
                                     WalRecordHeader *out);
+
+/* Rewrites the flags byte of an already-serialized 44-byte record
+ * header and recomputes its checksum over header+body, so the record
+ * still validates afterwards. body must point at that record's own
+ * contiguous body bytes (body_len of them); it is read, never written.
+ *
+ * This exists for the LARGE_WAL writer, which learns only at pack time
+ * whether a record will span a page, and must not mutate the caller's
+ * const blob to record that: it patches a 44-byte copy of the header
+ * and packs that instead of the original's first 44 bytes. */
+void wal_record_header_patch_flags(uint8_t *hdr_buf, const void *body,
+                                    size_t body_len, uint8_t flags);
 
 /* ------------------------------------------------------------------
  * Fixed-shape record bodies.

@@ -5,7 +5,7 @@
 #include <sys/stat.h>
 
 #include "common.h"
-#include "normal_wal/wal_page.h"
+#include "wal_page.h"
 #include "normal_wal/wal_segment.h"
 #include "normal_wal/wal_segment_pool.h"
 
@@ -101,7 +101,7 @@ static void test_page_round_trip_and_bounds(void)
     WalPageHeader hdr;
     memset(&hdr, 0, sizeof(hdr));
     hdr.id.file_type = FILETYPE_WAL_PAGE;
-    hdr.page_lsn = 99;
+    hdr.start_lsn = 99;
     hdr.data_len = 123;
 
     uint8_t page_buf[WAL_PAGE_SIZE];
@@ -118,7 +118,7 @@ static void test_page_round_trip_and_bounds(void)
     WalPageHeader out;
     int rc = wal_page_header_deserialize(read_buf, &out);
     CHECK(rc == MYDB_OK, "the page read back deserializes cleanly");
-    CHECK(out.page_lsn == 99, "page_lsn round-trips through the pool");
+    CHECK(out.start_lsn == 99, "start_lsn round-trips through the pool");
 
     CHECK(wal_segment_pool_write_page(&pool, slot_index, 0, page_buf) == MYDB_ERR,
           "page_no=0 (the header's own slot) is rejected");
@@ -174,7 +174,7 @@ static void test_crash_reload_tail_scan(void)
     uint8_t page_buf[WAL_PAGE_SIZE];
     for (uint32_t page_no = 1; page_no <= 2; page_no++) {
         memset(page_buf, 0, WAL_PAGE_SIZE);
-        hdr.page_lsn = page_no;
+        hdr.start_lsn = page_no;
         wal_page_header_serialize(&hdr, page_buf);
         wal_segment_pool_write_page(&pool, slot_index, page_no, page_buf);
     }
@@ -203,12 +203,12 @@ static void test_crash_reload_tail_scan(void)
  * the way the Flusher would before handing it to wal_segment_pool_write
  * — segment_write itself never constructs headers, so tests that need
  * a real one build it by hand via the existing wal_page_* functions. */
-static void build_page(uint8_t *out, uint64_t page_lsn, uint64_t end_lsn, uint8_t fill)
+static void build_page(uint8_t *out, uint64_t start_lsn, uint64_t end_lsn, uint8_t fill)
 {
     WalPageHeader hdr;
     memset(&hdr, 0, sizeof(hdr));
     hdr.id.file_type = FILETYPE_WAL_PAGE;
-    hdr.page_lsn = page_lsn;
+    hdr.start_lsn = start_lsn;
     hdr.end_lsn = end_lsn;
     hdr.data_len = WAL_PAGE_USABLE;
     memset(out + WAL_PAGE_HEADER_SIZE, fill, WAL_PAGE_USABLE);

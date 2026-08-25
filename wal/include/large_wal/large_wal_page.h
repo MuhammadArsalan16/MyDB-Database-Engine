@@ -4,23 +4,35 @@
 #include <stdint.h>
 #include "common.h"
 #include "file_header.h"
+#include "wal_page.h"
 
 /*
- * large_wal_page.h — LARGE_WAL page header format (MYDB_WAL_DESIGN.md
- * §10.2, corrected here — see below). Mirrors normal_wal/wal_page.h in
- * shape and discipline exactly: plain (not packed) struct, wire format
- * produced/consumed field-by-field in large_wal_page.c via explicit
- * offsets, not via this struct's in-memory layout.
+ * large_wal_page.h — LARGE_WAL's side of the page header format.
  *
- * Correction from the design doc: §10.2 lists magic(4)+content_lsn(8)+
- * record_type(1)+page_index(1)+data_len(2)+flags(2)+reserved(2)+
- * checksum(4) = 24 bytes for a struct it claims is 32 bytes — the same
- * unexplained-gap bug MYDB_WAL_IMPLEMENTATION.md §8.3/§8.4 already found
- * and fixed for WalPageHeader/WalSegmentHeader, just never applied here.
- * Fixed the same way: bare magic -> FileHeaderId (+4 bytes, matching
- * every other on-disk struct in this codebase), reserved sized to
- * honestly close the gap at the doc's own originally-claimed 32-byte
- * total (8+8+1+1+2+2+6+4 = 32).
+ * There is no LargeWalPageHeader struct any more: LARGE_WAL's 16KB
+ * content pages and normal_wal's 4KB segment pages now share one
+ * on-disk shape, WalPageHeader (wal_page.h), byte for byte. The only
+ * difference is the file_type stamped into id — FILETYPE_LARGE_WAL_PAGE
+ * here vs FILETYPE_WAL_PAGE there — which is exactly the split
+ * wal_segment.h / large_wal_segment.h already established for the
+ * segment header: same shape, own file_type, own module.
+ *
+ * What the old struct dropped, and why:
+ *   - page_index: a page's position within one multi-page record. Gone
+ *     because a page can hold parts of more than one record, so "which
+ *     slice of which record is this" is no longer a single number the
+ *     page itself can carry. LargeWalIndexEntry (start_page_no/offset/
+ *     page_count) locates a record's bytes instead.
+ *   - record_type: already carried twice over — by the WalRecordHeader
+ *     embedded in the page's own content, and by
+ *     LargeWalIndexEntry.rec_type.
+ *   - content_lsn (one LSN per page): replaced by the shared header's
+ *     start_lsn/end_lsn pair, which can describe a page holding several
+ *     records with different LSNs.
+ *
+ * Multi-record/continuation state lives in WalPageHeader.flags —
+ * WAL_PAGE_FLAG_INCOMING_CONTINUATION / _OUTGOING_CONTINUATION
+ * (wal_page.h), replacing the old single LARGE_WAL_PAGE_FLAG_CONTINUATION.
  *
  * What lives inside the data area these pages carry: no new record
  * type. A large record is still a WalRecordHeader (44 bytes,
@@ -28,46 +40,26 @@
  * found redundant and dropped (impl doc §10.4): total_len is self-
  * terminating, checksum is self-validating. This page format is only
  * the *container* — reassembling a multi-page record's content back
- * into one contiguous buffer for wal_record_header_deserialize is a
- * later phase's job (the segment pool / writer), not this layer's.
+ * into one contiguous buffer is large_wal_get()'s job (large_wal_api.c),
+ * not this layer's.
  */
 
-/* ------------------------------------------------------------------
- * LargeWalPageHeader — 32 bytes. Leads every 16KB LARGE_WAL content
- * page. page_index/CONTINUATION let a reader detect multi-page records
- * without needing anything from the (now-removed) footer.
- * ------------------------------------------------------------------ */
-#define LARGE_WAL_PAGE_FLAG_CONTINUATION 0x0001   /* set on any page_index > 0 */
-
-typedef struct {
-    FileHeaderId id;
-    uint64_t     content_lsn;   /* LSN of the large record this page belongs to */
-    uint8_t      record_type;   /* WalRecType — the original record's own type */
-    uint8_t      page_index;    /* position within this large record, 0-based */
-    uint16_t     data_len;      /* exact bytes of valid content on this page */
-    uint16_t     flags;         /* LARGE_WAL_PAGE_FLAG_* */
-    uint8_t      reserved[6];
-    uint32_t     checksum;      /* CRC32 over the preceding 28 bytes */
-} LargeWalPageHeader;             /* 32 bytes */
-
-#define LARGE_WAL_PAGE_HEADER_ON_DISK_SIZE  32   /* matches LargeWalSegmentHeader's own
-     LARGE_WAL_SEGMENT_HEADER_ON_DISK_SIZE naming (large_wal_segment.h) — the on-disk
-     footprint a caller needs to skip past to reach a page's content bytes. */
+#define LARGE_WAL_PAGE_HEADER_ON_DISK_SIZE  32   /* same 32 bytes WalPageHeader
+     occupies for normal_wal; named separately here (matching
+     LARGE_WAL_SEGMENT_HEADER_ON_DISK_SIZE, large_wal_segment.h) as the footprint
+     a caller skips past to reach a LARGE_WAL page's content bytes. */
 
 /* ------------------------------------------------------------------
- * Serialize/deserialize + checksum — same contract as
- * wal_page_header_serialize/deserialize (normal_wal/wal_page.h).
+ * Serialize/deserialize + checksum — identical contract to
+ * wal_page_header_serialize/deserialize (wal_page.h), just stamping and
+ * checking FILETYPE_LARGE_WAL_PAGE.
  *
- * large_wal_page_header_serialize fills buf[0..32) from *hdr and stamps
- * buf's checksum field. Caller sets every field of *hdr except checksum
- * first.
- *
- * large_wal_page_header_deserialize validates the FileHeaderId (magic/
- * version/file_type) via file_header_check_id, then the checksum,
- * before filling *out. Returns MYDB_OK, or MYDB_ERR_BAD_MAGIC/
- * BAD_VERSION/BAD_FILE_TYPE/BAD_CHECKSUM.
+ * serialize is a straight delegation: wal_page_header_serialize already
+ * takes the file_type from hdr->id.file_type, so it is format-agnostic
+ * as written. deserialize needs its own body only because it must check
+ * against FILETYPE_LARGE_WAL_PAGE rather than FILETYPE_WAL_PAGE.
  * ------------------------------------------------------------------ */
-void large_wal_page_header_serialize(const LargeWalPageHeader *hdr, uint8_t *buf);
-int  large_wal_page_header_deserialize(const uint8_t *buf, LargeWalPageHeader *out);
+void large_wal_page_header_serialize(const WalPageHeader *hdr, uint8_t *buf);
+int  large_wal_page_header_deserialize(const uint8_t *buf, WalPageHeader *out);
 
 #endif /* LARGE_WAL_PAGE_H */

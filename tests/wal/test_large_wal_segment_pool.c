@@ -40,7 +40,7 @@ static void test_fresh_init_creates_all_slots(void)
     cleanup();
 
     LargeWalSegmentPool pool;
-    int rc = large_wal_segment_pool_init(&pool, TEST_WAL_DIR, 7);
+    int rc = large_wal_segment_pool_init(&pool, TEST_WAL_DIR, 7, NULL);
     CHECK(rc == MYDB_OK, "fresh init succeeds");
 
     int all_free = 1, all_right_size = 1;
@@ -67,7 +67,7 @@ static void test_claim_next_round_robins(void)
     cleanup();
 
     LargeWalSegmentPool pool;
-    CHECK(large_wal_segment_pool_init(&pool, TEST_WAL_DIR, 1) == MYDB_OK, "init succeeds");
+    CHECK(large_wal_segment_pool_init(&pool, TEST_WAL_DIR, 1, NULL) == MYDB_OK, "init succeeds");
 
     int ok = 1;
     for (uint32_t i = 0; i < LARGE_WAL_SEGMENT_POOL_SLOTS; i++) {
@@ -93,15 +93,16 @@ static void test_page_round_trip_and_bounds(void)
     cleanup();
 
     LargeWalSegmentPool pool;
-    CHECK(large_wal_segment_pool_init(&pool, TEST_WAL_DIR, 1) == MYDB_OK, "init succeeds");
+    CHECK(large_wal_segment_pool_init(&pool, TEST_WAL_DIR, 1, NULL) == MYDB_OK, "init succeeds");
 
     uint32_t slot_index;
     CHECK(large_wal_segment_pool_claim_next(&pool, &slot_index) == MYDB_OK, "claim succeeds");
 
-    LargeWalPageHeader hdr;
+    WalPageHeader hdr;
     memset(&hdr, 0, sizeof(hdr));
     hdr.id.file_type = FILETYPE_LARGE_WAL_PAGE;
-    hdr.content_lsn = 99;
+    hdr.start_lsn = 99;
+    hdr.end_lsn = 99;
     hdr.data_len = 123;
 
     uint8_t page_buf[PAGE_SIZE];
@@ -115,10 +116,10 @@ static void test_page_round_trip_and_bounds(void)
     CHECK(large_wal_segment_pool_read_page(&pool, slot_index, 1, read_buf) == MYDB_OK,
           "read_page(page_no=1) succeeds");
 
-    LargeWalPageHeader out;
+    WalPageHeader out;
     int rc = large_wal_page_header_deserialize(read_buf, &out);
     CHECK(rc == MYDB_OK, "the page read back deserializes cleanly");
-    CHECK(out.content_lsn == 99, "content_lsn round-trips through the pool");
+    CHECK(out.start_lsn == 99, "start_lsn round-trips through the pool");
 
     CHECK(large_wal_segment_pool_write_page(&pool, slot_index, 0, page_buf) == MYDB_ERR,
           "page_no=0 (the header's own slot) is rejected");
@@ -135,7 +136,7 @@ static void test_clean_reload_preserves_state(void)
     cleanup();
 
     LargeWalSegmentPool pool;
-    CHECK(large_wal_segment_pool_init(&pool, TEST_WAL_DIR, 1) == MYDB_OK, "first init succeeds");
+    CHECK(large_wal_segment_pool_init(&pool, TEST_WAL_DIR, 1, NULL) == MYDB_OK, "first init succeeds");
 
     uint32_t slot_index;
     large_wal_segment_pool_claim_next(&pool, &slot_index);
@@ -144,7 +145,7 @@ static void test_clean_reload_preserves_state(void)
     large_wal_segment_pool_shutdown(&pool);
 
     LargeWalSegmentPool reloaded;
-    CHECK(large_wal_segment_pool_init(&reloaded, TEST_WAL_DIR, 1) == MYDB_OK, "reload succeeds");
+    CHECK(large_wal_segment_pool_init(&reloaded, TEST_WAL_DIR, 1, NULL) == MYDB_OK, "reload succeeds");
     CHECK(reloaded.next_segment_no == 3, "next_segment_no survives a clean reload (3 claims made)");
     CHECK(reloaded.slots[0].header.state == LSEG_ACTIVE &&
           reloaded.slots[1].header.state == LSEG_ACTIVE &&
@@ -162,19 +163,20 @@ static void test_crash_reload_tail_scan(void)
     cleanup();
 
     LargeWalSegmentPool pool;
-    CHECK(large_wal_segment_pool_init(&pool, TEST_WAL_DIR, 1) == MYDB_OK, "first init succeeds");
+    CHECK(large_wal_segment_pool_init(&pool, TEST_WAL_DIR, 1, NULL) == MYDB_OK, "first init succeeds");
 
     uint32_t slot_index;
     CHECK(large_wal_segment_pool_claim_next(&pool, &slot_index) == MYDB_OK, "claim succeeds");
 
-    LargeWalPageHeader hdr;
+    WalPageHeader hdr;
     memset(&hdr, 0, sizeof(hdr));
     hdr.id.file_type = FILETYPE_LARGE_WAL_PAGE;
 
     uint8_t page_buf[PAGE_SIZE];
     for (uint32_t page_no = 1; page_no <= 2; page_no++) {
         memset(page_buf, 0, PAGE_SIZE);
-        hdr.content_lsn = page_no;
+        hdr.start_lsn = page_no;
+        hdr.end_lsn   = page_no;
         large_wal_page_header_serialize(&hdr, page_buf);
         large_wal_segment_pool_write_page(&pool, slot_index, page_no, page_buf);
     }
@@ -184,7 +186,7 @@ static void test_crash_reload_tail_scan(void)
     large_wal_segment_pool_shutdown(&pool);
 
     LargeWalSegmentPool reloaded;
-    CHECK(large_wal_segment_pool_init(&reloaded, TEST_WAL_DIR, 1) == MYDB_OK, "post-crash reload succeeds");
+    CHECK(large_wal_segment_pool_init(&reloaded, TEST_WAL_DIR, 1, NULL) == MYDB_OK, "post-crash reload succeeds");
     CHECK(reloaded.slots[slot_index].header.state == LSEG_ACTIVE,
           "the crashed slot reloads as LSEG_ACTIVE (never got to rewrite its header)");
     CHECK(reloaded.slots[slot_index].header.data_pages == 2,
@@ -199,25 +201,19 @@ static void test_crash_reload_tail_scan(void)
     cleanup();
 }
 
-/* Wire size of LargeWalPageHeader (large_wal_page.c's own explicit byte
- * offsets: checksum lands at offset 28, is 4 bytes -> 32 total). No
- * shared constant for this exists yet (common.h only defines
- * WAL_PAGE_HEADER_SIZE for normal_wal's 4KB pages) — sizeof(struct)
- * would be unreliable here since the struct isn't packed. */
-#define LARGE_WAL_PAGE_HEADER_WIRE_SIZE 32
-
 /* Builds one complete PAGE_SIZE page buffer (real header + content), the
  * way the LARGE_WAL Writer would before handing it to
  * large_wal_segment_pool_write — write() itself never constructs
  * headers, so tests that need a real one build it by hand. */
 static void build_page(uint8_t *out, uint64_t content_lsn, uint8_t fill)
 {
-    LargeWalPageHeader hdr;
+    WalPageHeader hdr;
     memset(&hdr, 0, sizeof(hdr));
     hdr.id.file_type = FILETYPE_LARGE_WAL_PAGE;
-    hdr.content_lsn = content_lsn;
-    hdr.data_len = PAGE_SIZE - LARGE_WAL_PAGE_HEADER_WIRE_SIZE;
-    memset(out + LARGE_WAL_PAGE_HEADER_WIRE_SIZE, fill, hdr.data_len);
+    hdr.start_lsn = content_lsn;
+    hdr.end_lsn   = content_lsn;
+    hdr.data_len = PAGE_SIZE - LARGE_WAL_PAGE_HEADER_ON_DISK_SIZE;
+    memset(out + LARGE_WAL_PAGE_HEADER_ON_DISK_SIZE, fill, hdr.data_len);
     large_wal_page_header_serialize(&hdr, out);
 }
 
@@ -227,7 +223,7 @@ static void test_write_at_explicit_offset(void)
     cleanup();
 
     LargeWalSegmentPool pool;
-    CHECK(large_wal_segment_pool_init(&pool, TEST_WAL_DIR, 1) == MYDB_OK, "init succeeds");
+    CHECK(large_wal_segment_pool_init(&pool, TEST_WAL_DIR, 1, NULL) == MYDB_OK, "init succeeds");
 
     uint32_t slot_index;
     CHECK(large_wal_segment_pool_claim_next(&pool, &slot_index) == MYDB_OK, "claim succeeds");
@@ -265,7 +261,7 @@ static void test_write_spans_multiple_pages(void)
     cleanup();
 
     LargeWalSegmentPool pool;
-    CHECK(large_wal_segment_pool_init(&pool, TEST_WAL_DIR, 1) == MYDB_OK, "init succeeds");
+    CHECK(large_wal_segment_pool_init(&pool, TEST_WAL_DIR, 1, NULL) == MYDB_OK, "init succeeds");
 
     uint32_t slot_index;
     large_wal_segment_pool_claim_next(&pool, &slot_index);
@@ -304,7 +300,7 @@ static void test_write_rolls_to_new_segment(void)
     cleanup();
 
     LargeWalSegmentPool pool;
-    CHECK(large_wal_segment_pool_init(&pool, TEST_WAL_DIR, 1) == MYDB_OK, "init succeeds");
+    CHECK(large_wal_segment_pool_init(&pool, TEST_WAL_DIR, 1, NULL) == MYDB_OK, "init succeeds");
 
     uint32_t slot_index;
     large_wal_segment_pool_claim_next(&pool, &slot_index);
@@ -312,11 +308,11 @@ static void test_write_rolls_to_new_segment(void)
     uint32_t first_slot = slot_index;
 
     /* Build all 127 usable pages as real, header-carrying pages — the
-     * last one stamped with a distinguishable content_lsn — plus one
-     * more real page that should land in the rolled-over segment. This
-     * is the one scenario that needs real headers: it's testing that
-     * write() correctly reads content_lsn back from the segment's true
-     * last page when it auto-finalizes. */
+     * last one stamped with a distinguishable LSN — plus one more real
+     * page that should land in the rolled-over segment. This is the one
+     * scenario that needs real headers: it's testing that write()
+     * correctly reads end_lsn back from the segment's true last page
+     * when it auto-finalizes. */
     uint32_t last_page_count = LARGE_WAL_SEGMENT_PAGES_PER_FILE - 1;
     size_t total_len = (size_t)PAGE_SIZE * (last_page_count + 1);
     uint8_t *big = malloc(total_len);
@@ -335,7 +331,7 @@ static void test_write_rolls_to_new_segment(void)
     CHECK(pool.slots[first_slot].header.data_pages == last_page_count,
           "the finalized segment's data_pages reflects all 127 pages used");
     CHECK(pool.slots[first_slot].header.end_lsn == 100 + last_page_count - 1,
-          "the finalized segment's end_lsn was read back from the true last page's own content_lsn field");
+          "the finalized segment's end_lsn was read back from the true last page's own end_lsn field");
     CHECK(pool.slots[slot_index].header.state == LSEG_ACTIVE,
           "the new segment is active and holds the one spilled-over page");
 
@@ -355,7 +351,7 @@ static void test_read_segment_whole_file(void)
     cleanup();
 
     LargeWalSegmentPool pool;
-    CHECK(large_wal_segment_pool_init(&pool, TEST_WAL_DIR, 1) == MYDB_OK, "init succeeds");
+    CHECK(large_wal_segment_pool_init(&pool, TEST_WAL_DIR, 1, NULL) == MYDB_OK, "init succeeds");
 
     uint32_t slot_index;
     large_wal_segment_pool_claim_next(&pool, &slot_index);

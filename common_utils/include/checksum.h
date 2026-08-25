@@ -32,4 +32,30 @@ uint32_t fnv1a(const void *data, size_t len);
 /* ------------------------------------------------------------------ */
 uint32_t crc32(const void *data, size_t len);
 
+/* ------------------------------------------------------------------ */
+/*  Incremental CRC32 — same algorithm/parameters as crc32() above,    */
+/*  just split so a checksum can span several non-contiguous buffers   */
+/*  without copying them into one scratch first:                       */
+/*                                                                     */
+/*    uint32_t c = CRC32_INIT;                                         */
+/*    c = crc32_update(c, part_a, a_len);                              */
+/*    c = crc32_update(c, part_b, b_len);                              */
+/*    uint32_t result = crc32_final(c);   // == crc32(a ++ b)          */
+/*                                                                     */
+/*  This is what WalRecordHeader's checksum needs: it covers the       */
+/*  header's leading bytes plus the record body, two spans that are    */
+/*  not adjacent on disk (the checksum field itself sits between       */
+/*  them). Copying both into a stack scratch — the old approach —      */
+/*  bounded record bodies to the scratch's size, which LARGE_WAL       */
+/*  records exceed by definition.                                      */
+/* ------------------------------------------------------------------ */
+#define CRC32_INIT 0xFFFFFFFFu
+
+/* Folds len bytes into the running state. Not a finished checksum on
+ * its own — pass the result to crc32_final(). */
+uint32_t crc32_update(uint32_t crc, const void *data, size_t len);
+
+/* Applies the final XOR, turning running state into the checksum. */
+static inline uint32_t crc32_final(uint32_t crc) { return ~crc; }
+
 #endif /* CHECKSUM_H */

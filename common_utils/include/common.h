@@ -22,11 +22,11 @@
 /*  themselves, which are wal/'s own structs, not declared here.      */
 /* ------------------------------------------------------------------ */
 #define WAL_PAGE_SIZE           4096
-#define WAL_PAGE_HEADER_SIZE      36
+#define WAL_PAGE_HEADER_SIZE      32   /* was 36 -- WalPageHeader unified/shrunk */
 #define WAL_RECORD_HEADER_SIZE    44
-#define WAL_PAGE_USABLE         4060   /* WAL_PAGE_SIZE - WAL_PAGE_HEADER_SIZE */
-#define WAL_MAX_RECORD_SIZE     4060   /* records above this redirect to LARGE_WAL */
-#define WAL_MAX_ROW_BODY        4016   /* WAL_MAX_RECORD_SIZE - WAL_RECORD_HEADER_SIZE */
+#define WAL_PAGE_USABLE         4064   /* was 4060 -- WAL_PAGE_SIZE - WAL_PAGE_HEADER_SIZE */
+#define WAL_MAX_RECORD_SIZE     4064   /* was 4060 -- records above this redirect to LARGE_WAL */
+#define WAL_MAX_ROW_BODY        4020   /* was 4016 -- WAL_MAX_RECORD_SIZE - WAL_RECORD_HEADER_SIZE */
 
 /* ------------------------------------------------------------------ */
 /*  Size limits                                                       */

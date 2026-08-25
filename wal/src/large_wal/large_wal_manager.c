@@ -10,11 +10,14 @@ int large_wal_manager_init(LargeWalManager *mgr, const char *wal_dir,
     mgr->partition_id = partition_id;
     snprintf(mgr->wal_dir, sizeof(mgr->wal_dir), "%s", wal_dir);
 
-    if (large_wal_segment_pool_init(&mgr->lw_pool, wal_dir, partition_id) != MYDB_OK)
+    /* Registry first: the pool holds a pointer to it, and registers
+     * every segment_no claim_next mints. */
+    if (large_wal_registry_init(&mgr->lw_registry) != MYDB_OK)
         return MYDB_ERR;
 
-    if (large_wal_registry_init(&mgr->lw_registry) != MYDB_OK) {
-        large_wal_segment_pool_shutdown(&mgr->lw_pool);
+    if (large_wal_segment_pool_init(&mgr->lw_pool, wal_dir, partition_id,
+                                     &mgr->lw_registry) != MYDB_OK) {
+        large_wal_registry_shutdown(&mgr->lw_registry);
         return MYDB_ERR;
     }
 

@@ -7,7 +7,7 @@
 
 #include "common.h"
 #include "normal_wal/wal_types.h"
-#include "normal_wal/wal_page.h"
+#include "wal_page.h"
 #include "normal_wal/wal_segment_pool.h"
 #include "normal_wal/wal_ring_buffer.h"
 #include "normal_wal/wal_flusher.h"

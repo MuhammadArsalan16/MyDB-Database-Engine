@@ -16,48 +16,52 @@ static int tests_passed = 0;
 
 /* ------------------------------------------------------------------ */
 
+/* LARGE_WAL pages carry the shared WalPageHeader (wal_page.h) — same
+ * struct and byte layout normal_wal's pages use, differing only in the
+ * file_type stamped into id. These tests cover LARGE_WAL's own
+ * serialize/deserialize pair (large_wal_page.h), which is what enforces
+ * that file_type distinction. */
 static void test_page_header_round_trip(void)
 {
     printf("\n[test_page_header_round_trip]\n");
-    LargeWalPageHeader hdr;
+    WalPageHeader hdr;
     memset(&hdr, 0, sizeof(hdr));
     hdr.id.file_type = FILETYPE_LARGE_WAL_PAGE;
-    hdr.content_lsn  = 123456789ull;
-    hdr.record_type  = WAL_REC_SCHEMA_UPDATE;
-    hdr.page_index   = 1;
+    hdr.start_lsn    = 123456789ull;
+    hdr.end_lsn      = 123456999ull;
     hdr.data_len     = 16000;
-    hdr.flags        = LARGE_WAL_PAGE_FLAG_CONTINUATION;
+    hdr.flags        = WAL_PAGE_FLAG_INCOMING_CONTINUATION |
+                       WAL_PAGE_FLAG_OUTGOING_CONTINUATION;
 
-    uint8_t buf[32];
+    uint8_t buf[LARGE_WAL_PAGE_HEADER_ON_DISK_SIZE];
     large_wal_page_header_serialize(&hdr, buf);
 
-    LargeWalPageHeader out;
+    WalPageHeader out;
     memset(&out, 0xAA, sizeof(out));
     int rc = large_wal_page_header_deserialize(buf, &out);
 
     CHECK(rc == MYDB_OK,                          "deserialize of a freshly-serialized page header succeeds");
     CHECK(out.id.magic == MYDB_MAGIC,             "magic round-trips");
     CHECK(out.id.file_type == FILETYPE_LARGE_WAL_PAGE, "file_type round-trips");
-    CHECK(out.content_lsn == hdr.content_lsn,     "content_lsn round-trips");
-    CHECK(out.record_type == hdr.record_type,     "record_type round-trips");
-    CHECK(out.page_index == hdr.page_index,       "page_index round-trips");
+    CHECK(out.start_lsn == hdr.start_lsn,         "start_lsn round-trips");
+    CHECK(out.end_lsn == hdr.end_lsn,             "end_lsn round-trips");
     CHECK(out.data_len == hdr.data_len,           "data_len round-trips");
-    CHECK(out.flags == hdr.flags,                 "flags (CONTINUATION) round-trips");
+    CHECK(out.flags == hdr.flags,                 "flags (both continuation bits) round-trip");
 }
 
 static void test_page_header_detects_tamper(void)
 {
     printf("\n[test_page_header_detects_tamper]\n");
-    LargeWalPageHeader hdr;
+    WalPageHeader hdr;
     memset(&hdr, 0, sizeof(hdr));
     hdr.id.file_type = FILETYPE_LARGE_WAL_PAGE;
-    hdr.content_lsn  = 42;
+    hdr.start_lsn    = 42;
 
-    uint8_t buf[32];
+    uint8_t buf[LARGE_WAL_PAGE_HEADER_ON_DISK_SIZE];
     large_wal_page_header_serialize(&hdr, buf);
-    buf[9] ^= 0x01;   /* flip a byte inside content_lsn */
+    buf[9] ^= 0x01;   /* flip a byte inside start_lsn */
 
-    LargeWalPageHeader out;
+    WalPageHeader out;
     int rc = large_wal_page_header_deserialize(buf, &out);
     CHECK(rc == MYDB_ERR_BAD_CHECKSUM, "corrupted page header fails checksum verification");
 }
@@ -65,16 +69,44 @@ static void test_page_header_detects_tamper(void)
 static void test_page_header_wrong_file_type(void)
 {
     printf("\n[test_page_header_wrong_file_type]\n");
-    LargeWalPageHeader hdr;
+    WalPageHeader hdr;
     memset(&hdr, 0, sizeof(hdr));
     hdr.id.file_type = FILETYPE_LARGE_WAL_SEGMENT;   /* wrong type on purpose */
 
-    uint8_t buf[32];
+    uint8_t buf[LARGE_WAL_PAGE_HEADER_ON_DISK_SIZE];
     large_wal_page_header_serialize(&hdr, buf);
 
-    LargeWalPageHeader out;
+    WalPageHeader out;
     int rc = large_wal_page_header_deserialize(buf, &out);
     CHECK(rc == MYDB_ERR_BAD_FILE_TYPE, "a page header stamped with the wrong file_type is rejected");
+}
+
+/* A normal_wal page header must not deserialize as a LARGE_WAL one and
+ * vice versa — the single thing that still distinguishes the two now
+ * that they share a struct and byte layout. */
+static void test_page_header_types_do_not_cross(void)
+{
+    printf("\n[test_page_header_types_do_not_cross]\n");
+    WalPageHeader hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.start_lsn = 7;
+
+    uint8_t buf[LARGE_WAL_PAGE_HEADER_ON_DISK_SIZE];
+    WalPageHeader out;
+
+    hdr.id.file_type = FILETYPE_LARGE_WAL_PAGE;
+    large_wal_page_header_serialize(&hdr, buf);
+    CHECK(wal_page_header_deserialize(buf, &out) == MYDB_ERR_BAD_FILE_TYPE,
+          "a LARGE_WAL page is rejected by normal_wal's deserializer");
+    CHECK(large_wal_page_header_deserialize(buf, &out) == MYDB_OK,
+          "...and accepted by LARGE_WAL's own");
+
+    hdr.id.file_type = FILETYPE_WAL_PAGE;
+    wal_page_header_serialize(&hdr, buf);
+    CHECK(large_wal_page_header_deserialize(buf, &out) == MYDB_ERR_BAD_FILE_TYPE,
+          "a normal_wal page is rejected by LARGE_WAL's deserializer");
+    CHECK(wal_page_header_deserialize(buf, &out) == MYDB_OK,
+          "...and accepted by normal_wal's own");
 }
 
 static void test_segment_header_round_trip(void)
@@ -153,6 +185,7 @@ int main(void)
     test_page_header_round_trip();
     test_page_header_detects_tamper();
     test_page_header_wrong_file_type();
+    test_page_header_types_do_not_cross();
     test_segment_header_round_trip();
     test_segment_header_detects_tamper();
     test_segment_header_wrong_file_type();
