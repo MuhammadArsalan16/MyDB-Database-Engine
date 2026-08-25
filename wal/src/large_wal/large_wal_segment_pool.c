@@ -268,12 +268,55 @@ int large_wal_segment_pool_mark_done(LargeWalSegmentPool *pool, WalWorker *worke
     return MYDB_OK;
 }
 
+/* Overwrites this slot's content pages (1..PAGES_PER_FILE-1) with
+ * zeros. The file is posix_fallocate'd once at creation and never
+ * truncated, so without this the previous segment's pages stay
+ * physically present — and they carry valid magic/version/file_type/CRC,
+ * having been legitimately written once. tail_scan, which walks pages
+ * until one fails to deserialize, would sail straight past the next
+ * generation's tail into them. Zeroing is what makes an unwritten page
+ * actually *look* unwritten.
+ *
+ * Chunked rather than one 2MB buffer: this runs once per segment on the
+ * archiver's path, so ~32 pwrites of 64KB costs nothing that matters. */
+static int zero_content_pages(int fd)
+{
+    enum { CHUNK = 64 * 1024 };
+    static const uint8_t zeros[CHUNK];   /* .bss — never written to */
+
+    off_t  pos = PAGE_SIZE;              /* page 0 is the header; keep it */
+    off_t  end = LARGE_WAL_SEGMENT_FILE_SIZE;
+
+    while (pos < end) {
+        size_t n = (size_t)((end - pos) < CHUNK ? (end - pos) : CHUNK);
+        if (pwrite_all(fd, zeros, n, pos) != MYDB_OK) return MYDB_ERR;
+        pos += (off_t)n;
+    }
+    return MYDB_OK;
+}
+
 int large_wal_segment_pool_free_slot(LargeWalSegmentPool *pool, uint32_t slot_index)
 {
     if (!pool || slot_index >= LARGE_WAL_SEGMENT_POOL_SLOTS) return MYDB_ERR;
 
     LargeWalSlot *slot = &pool->slots[slot_index];
     if (slot->header.state != LSEG_DONE) return MYDB_ERR;
+
+    /* Zero the content, and make that durable, BEFORE the header says
+     * LSEG_FREE. The two writes must not share one flush: they could
+     * then reach disk in either order, and page 0 landing first would
+     * publish the slot as reusable while the old segment's pages are
+     * still there — reviving exactly the bug this zeroing exists to
+     * kill. Two fsyncs is affordable here precisely because freeing is
+     * the archiver's cold path, once per segment.
+     *
+     * A crash anywhere before step 2 completes leaves the header still
+     * LSEG_DONE, so claim_next (which demands LSEG_FREE) can't hand the
+     * slot out and nothing ever scans it — and the content is already
+     * durable in the holding area, since copy_out fsyncs that before it
+     * calls us. */
+    if (zero_content_pages(slot->fd) != MYDB_OK) return MYDB_ERR;
+    if (fdatasync(slot->fd) < 0) return MYDB_ERR;
 
     /* Local copy, committed only on success — see claim_next's note. */
     LargeWalSegmentHeader next = slot->header;

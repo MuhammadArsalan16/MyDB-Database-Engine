@@ -208,7 +208,16 @@ int wal_segment_pool_read_segment(WalSegmentPool *pool, uint32_t slot_index,
  * wal_page_header_deserialize, stopping at the first invalid/unwritten
  * page. *out_data_pages gets the count of valid pages found. Called
  * internally by wal_segment_pool_init() for any slot reloaded in
- * SEG_ACTIVE state; exposed publicly so tests can exercise it directly. */
+ * SEG_ACTIVE state; exposed publicly so tests can exercise it directly.
+ *
+ * Sound here only because this pool has no free/reuse path yet: a slot
+ * is claimed once and never released, so a page can never hold a
+ * previous generation's content. Whoever adds one (the Normal WAL
+ * Archiver) MUST zero a slot's content pages before releasing it —
+ * stale pages deserialize perfectly well, so this walk would run past
+ * the live tail and report the older segment's count. large_wal hit
+ * exactly that; see large_wal_segment_pool_free_slot for the fix and
+ * the write-ordering it needs. */
 int wal_segment_pool_tail_scan(WalSegmentPool *pool, uint32_t slot_index,
                                 uint32_t *out_data_pages);
 

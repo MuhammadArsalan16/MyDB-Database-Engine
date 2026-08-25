@@ -375,6 +375,107 @@ static void test_read_segment_whole_file(void)
     cleanup();
 }
 
+static void test_free_slot_zeroes_content(void)
+{
+    printf("\n[test_free_slot_zeroes_content]\n");
+    cleanup();
+
+    LargeWalSegmentPool pool;
+    CHECK(large_wal_segment_pool_init(&pool, TEST_WAL_DIR, 1, NULL) == MYDB_OK, "init succeeds");
+
+    uint32_t slot_index;
+    large_wal_segment_pool_claim_next(&pool, &slot_index);
+
+    uint8_t page_buf[PAGE_SIZE];
+    for (uint32_t p = 1; p <= 5; p++) {
+        build_page(page_buf, 500 + p, 0xE1);
+        large_wal_segment_pool_write_page(&pool, slot_index, p, page_buf);
+    }
+
+    large_wal_segment_pool_mark_done(&pool, NULL, slot_index, 505, 5);
+    CHECK(large_wal_segment_pool_free_slot(&pool, slot_index) == MYDB_OK, "free_slot succeeds");
+    CHECK(pool.slots[slot_index].header.state == LSEG_FREE, "the slot is LSEG_FREE");
+
+    /* Every former content page must now read back as zeros — which is
+     * exactly what makes an unwritten page fail deserialize, and so what
+     * lets tail_scan find the real tail of the NEXT generation. */
+    uint8_t read_buf[PAGE_SIZE];
+    int all_zero = 1, all_reject = 1;
+    for (uint32_t p = 1; p <= 5; p++) {
+        large_wal_segment_pool_read_page(&pool, slot_index, p, read_buf);
+        for (uint32_t i = 0; i < PAGE_SIZE; i++)
+            if (read_buf[i] != 0) { all_zero = 0; break; }
+
+        WalPageHeader hdr;
+        if (large_wal_page_header_deserialize(read_buf, &hdr) == MYDB_OK) all_reject = 0;
+    }
+    CHECK(all_zero,   "every content page written before the free reads back as zeros");
+    CHECK(all_reject, "and none of them deserializes any more");
+
+    large_wal_segment_pool_shutdown(&pool);
+    cleanup();
+}
+
+/* The bug this zeroing exists to kill, driven end to end.
+ *
+ * A segment only rolls over when full, so a slot's previous generation
+ * has essentially always written every page — while the generation that
+ * crashes is mid-fill. Stale pages carry valid magic/version/file_type
+ * and a valid CRC, so without zeroing tail_scan walks straight past the
+ * live tail and reports the OLD generation's count. */
+static void test_reused_slot_does_not_inherit_stale_pages(void)
+{
+    printf("\n[test_reused_slot_does_not_inherit_stale_pages]\n");
+    cleanup();
+
+    LargeWalSegmentPool pool;
+    CHECK(large_wal_segment_pool_init(&pool, TEST_WAL_DIR, 1, NULL) == MYDB_OK, "init succeeds");
+
+    /* Generation 1: claim slot 0, write 20 pages, finish it, release it. */
+    uint32_t slot_index;
+    large_wal_segment_pool_claim_next(&pool, &slot_index);
+    uint32_t first_slot = slot_index;
+
+    uint8_t page_buf[PAGE_SIZE];
+    for (uint32_t p = 1; p <= 20; p++) {
+        build_page(page_buf, 1000 + p, 0xA1);
+        large_wal_segment_pool_write_page(&pool, first_slot, p, page_buf);
+    }
+    large_wal_segment_pool_mark_done(&pool, NULL, first_slot, 1020, 20);
+    large_wal_segment_pool_free_slot(&pool, first_slot);
+
+    /* Round-robin over 4 slots brings us back to the same file. */
+    uint32_t reused;
+    for (int i = 0; i < LARGE_WAL_SEGMENT_POOL_SLOTS; i++)
+        large_wal_segment_pool_claim_next(&pool, &reused);
+    CHECK(reused == first_slot, "round-robin returns to the same physical slot");
+
+    /* Generation 2: only 3 pages, then "crash" — no mark_done, so the
+     * on-disk data_pages stays 0 and reload must reconstruct it. */
+    for (uint32_t p = 1; p <= 3; p++) {
+        build_page(page_buf, 2000 + p, 0xB2);
+        large_wal_segment_pool_write_page(&pool, reused, p, page_buf);
+    }
+    large_wal_segment_pool_shutdown(&pool);
+
+    LargeWalSegmentPool reloaded;
+    CHECK(large_wal_segment_pool_init(&reloaded, TEST_WAL_DIR, 1, NULL) == MYDB_OK,
+          "post-crash reload succeeds");
+    CHECK(reloaded.slots[reused].header.state == LSEG_ACTIVE,
+          "the crashed slot reloads as LSEG_ACTIVE");
+    CHECK(reloaded.slots[reused].header.data_pages == 3,
+          "tail_scan recovers 3 — the NEW generation's count, not the old 20 "
+          "(without free_slot's zeroing this reports 20)");
+
+    uint32_t rescanned = 0;
+    CHECK(large_wal_segment_pool_tail_scan(&reloaded, reused, &rescanned) == MYDB_OK &&
+          rescanned == 3,
+          "a direct tail_scan agrees: the stale pages beyond the tail are gone");
+
+    large_wal_segment_pool_shutdown(&reloaded);
+    cleanup();
+}
+
 /* ------------------------------------------------------------------ */
 
 int main(void)
@@ -390,6 +491,8 @@ int main(void)
     test_write_spans_multiple_pages();
     test_write_rolls_to_new_segment();
     test_read_segment_whole_file();
+    test_free_slot_zeroes_content();
+    test_reused_slot_does_not_inherit_stale_pages();
 
     printf("\nResults: %d/%d passed\n", tests_passed, tests_run);
     return (tests_passed == tests_run) ? 0 : 1;

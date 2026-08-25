@@ -146,9 +146,17 @@ int large_wal_segment_pool_mark_done(LargeWalSegmentPool *pool, WalWorker *worke
 /* LSEG_DONE -> LSEG_FREE: called by the archiver only after the
  * holding-area copy's fsync has confirmed (impl doc §10.1's ordering
  * rule — a slot must never be marked FREE/reusable before that, or a
- * segment_no could transiently exist validly in two places). Zeroes
- * segment_no/start_lsn/end_lsn/data_pages, rewrites + fdatasyncs the
- * header. Returns MYDB_ERR if the slot isn't currently LSEG_DONE. */
+ * segment_no could transiently exist validly in two places).
+ *
+ * Also overwrites the slot's content pages with zeros, so the segment
+ * about to be handed out doesn't inherit the previous one's pages —
+ * they would otherwise still be there, valid magic and CRC intact, for
+ * tail_scan to miscount. That happens strictly before the header flips
+ * to LSEG_FREE, with its own fdatasync in between: see the source for
+ * why the two writes must not share a flush.
+ *
+ * Zeroes segment_no/start_lsn/end_lsn/data_pages, rewrites + fdatasyncs
+ * the header. Returns MYDB_ERR if the slot isn't currently LSEG_DONE. */
 int large_wal_segment_pool_free_slot(LargeWalSegmentPool *pool, uint32_t slot_index);
 
 /* Scans page_no = 1, 2, ... in the given slot's file, validating each via
@@ -156,7 +164,17 @@ int large_wal_segment_pool_free_slot(LargeWalSegmentPool *pool, uint32_t slot_in
  * unwritten page. *out_data_pages gets the count of valid pages found.
  * Called internally by large_wal_segment_pool_init() for any slot
  * reloaded in LSEG_ACTIVE state; exposed publicly so tests can exercise
- * it directly. */
+ * it directly.
+ *
+ * "Stop at the first page that doesn't deserialize" is only a sound
+ * definition of the tail BECAUSE free_slot zeroes a slot's content
+ * before releasing it. A page left behind by a previous generation
+ * deserializes perfectly well — same magic, same version, same
+ * file_type, valid CRC — so without that zeroing this walks straight
+ * past the live tail and reports the *older* segment's page count.
+ * Anything that later gains its own free/reuse path (normal_wal's
+ * segment pool, once the Normal WAL Archiver exists) has to zero on
+ * release too, or inherits the same bug. */
 int large_wal_segment_pool_tail_scan(LargeWalSegmentPool *pool, uint32_t slot_index,
                                       uint32_t *out_data_pages);
 
