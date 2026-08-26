@@ -24,6 +24,15 @@ static int fd_is_valid(int fd)
     return fcntl(fd, F_GETFD) != -1 || errno != EBADF;
 }
 
+/* The registry is a linked list rather than an array now — per-node
+ * mutexes need addresses that realloc can't move (large_wal_registry.h)
+ * — so these tests walk it instead of indexing it. Used to neutralise
+ * synthetic fds before shutdown, which would otherwise close(42). */
+static void clear_all_fds(LargeWalRegistry *reg)
+{
+    for (LargeWalRegistryNode *n = reg->head; n; n = n->next) n->fd = -1;
+}
+
 static void test_register_insert_and_update(void)
 {
     printf("\n[test_register_insert_and_update]\n");
@@ -41,7 +50,7 @@ static void test_register_insert_and_update(void)
     CHECK(reg.count == 1, "count stays 1 -- update, not a second insert");
     CHECK(large_wal_registry_lookup(&reg, 7, &fd) == MYDB_OK && fd == 99, "lookup now returns the updated fd");
 
-    reg.entries[0].fd = -1;   /* avoid a real close() on shutdown for this synthetic fd */
+    clear_all_fds(&reg);   /* avoid a real close() on shutdown for these synthetic fds */
     large_wal_registry_shutdown(&reg);
 }
 
@@ -57,7 +66,7 @@ static void test_lookup_miss(void)
     CHECK(large_wal_registry_lookup(&reg, 999, &fd) == MYDB_ERR_NOT_FOUND,
           "looking up a segment_no that was never registered misses");
 
-    reg.entries[0].fd = -1;
+    clear_all_fds(&reg);
     large_wal_registry_shutdown(&reg);
 }
 
@@ -72,20 +81,63 @@ static void test_remove(void)
     large_wal_registry_register(&reg, 3, 30, 0);
     CHECK(reg.count == 3, "3 entries present before remove");
 
-    CHECK(large_wal_registry_remove(&reg, 2) == MYDB_OK, "remove succeeds");
+    int removed_fd = -1, removed_owns = -1;
+    CHECK(large_wal_registry_remove(&reg, 2, &removed_fd, &removed_owns) == MYDB_OK, "remove succeeds");
     CHECK(reg.count == 2, "count drops to 2");
+    CHECK(removed_fd == 20 && removed_owns == 0,
+          "remove hands the fd and owns_fd back -- the caller can no longer look them up");
 
     int fd;
     CHECK(large_wal_registry_lookup(&reg, 2, &fd) == MYDB_ERR_NOT_FOUND, "segment 2 is gone");
     CHECK(large_wal_registry_lookup(&reg, 1, &fd) == MYDB_OK && fd == 10, "segment 1 survives untouched");
     CHECK(large_wal_registry_lookup(&reg, 3, &fd) == MYDB_OK && fd == 30, "segment 3 survives untouched");
 
-    CHECK(large_wal_registry_remove(&reg, 999) == MYDB_OK,
+    int absent_fd = -1;
+    CHECK(large_wal_registry_remove(&reg, 999, &absent_fd, NULL) == MYDB_OK,
           "removing a segment_no that isn't present is a harmless no-op");
     CHECK(reg.count == 2, "count unchanged by the no-op remove");
+    CHECK(absent_fd == -1, "a no-op remove leaves the out-fd untouched");
 
-    reg.entries[0].fd = -1;
-    reg.entries[1].fd = -1;
+    clear_all_fds(&reg);
+    large_wal_registry_shutdown(&reg);
+}
+
+/* The locking contract itself: acquire() hands back the same fd lookup()
+ * would, holds it until release(), and misses cleanly on an unknown
+ * segment_no without leaving the list read lock held (which a later
+ * register(), needing the write lock, would deadlock on). */
+static void test_acquire_release(void)
+{
+    printf("\n[test_acquire_release]\n");
+
+    LargeWalRegistry reg;
+    large_wal_registry_init(&reg);
+    large_wal_registry_register(&reg, 5, 55, 0);
+
+    LargeWalRegistryNode *node = NULL;
+    int fd = -1;
+    CHECK(large_wal_registry_acquire(&reg, 5, &node, &fd) == MYDB_OK && fd == 55,
+          "acquire resolves the fd");
+    CHECK(node != NULL, "acquire hands back the node to release");
+
+    CHECK(large_wal_registry_set_fd(node, 77, /*owns_fd=*/0) == MYDB_OK,
+          "set_fd repoints an already-held node");
+    large_wal_registry_release(&reg, node);
+
+    CHECK(large_wal_registry_lookup(&reg, 5, &fd) == MYDB_OK && fd == 77,
+          "the repointed fd is what later lookups see");
+
+    LargeWalRegistryNode *miss_node = (LargeWalRegistryNode *)0x1;
+    CHECK(large_wal_registry_acquire(&reg, 404, &miss_node, &fd) == MYDB_ERR_NOT_FOUND,
+          "acquiring an unregistered segment_no misses");
+    CHECK(miss_node == NULL, "a missed acquire nulls the out-node rather than leaving it stale");
+
+    /* Would block forever if the missed acquire above had leaked the
+     * read lock -- register needs the write lock. */
+    CHECK(large_wal_registry_register(&reg, 6, 66, 0) == MYDB_OK,
+          "a write-locking call still works after a missed acquire -- no leaked read lock");
+
+    clear_all_fds(&reg);
     large_wal_registry_shutdown(&reg);
 }
 
@@ -121,6 +173,7 @@ int main(void)
     test_register_insert_and_update();
     test_lookup_miss();
     test_remove();
+    test_acquire_release();
     test_shutdown_closes_only_owned_fds();
 
     printf("\nResults: %d/%d passed\n", tests_passed, tests_run);

@@ -10,6 +10,10 @@
 #include <errno.h>
 #include <sys/stat.h>
 
+/* Defined below next to the public lookup() it backs — declared here so
+ * insert()'s duplicate check can reach it without re-locking. */
+static int lookup_locked(const LargeWalIndex *idx, uint64_t content_lsn, LargeWalIndexEntry *out);
+
 static int pwrite_all(int fd, const void *buf, size_t n, off_t offset)
 {
     ssize_t written = pwrite(fd, buf, n, offset);
@@ -133,6 +137,7 @@ int large_wal_index_open(LargeWalIndex *idx, const char *wal_dir)
     if (!idx || !wal_dir) return MYDB_ERR;
     memset(idx, 0, sizeof(*idx));
     idx->fd = -1;
+    if (pthread_mutex_init(&idx->lock, NULL) != 0) return MYDB_ERR;
     snprintf(idx->path, sizeof(idx->path), "%s/large_wal_index.mydb", wal_dir);
 
     int fd = open(idx->path, O_RDWR);
@@ -210,6 +215,7 @@ int large_wal_index_close(LargeWalIndex *idx)
     idx->count            = 0;
     idx->capacity         = 0;
     idx->bucket_capacity  = 0;
+    pthread_mutex_destroy(&idx->lock);
     return MYDB_OK;
 }
 
@@ -217,26 +223,47 @@ int large_wal_index_insert(LargeWalIndex *idx, const LargeWalIndexEntry *e)
 {
     if (!idx || !e) return MYDB_ERR;
 
+    pthread_mutex_lock(&idx->lock);
+
     LargeWalIndexEntry existing;
-    if (large_wal_index_lookup(idx, e->content_lsn, &existing) == MYDB_OK)
+    if (lookup_locked(idx, e->content_lsn, &existing) == MYDB_OK) {
+        pthread_mutex_unlock(&idx->lock);
         return MYDB_ERR_DUPLICATE;
+    }
 
     if (idx->count == idx->capacity) {
         uint32_t new_cap = idx->capacity ? idx->capacity * 2 : 8;
         LargeWalIndexEntry *ne = realloc(idx->entries, (size_t)new_cap * sizeof(LargeWalIndexEntry));
-        if (!ne) return MYDB_ERR;
+        if (!ne) {
+            pthread_mutex_unlock(&idx->lock);
+            return MYDB_ERR;
+        }
         idx->entries  = ne;
         idx->capacity = new_cap;
     }
     idx->entries[idx->count++] = *e;
 
-    if (rebuild_hash_map(idx) != MYDB_OK) return MYDB_ERR;
-    return idx_save(idx);
+    int rc = (rebuild_hash_map(idx) != MYDB_OK) ? MYDB_ERR : idx_save(idx);
+
+    pthread_mutex_unlock(&idx->lock);
+    return rc;
 }
 
-int large_wal_index_lookup(const LargeWalIndex *idx, uint64_t content_lsn, LargeWalIndexEntry *out)
+int large_wal_index_lookup(LargeWalIndex *idx, uint64_t content_lsn, LargeWalIndexEntry *out)
 {
-    if (!idx || !out || idx->bucket_capacity == 0) return MYDB_ERR_NOT_FOUND;
+    if (!idx || !out) return MYDB_ERR_NOT_FOUND;
+
+    pthread_mutex_lock(&idx->lock);
+    int rc = lookup_locked(idx, content_lsn, out);
+    pthread_mutex_unlock(&idx->lock);
+    return rc;
+}
+
+/* The lookup body, minus the locking — insert() needs its duplicate
+ * check without re-entering a non-recursive mutex it already holds. */
+static int lookup_locked(const LargeWalIndex *idx, uint64_t content_lsn, LargeWalIndexEntry *out)
+{
+    if (idx->bucket_capacity == 0) return MYDB_ERR_NOT_FOUND;
 
     uint32_t b     = hash_lsn(content_lsn, idx->bucket_capacity);
     uint32_t start = b;
@@ -257,6 +284,8 @@ int large_wal_index_delete_by_segment(LargeWalIndex *idx, uint64_t segment_no)
 {
     if (!idx) return MYDB_ERR;
 
+    pthread_mutex_lock(&idx->lock);
+
     uint32_t w = 0;
     for (uint32_t r = 0; r < idx->count; r++) {
         if (idx->entries[r].segment_no != segment_no)
@@ -264,6 +293,8 @@ int large_wal_index_delete_by_segment(LargeWalIndex *idx, uint64_t segment_no)
     }
     idx->count = w;
 
-    if (rebuild_hash_map(idx) != MYDB_OK) return MYDB_ERR;
-    return idx_save(idx);
+    int rc = (rebuild_hash_map(idx) != MYDB_OK) ? MYDB_ERR : idx_save(idx);
+
+    pthread_mutex_unlock(&idx->lock);
+    return rc;
 }

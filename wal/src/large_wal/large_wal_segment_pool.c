@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 
 /* ------------------------------------------------------------------
  * Internal helpers — same shape as normal_wal/wal_segment_pool.c's own
@@ -42,6 +43,45 @@ static int ensure_dir(const char *path)
 static int page_no_valid(uint32_t page_no)
 {
     return page_no >= 1 && page_no < LARGE_WAL_SEGMENT_PAGES_PER_FILE;
+}
+
+/* ------------------------------------------------------------------
+ * Locked content writes.
+ *
+ * Every pwrite into a slot's *content* pages goes through here, so it
+ * happens under that segment's registry node lock. Without it a
+ * large_wal_get preading the same page mid-pwrite could deserialize a
+ * half-updated 16KB page and report a spurious checksum failure — the
+ * case do_write's read-back-and-rewrite of a partially filled tail page
+ * makes real rather than theoretical.
+ *
+ * Two fallbacks write unlocked, and both are safe for the same reason:
+ * a reader can only ever reach a segment *through* the registry, so a
+ * pool with no registry, or a segment not registered in one, has no
+ * possible concurrent reader to tear a page for.
+ * ------------------------------------------------------------------ */
+static int locked_pwrite(LargeWalSegmentPool *pool, uint32_t slot_index,
+                          const void *buf, size_t n, off_t offset)
+{
+    int fd = pool->slots[slot_index].fd;
+
+    if (!pool->registry) return pwrite_all(fd, buf, n, offset);
+
+    /* pool->lock and the registry lock are taken in sequence, never
+     * nested — see claim_next's note on why nesting them the other way
+     * would close a cycle against copy_out. */
+    pthread_mutex_lock(&pool->lock);
+    uint64_t segment_no = pool->slots[slot_index].header.segment_no;
+    pthread_mutex_unlock(&pool->lock);
+
+    LargeWalRegistryNode *node = NULL;
+    int                   reg_fd = -1;
+    if (large_wal_registry_acquire(pool->registry, segment_no, &node, &reg_fd) != MYDB_OK)
+        return pwrite_all(fd, buf, n, offset);
+
+    int rc = pwrite_all(fd, buf, n, offset);
+    large_wal_registry_release(pool->registry, node);
+    return rc;
 }
 
 /* ------------------------------------------------------------------
@@ -131,6 +171,16 @@ int large_wal_segment_pool_init(LargeWalSegmentPool *pool, const char *wal_dir,
     if (ensure_dir(wal_dir) != 0) return MYDB_ERR;
 
     memset(pool, 0, sizeof(*pool));
+    if (pthread_mutex_init(&pool->lock, NULL) != 0) return MYDB_ERR;
+    if (pthread_cond_init(&pool->slot_done_cv, NULL) != 0) {
+        pthread_mutex_destroy(&pool->lock);
+        return MYDB_ERR;
+    }
+    if (pthread_cond_init(&pool->slot_free_cv, NULL) != 0) {
+        pthread_cond_destroy(&pool->slot_done_cv);
+        pthread_mutex_destroy(&pool->lock);
+        return MYDB_ERR;
+    }
     snprintf(pool->wal_dir, sizeof(pool->wal_dir), "%s", wal_dir);
     pool->partition_id = partition_id;
     pool->registry     = registry;
@@ -176,12 +226,25 @@ int large_wal_segment_pool_init(LargeWalSegmentPool *pool, const char *wal_dir,
 int large_wal_segment_pool_shutdown(LargeWalSegmentPool *pool)
 {
     if (!pool) return MYDB_ERR;
+
+    /* Wake anything still blocked in claim_next_wait BEFORE closing the
+     * fds out from under it. shutting_down is what turns that wake into
+     * a clean MYDB_ERR rather than another trip round the retry loop. */
+    pthread_mutex_lock(&pool->lock);
+    pool->shutting_down = 1;
+    pthread_cond_broadcast(&pool->slot_free_cv);
+    pthread_cond_broadcast(&pool->slot_done_cv);
+    pthread_mutex_unlock(&pool->lock);
+
     for (uint32_t i = 0; i < LARGE_WAL_SEGMENT_POOL_SLOTS; i++) {
         if (pool->slots[i].fd >= 0) {
             close(pool->slots[i].fd);
             pool->slots[i].fd = -1;
         }
     }
+    pthread_cond_destroy(&pool->slot_free_cv);
+    pthread_cond_destroy(&pool->slot_done_cv);
+    pthread_mutex_destroy(&pool->lock);
     return MYDB_OK;
 }
 
@@ -189,14 +252,32 @@ int large_wal_segment_pool_shutdown(LargeWalSegmentPool *pool)
  * Claiming
  * ------------------------------------------------------------------ */
 
-int large_wal_segment_pool_claim_next(LargeWalSegmentPool *pool, uint32_t *out_slot_index)
+/* The claim itself, with pool->lock ALREADY HELD by the caller.
+ *
+ * Split out of claim_next so claim_next_wait can retry it directly
+ * inside the same locked region it waits in. Doing the retry from
+ * outside the lock instead would open a gap between "the claim failed"
+ * and "we started waiting", and a free_slot landing in that gap would
+ * broadcast to nobody -- the writer would then sit out its whole
+ * timeout despite a slot being free the entire time. Not a deadlock,
+ * but a multi-millisecond stall for no reason.
+ *
+ * Returns MYDB_ERR_FULL when the target slot simply isn't free yet
+ * (retryable -- this is what claim_next_wait waits on) and MYDB_ERR for
+ * a real I/O failure (not retryable). claim_next collapses both back to
+ * MYDB_ERR to keep its long-standing public contract unchanged.
+ *
+ * On success the two out-params carry what the caller needs to register
+ * AFTER releasing pool->lock -- registering here would take the
+ * registry write lock while holding pool->lock, the one nesting the
+ * global lock order forbids. */
+static int claim_next_locked(LargeWalSegmentPool *pool, uint32_t *out_slot_index,
+                              uint64_t *out_segment_no, int *out_fd)
 {
-    if (!pool || !out_slot_index) return MYDB_ERR;
-
     uint32_t target = (uint32_t)(pool->next_segment_no % LARGE_WAL_SEGMENT_POOL_SLOTS);
     LargeWalSlot *slot = &pool->slots[target];
 
-    if (slot->header.state != LSEG_FREE) return MYDB_ERR;
+    if (slot->header.state != LSEG_FREE) return MYDB_ERR_FULL;
 
     /* Mutate a local copy, not slot->header: if the write below fails we
      * must leave the in-memory header exactly as it was, or memory and
@@ -221,19 +302,117 @@ int large_wal_segment_pool_claim_next(LargeWalSegmentPool *pool, uint32_t *out_s
 
     large_wal_segment_header_deserialize(page_buf, &slot->header);
 
+    *out_segment_no = slot->header.segment_no;
+    *out_fd         = slot->fd;
+
+    pool->next_segment_no++;
+
+    *out_slot_index = target;
+    return MYDB_OK;
+}
+
+/* Registers a freshly claimed segment. Split out purely so claim_next
+ * and claim_next_wait share it — both must call it with pool->lock
+ * already RELEASED. */
+static int register_claimed(LargeWalSegmentPool *pool, uint64_t claimed_segment_no,
+                             int claimed_fd)
+{
     /* The segment_no now exists, so make it resolvable immediately —
      * see the header's doc comment for why this lives here rather than
      * in whoever called claim_next. owns_fd = 0: this fd belongs to the
      * pool's own slot and is closed by pool shutdown, never by the
-     * registry. */
+     * registry.
+     *
+     * Deliberately outside pool->lock: this takes the registry's WRITE
+     * lock, and copy_out holds a registry node lock while calling
+     * free_slot, which takes pool->lock — nesting these the other way
+     * round would close that cycle. Safe to run unlocked because the
+     * segment is ACTIVE but unregistered for exactly this window, and
+     * nothing can be asking for it yet: no index entry names it until
+     * the writer has actually written into it. */
     if (pool->registry &&
-        large_wal_registry_register(pool->registry, slot->header.segment_no,
-                                     slot->fd, /*owns_fd=*/0) != MYDB_OK)
+        large_wal_registry_register(pool->registry, claimed_segment_no,
+                                     claimed_fd, /*owns_fd=*/0) != MYDB_OK)
         return MYDB_ERR;
 
-    pool->next_segment_no++;
-    *out_slot_index = target;
     return MYDB_OK;
+}
+
+int large_wal_segment_pool_claim_next(LargeWalSegmentPool *pool, uint32_t *out_slot_index)
+{
+    if (!pool || !out_slot_index) return MYDB_ERR;
+
+    /* pool->lock covers everything through the header commit, then is
+     * released BEFORE registering — see the header's doc comment for
+     * why those two must not nest. */
+    uint64_t claimed_segment_no = 0;
+    int      claimed_fd         = -1;
+
+    pthread_mutex_lock(&pool->lock);
+    int rc = claim_next_locked(pool, out_slot_index, &claimed_segment_no, &claimed_fd);
+    pthread_mutex_unlock(&pool->lock);
+
+    /* Collapsed back to plain MYDB_ERR: callers and tests have checked
+     * for exactly that since Phase 2, and "no free slot" vs "write
+     * failed" is a distinction only claim_next_wait needs. */
+    if (rc != MYDB_OK) return MYDB_ERR;
+
+    return register_claimed(pool, claimed_segment_no, claimed_fd);
+}
+
+/* now + ms, as an absolute CLOCK_REALTIME deadline —
+ * pthread_cond_timedwait wants absolute, not a duration, precisely so a
+ * spurious wakeup can't restart the clock. */
+static void deadline_from_now(struct timespec *ts, uint32_t ms)
+{
+    clock_gettime(CLOCK_REALTIME, ts);
+    ts->tv_sec  += (time_t)(ms / 1000u);
+    ts->tv_nsec += (long)(ms % 1000u) * 1000000L;
+    if (ts->tv_nsec >= 1000000000L) { ts->tv_sec++; ts->tv_nsec -= 1000000000L; }
+}
+
+int large_wal_segment_pool_claim_next_wait(LargeWalSegmentPool *pool,
+                                            uint32_t timeout_ms,
+                                            uint32_t *out_slot_index)
+{
+    if (!pool || !out_slot_index) return MYDB_ERR;
+
+    struct timespec deadline;
+    deadline_from_now(&deadline, timeout_ms);
+
+    uint64_t claimed_segment_no = 0;
+    int      claimed_fd         = -1;
+    int      rc;
+
+    pthread_mutex_lock(&pool->lock);
+    for (;;) {
+        if (pool->shutting_down) {
+            pthread_mutex_unlock(&pool->lock);
+            return MYDB_ERR;
+        }
+
+        rc = claim_next_locked(pool, out_slot_index, &claimed_segment_no, &claimed_fd);
+        if (rc != MYDB_ERR_FULL) break;   /* claimed it, or failed for real */
+
+        /* Every slot is still in use. Sleep until free_slot broadcasts,
+         * then go round and try again — the broadcast only means "some
+         * slot changed", not "the one slot this pool wants next", so a
+         * retry is required rather than assuming success.
+         *
+         * cond_timedwait releases pool->lock while it sleeps, which is
+         * what lets the archiver take it inside free_slot. And this
+         * thread holds no registry lock at all, so copy_out's
+         * reg -> node -> pool path stays clear. */
+        if (pthread_cond_timedwait(&pool->slot_free_cv, &pool->lock, &deadline) == ETIMEDOUT) {
+            pthread_mutex_unlock(&pool->lock);
+            return MYDB_ERR;
+        }
+    }
+    pthread_mutex_unlock(&pool->lock);
+
+    if (rc != MYDB_OK) return MYDB_ERR;
+
+    return register_claimed(pool, claimed_segment_no, claimed_fd);
 }
 
 int large_wal_segment_pool_mark_done(LargeWalSegmentPool *pool, WalWorker *worker,
@@ -242,7 +421,17 @@ int large_wal_segment_pool_mark_done(LargeWalSegmentPool *pool, WalWorker *worke
     if (!pool || slot_index >= LARGE_WAL_SEGMENT_POOL_SLOTS) return MYDB_ERR;
 
     LargeWalSlot *slot = &pool->slots[slot_index];
-    if (slot->header.state != LSEG_ACTIVE) return MYDB_ERR;
+
+    /* pool->lock only — this rewrites the segment *header* (page 0),
+     * which no reader ever touches: large_wal_get resolves an fd through
+     * the registry and preads content pages by page_no. So there is
+     * nothing here for a node lock to protect against. */
+    pthread_mutex_lock(&pool->lock);
+
+    if (slot->header.state != LSEG_ACTIVE) {
+        pthread_mutex_unlock(&pool->lock);
+        return MYDB_ERR;
+    }
 
     /* Local copy, committed to slot->header only after the write and
      * sync both succeed — see claim_next's own note on why mutating
@@ -257,15 +446,29 @@ int large_wal_segment_pool_mark_done(LargeWalSegmentPool *pool, WalWorker *worke
     memset(page_buf, 0, PAGE_SIZE);
     large_wal_segment_header_serialize(&next, page_buf);
 
-    if (pwrite_all(slot->fd, page_buf, PAGE_SIZE, 0) != MYDB_OK) return MYDB_ERR;
-    if (worker) {
-        if (wal_worker_async_fdatasync(worker, slot->fd) != MYDB_OK) return MYDB_ERR;
+    int rc = MYDB_OK;
+    if (pwrite_all(slot->fd, page_buf, PAGE_SIZE, 0) != MYDB_OK) {
+        rc = MYDB_ERR;
+    } else if (worker) {
+        if (wal_worker_async_fdatasync(worker, slot->fd) != MYDB_OK) rc = MYDB_ERR;
     } else {
-        if (fdatasync(slot->fd) < 0) return MYDB_ERR;
+        if (fdatasync(slot->fd) < 0) rc = MYDB_ERR;
     }
 
-    large_wal_segment_header_deserialize(page_buf, &slot->header);
-    return MYDB_OK;
+    if (rc == MYDB_OK) {
+        large_wal_segment_header_deserialize(page_buf, &slot->header);
+
+        /* A slot just became LSEG_DONE, which is the only thing the
+         * archiver ever waits for. Broadcast rather than signal: it
+         * costs nothing with one waiter, and stays correct if a second
+         * archiver-side consumer is ever added. Done while still
+         * holding the lock so the state change and the wake-up can't be
+         * observed out of order. */
+        pthread_cond_broadcast(&pool->slot_done_cv);
+    }
+
+    pthread_mutex_unlock(&pool->lock);
+    return rc;
 }
 
 /* Overwrites this slot's content pages (1..PAGES_PER_FILE-1) with
@@ -300,7 +503,20 @@ int large_wal_segment_pool_free_slot(LargeWalSegmentPool *pool, uint32_t slot_in
     if (!pool || slot_index >= LARGE_WAL_SEGMENT_POOL_SLOTS) return MYDB_ERR;
 
     LargeWalSlot *slot = &pool->slots[slot_index];
-    if (slot->header.state != LSEG_DONE) return MYDB_ERR;
+
+    /* pool->lock guards slot->header, as everywhere else here. The
+     * segment *content* zeroed below is guarded by this segment's
+     * registry node lock, which the CALLER holds — see the header's
+     * LOCKING CONTRACT. copy_out is already inside that node lock so
+     * that freeing this slot and repointing the registry at the
+     * holding-area copy are one atomic step to a reader; re-taking it
+     * here would self-deadlock. */
+    pthread_mutex_lock(&pool->lock);
+
+    if (slot->header.state != LSEG_DONE) {
+        pthread_mutex_unlock(&pool->lock);
+        return MYDB_ERR;
+    }
 
     /* Zero the content, and make that durable, BEFORE the header says
      * LSEG_FREE. The two writes must not share one flush: they could
@@ -315,8 +531,10 @@ int large_wal_segment_pool_free_slot(LargeWalSegmentPool *pool, uint32_t slot_in
      * slot out and nothing ever scans it — and the content is already
      * durable in the holding area, since copy_out fsyncs that before it
      * calls us. */
-    if (zero_content_pages(slot->fd) != MYDB_OK) return MYDB_ERR;
-    if (fdatasync(slot->fd) < 0) return MYDB_ERR;
+    if (zero_content_pages(slot->fd) != MYDB_OK || fdatasync(slot->fd) < 0) {
+        pthread_mutex_unlock(&pool->lock);
+        return MYDB_ERR;
+    }
 
     /* Local copy, committed only on success — see claim_next's note. */
     LargeWalSegmentHeader next = slot->header;
@@ -330,10 +548,32 @@ int large_wal_segment_pool_free_slot(LargeWalSegmentPool *pool, uint32_t slot_in
     memset(page_buf, 0, PAGE_SIZE);
     large_wal_segment_header_serialize(&next, page_buf);
 
-    if (pwrite_all(slot->fd, page_buf, PAGE_SIZE, 0) != MYDB_OK) return MYDB_ERR;
-    if (fdatasync(slot->fd) < 0) return MYDB_ERR;
+    int rc = MYDB_OK;
+    if (pwrite_all(slot->fd, page_buf, PAGE_SIZE, 0) != MYDB_OK) rc = MYDB_ERR;
+    else if (fdatasync(slot->fd) < 0)                            rc = MYDB_ERR;
 
-    large_wal_segment_header_deserialize(page_buf, &slot->header);
+    if (rc == MYDB_OK) {
+        large_wal_segment_header_deserialize(page_buf, &slot->header);
+
+        /* A slot just became LSEG_FREE — the other half of the handoff.
+         * This is what wakes a writer parked in claim_next_wait. */
+        pthread_cond_broadcast(&pool->slot_free_cv);
+    }
+
+    pthread_mutex_unlock(&pool->lock);
+    return rc;
+}
+
+int large_wal_segment_pool_slot_info(LargeWalSegmentPool *pool, uint32_t slot_index,
+                                      uint64_t *out_segment_no, uint8_t *out_state)
+{
+    if (!pool || slot_index >= LARGE_WAL_SEGMENT_POOL_SLOTS) return MYDB_ERR;
+
+    pthread_mutex_lock(&pool->lock);
+    if (out_segment_no) *out_segment_no = pool->slots[slot_index].header.segment_no;
+    if (out_state)      *out_state      = pool->slots[slot_index].header.state;
+    pthread_mutex_unlock(&pool->lock);
+
     return MYDB_OK;
 }
 
@@ -348,7 +588,7 @@ int large_wal_segment_pool_write_page(LargeWalSegmentPool *pool, uint32_t slot_i
     if (!page_no_valid(page_no)) return MYDB_ERR;
 
     off_t offset = (off_t)page_no * PAGE_SIZE;
-    return pwrite_all(pool->slots[slot_index].fd, buf, PAGE_SIZE, offset);
+    return locked_pwrite(pool, slot_index, buf, PAGE_SIZE, offset);
 }
 
 int large_wal_segment_pool_read_page(LargeWalSegmentPool *pool, uint32_t slot_index,
@@ -400,8 +640,16 @@ int large_wal_segment_pool_write(LargeWalSegmentPool *pool, WalWorker *worker,
         size_t   remaining = buf_len - written;
         uint32_t chunk = (remaining < (size_t)room_left) ? (uint32_t)remaining : room_left;
 
+        /* One locked_pwrite per chunk, and a chunk never spans pages —
+         * so each 16KB page reaches disk under this segment's node lock
+         * in a single call, which is what makes it atomic against a
+         * concurrent large_wal_get. Acquiring per chunk rather than once
+         * for the whole call is deliberate: this loop rolls segments
+         * internally via claim_next, which needs the registry's WRITE
+         * lock, and holding the read lock across that would self-
+         * deadlock on a non-recursive rwlock. */
         off_t abs_offset = (off_t)(*page_no) * PAGE_SIZE + *offset;
-        if (pwrite_all(pool->slots[*slot_index].fd, buf + written, chunk, abs_offset) != MYDB_OK) {
+        if (locked_pwrite(pool, *slot_index, buf + written, chunk, abs_offset) != MYDB_OK) {
             rc = MYDB_ERR;
             goto out;
         }
@@ -447,7 +695,14 @@ int large_wal_segment_pool_write(LargeWalSegmentPool *pool, WalWorker *worker,
              * mailbox, hence goto rather than return. claim_next failing
              * is the reachable case: the pool runs out of free slots
              * whenever the archiver is behind. */
-            if (large_wal_segment_pool_claim_next(pool, slot_index) != MYDB_OK) {
+            /* The waiting variant, not the plain one: the pool being
+             * momentarily full is a condition that clears itself within
+             * milliseconds once the archiver copies a DONE slot out.
+             * Failing here instead would turn that into a failed user
+             * write. On timeout it returns exactly what plain
+             * claim_next returns, so this is never worse. */
+            if (large_wal_segment_pool_claim_next_wait(pool, LARGE_WAL_CLAIM_WAIT_MS,
+                                                        slot_index) != MYDB_OK) {
                 rc = MYDB_ERR;
                 goto out;
             }

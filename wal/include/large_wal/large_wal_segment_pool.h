@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <pthread.h>
 #include "common.h"
 #include "large_wal/large_wal_segment.h"
 #include "large_wal/large_wal_registry.h"
@@ -43,6 +44,21 @@
      (16384, common.h) reused directly — design doc: "Internal pages: 16KB (matches
      data page size)" — the same B+Tree page size, not a new constant. */
 
+/* How long write()'s rollover waits for the archiver to free a slot
+ * before giving up (see large_wal_segment_pool_claim_next_wait).
+ *
+ * Sized to ride out several copy-outs, not one: a copy-out is a few
+ * milliseconds and the archiver's own poll interval is tens, so
+ * anything under a second would start failing writes during an ordinary
+ * burst -- the exact thing waiting was added to avoid. 5s is also short
+ * enough that a stopped or broken archiver still surfaces as an error a
+ * person will notice, rather than looking like a hang.
+ *
+ * If writers start hitting this under real load, that is the answer to
+ * the design doc's own open question about whether 4 slots is enough
+ * (impl doc 10.1, "still a placeholder pending real load testing"). */
+#define LARGE_WAL_CLAIM_WAIT_MS           5000
+
 /* ------------------------------------------------------------------
  * LargeWalSlot — in-memory only, never persisted. One per physical
  * rotation-pool slot.
@@ -72,8 +88,39 @@ typedef struct {
     /* Not owned; may be NULL (a pool driven directly, e.g. by
      * test_large_wal_segment_pool, needs no registry). When set,
      * claim_next registers every segment_no it mints — see its own doc
-     * comment for why that belongs there and not in the caller. */
+     * comment for why that belongs there and not in the caller. It is
+     * also where this pool reaches for per-segment locking: every write
+     * into a segment's content pages happens under that segment's
+     * registry node lock, which is what stops a concurrent
+     * large_wal_get seeing a half-written page. A NULL registry means
+     * no reader can resolve these segments at all, so there is nothing
+     * to lock against. */
     LargeWalRegistry *registry;
+
+    pthread_mutex_t lock;   /* protects slots[].header and next_segment_no.
+                                NOT the segment file contents — those are
+                                covered by the registry node lock above.
+                                Third in large_wal's global lock order:
+                                reg -> node -> pool -> idx -> state. */
+
+    /* The writer/archiver handoff, in both directions. Both use the
+     * lock above — no new lock, no new ordering rule.
+     *
+     * They live on the pool rather than on either thread on purpose:
+     * that way neither thread has to know the other exists. The writer
+     * waits for "a slot became free" without knowing an archiver is
+     * what frees them, and the archiver waits for "a slot became done"
+     * without knowing a writer is what fills them. Keeps
+     * large_wal_writer.h's "never touches large_wal_archiver at all"
+     * literally true. The pool is already the one thing both of them
+     * share, so it is where the handoff belongs. */
+    pthread_cond_t  slot_done_cv;   /* broadcast by mark_done()  -- wakes the archiver */
+    pthread_cond_t  slot_free_cv;   /* broadcast by free_slot()  -- wakes a waiting writer */
+
+    /* Set by shutdown() so anything blocked in claim_next_wait() gives
+     * up instead of waiting out its full timeout on a pool that is
+     * being torn down. */
+    uint8_t         shutting_down;
 } LargeWalSegmentPool;
 
 /* ------------------------------------------------------------------
@@ -113,8 +160,52 @@ int large_wal_segment_pool_shutdown(LargeWalSegmentPool *pool);
  * multi-boundary write passed through, silently leaving the ones in
  * between unresolvable. The fd doesn't change (the 4 slot files are
  * opened once at init and held for the process's life); it's the *key*
- * that changes, since this slot now holds a different segment_no. */
+ * that changes, since this slot now holds a different segment_no.
+ *
+ * Locking: takes pool->lock for the slot selection and header rewrite,
+ * RELEASES it, and only then takes the registry's write lock to
+ * register. The two must not nest, or they close a cycle against
+ * copy_out, which runs registry -> node -> free_slot -> pool. Splitting
+ * them is safe because between the two the segment is ACTIVE but
+ * unregistered, and no index entry names it yet — so no reader can be
+ * asking for it. */
 int large_wal_segment_pool_claim_next(LargeWalSegmentPool *pool, uint32_t *out_slot_index);
+
+/* Same as claim_next, but waits instead of failing when the target slot
+ * isn't LSEG_FREE yet.
+ *
+ * Blocks on slot_free_cv until the archiver frees a slot, retrying each
+ * time it is woken, and gives up with MYDB_ERR once timeout_ms has
+ * passed (or immediately if the pool is shutting down). The wait is
+ * bounded deliberately: with no archiver running -- or a broken one --
+ * an unbounded wait would hang the writer forever with nothing to
+ * indicate why.
+ *
+ * Why wait at all: a full pool clears itself within a few milliseconds,
+ * because a copy-out is already in flight. Failing the write outright
+ * turns that momentary condition into a failed user transaction. On
+ * timeout this returns exactly what plain claim_next returns today, so
+ * it can only ever do better, never worse.
+ *
+ * Only large_wal_segment_pool_write's rollover path uses this. Plain
+ * claim_next stays for writer_init and for tests that want the
+ * immediate answer.
+ *
+ * Holds no registry lock while waiting -- it never takes one at all,
+ * and the caller (the rollover point inside write()) holds none either.
+ * That is what leaves copy_out free to take reg -> node -> pool and
+ * signal the condvar this is sleeping on. */
+int large_wal_segment_pool_claim_next_wait(LargeWalSegmentPool *pool,
+                                            uint32_t timeout_ms,
+                                            uint32_t *out_slot_index);
+
+/* Snapshots a slot's segment_no and state under pool->lock. Exists so
+ * the archiver can decide what to do with a slot without reading
+ * slots[].header behind the lock's back — it needs the segment_no to
+ * find the registry node it must hold, and the lock order forbids
+ * taking pool->lock once it does. Either out pointer may be NULL. */
+int large_wal_segment_pool_slot_info(LargeWalSegmentPool *pool, uint32_t slot_index,
+                                      uint64_t *out_segment_no, uint8_t *out_state);
 
 /* Raw page I/O within an already-claimed slot. page_no is 1-based (0 is
  * the header's own page-slot) and must be < LARGE_WAL_SEGMENT_PAGES_PER_FILE.
@@ -156,7 +247,16 @@ int large_wal_segment_pool_mark_done(LargeWalSegmentPool *pool, WalWorker *worke
  * why the two writes must not share a flush.
  *
  * Zeroes segment_no/start_lsn/end_lsn/data_pages, rewrites + fdatasyncs
- * the header. Returns MYDB_ERR if the slot isn't currently LSEG_DONE. */
+ * the header. Returns MYDB_ERR if the slot isn't currently LSEG_DONE.
+ *
+ * LOCKING CONTRACT: the caller must already hold this segment's registry
+ * node lock (large_wal_registry_acquire) across the call. This function
+ * takes pool->lock itself, but it cannot take the node lock — copy_out,
+ * its only real caller, is already holding it so that freeing the slot
+ * and repointing the registry at the holding-area copy look like one
+ * atomic step to a reader. Taking it again here would self-deadlock.
+ * Without that contract the zeroing below would race a large_wal_get
+ * still preading this slot. */
 int large_wal_segment_pool_free_slot(LargeWalSegmentPool *pool, uint32_t slot_index);
 
 /* Scans page_no = 1, 2, ... in the given slot's file, validating each via

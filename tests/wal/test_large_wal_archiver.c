@@ -15,6 +15,12 @@
 
 #define TEST_WAL_DIR "/tmp/mydb_test_large_wal_archiver"
 
+/* reg=NULL on init throughout this file: these tests drive copy_out and
+ * try_free directly, with no thread, so they want none of init's
+ * holding-area scan -- the registry entries they care about are the
+ * ones build_done_segment makes by hand. The scan is exercised by
+ * test_large_wal_concurrency's restart test instead. */
+
 static int tests_run    = 0;
 static int tests_passed = 0;
 
@@ -136,7 +142,7 @@ static void test_copy_out_frees_slot_and_content_readable(void)
     LargeWalArchiver        arc;
     CHECK(large_wal_registry_init(&reg) == MYDB_OK, "registry init succeeds");
     CHECK(large_wal_segment_pool_init(&pool, TEST_WAL_DIR, 1, &reg) == MYDB_OK, "pool init succeeds");
-    CHECK(large_wal_archiver_init(&arc, TEST_WAL_DIR) == MYDB_OK, "archiver init succeeds");
+    CHECK(large_wal_archiver_init(&arc, TEST_WAL_DIR, /*reg=*/NULL) == MYDB_OK, "archiver init succeeds");
 
     uint32_t slot_index; uint64_t segment_no, end_lsn; uint16_t len_a, len_b;
     build_done_segment(&pool, &reg, &slot_index, &segment_no, &end_lsn, &len_a, &len_b);
@@ -179,7 +185,7 @@ static void test_try_free_gated_on_both_conditions(void)
     LargeWalIndex             idx;
     large_wal_registry_init(&reg);
     large_wal_segment_pool_init(&pool, TEST_WAL_DIR, 1, &reg);
-    large_wal_archiver_init(&arc, TEST_WAL_DIR);
+    large_wal_archiver_init(&arc, TEST_WAL_DIR, /*reg=*/NULL);
     large_wal_index_open(&idx, TEST_WAL_DIR);
 
     uint32_t slot_index; uint64_t segment_no, end_lsn; uint16_t len_a, len_b;

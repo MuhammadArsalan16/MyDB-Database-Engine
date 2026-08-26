@@ -2,6 +2,7 @@
 #define LARGE_WAL_INDEX_H
 
 #include <stdint.h>
+#include <pthread.h>
 #include "common.h"
 
 /*
@@ -28,9 +29,21 @@
  * since mutations are paced by large-record writes and archiver
  * gate-clears, not a hot loop.
  *
- * Concurrency: none built here — see the "Concurrency note" in this
- * phase's plan. No real writer/archiver thread exists yet to contend
- * over this structure.
+ * Concurrency: one plain mutex covering the whole structure, following
+ * the pattern normal_wal's WalRingBuffer already uses (a named lock
+ * embedded in the struct it protects). A mutex rather than an rwlock
+ * because the two mutating calls each rewrite the entries array,
+ * rebuild the bucket table wholesale and fsync the file — there is no
+ * cheap-write case for a reader/writer split to exploit, and
+ * large_wal_get (the only reader) is a cold path.
+ *
+ * This is the fourth lock in large_wal's global order
+ *     reg->lock -> node->lock -> pool->lock -> idx->lock -> state->lock
+ * and it is a leaf: nothing here acquires anything else while held.
+ * large_wal_get deliberately releases this lock before touching the
+ * registry, so a reader never holds the index and the registry at the
+ * same time — which is what keeps it from closing a cycle against
+ * try_free, which holds them in sequence.
  */
 
 typedef struct {
@@ -58,6 +71,9 @@ typedef struct {
 
     int    fd;
     char   path[300];
+
+    pthread_mutex_t lock;   /* protects entries/count/capacity, buckets/
+                                bucket_capacity, and the file behind fd */
 } LargeWalIndex;
 
 /* Opens wal_dir/large_wal_index.mydb, creating an empty one if it
@@ -70,8 +86,10 @@ int large_wal_index_close(LargeWalIndex *idx);
  * (whole-file rewrite + fsync) on success. */
 int large_wal_index_insert(LargeWalIndex *idx, const LargeWalIndexEntry *e);
 
-/* Copies the matching entry into *out. Returns MYDB_ERR_NOT_FOUND on miss. */
-int large_wal_index_lookup(const LargeWalIndex *idx, uint64_t content_lsn, LargeWalIndexEntry *out);
+/* Copies the matching entry into *out. Returns MYDB_ERR_NOT_FOUND on
+ * miss. Non-const because it takes idx->lock — the copy-out is exactly
+ * so the caller can use the entry after the lock is dropped. */
+int large_wal_index_lookup(LargeWalIndex *idx, uint64_t content_lsn, LargeWalIndexEntry *out);
 
 /* Removes every entry whose segment_no matches — called by the archiver
  * once a segment_no's holding-area copy has actually been freed

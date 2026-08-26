@@ -86,6 +86,23 @@ add_executable(test_large_wal_manager wal/test_large_wal_manager.c)
 target_link_libraries(test_large_wal_manager PRIVATE wal)
 add_test(NAME test_large_wal_manager COMMAND test_large_wal_manager)
 
+# large_wal segment locking -- the only test that runs more than one
+# thread against large_wal. Readers race the writer, readers race the
+# archiver relocating and deleting segments underneath them, and the
+# registry/index are hammered directly. Passing here is necessary but not
+# sufficient: the real verification is a clean run under
+# -DMYDB_SANITIZE_THREAD=ON (see the file's own header comment).
+#
+# Extended when the archiver thread landed: the hand-rolled driver this
+# file used to run was replaced by the real large_wal_archiver thread,
+# and it now also covers claim_next_wait's two outcomes (wakes on a
+# free / times out), the Gate A+B provider actually driving try_free,
+# and a restart re-registering holding-area files (including deleting a
+# truncated one so copy_out's O_EXCL can create it again).
+add_executable(test_large_wal_concurrency wal/test_large_wal_concurrency.c)
+target_link_libraries(test_large_wal_concurrency PRIVATE wal Threads::Threads)
+add_test(NAME test_large_wal_concurrency COMMAND test_large_wal_concurrency)
+
 # WAL Phase 2 — the pool of 10 physical wal_<N>.mydb segment files:
 # pre-allocation, round-robin claiming, raw page I/O, crash-reload
 # tail-scan (MYDB_WAL_IMPLEMENTATION.md §8.4). Real file I/O under /tmp.

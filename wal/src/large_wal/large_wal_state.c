@@ -49,6 +49,7 @@ int large_wal_state_open(LargeWalState *st, const char *wal_dir)
     if (!st || !wal_dir) return MYDB_ERR;
     memset(st, 0, sizeof(*st));
     st->fd = -1;
+    if (pthread_mutex_init(&st->lock, NULL) != 0) return MYDB_ERR;
     snprintf(st->path, sizeof(st->path), "%s/large_wal_state.mydb", wal_dir);
 
     int fd = open(st->path, O_RDWR);
@@ -94,18 +95,31 @@ int large_wal_state_close(LargeWalState *st)
     if (!st) return MYDB_ERR;
     if (st->fd >= 0) close(st->fd);
     st->fd = -1;
+    pthread_mutex_destroy(&st->lock);
     return MYDB_OK;
 }
 
 int large_wal_state_advance(LargeWalState *st, uint64_t new_flush_lsn)
 {
     if (!st || st->fd < 0) return MYDB_ERR;
-    if (new_flush_lsn < st->flush_lsn) return MYDB_ERR;
+
+    pthread_mutex_lock(&st->lock);
+
+    /* The monotonicity check has to be inside the lock, not before it:
+     * two concurrent advances that both read the old flush_lsn would
+     * otherwise each pass the check and then race to write, letting the
+     * lower one land last. */
+    if (new_flush_lsn < st->flush_lsn) {
+        pthread_mutex_unlock(&st->lock);
+        return MYDB_ERR;
+    }
 
     uint64_t prev = st->flush_lsn;
     st->flush_lsn = new_flush_lsn;
 
     int rc = save(st);
     if (rc != MYDB_OK) st->flush_lsn = prev;
+
+    pthread_mutex_unlock(&st->lock);
     return rc;
 }
