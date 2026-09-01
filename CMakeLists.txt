@@ -17,9 +17,34 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # PartitionBuffer's per-outer-slot latch (PARTITION_BUFFER_DESIGN.md §6/§7).
 find_package(Threads REQUIRED)
 
+# Opt-in ThreadSanitizer build: -DMYDB_SANITIZE_THREAD=ON.
+#
+# This is the real verification for large_wal's segment locking. A green
+# run of a threaded test proves very little on its own — a data race
+# usually produces correct output until the day it doesn't — so the
+# locking phase is only actually verified by running the WAL tests under
+# TSan. Off by default because it slows execution ~10x and cannot be
+# combined with ASan/valgrind.
+option(MYDB_SANITIZE_THREAD "Build with ThreadSanitizer (-fsanitize=thread)" OFF)
+if(MYDB_SANITIZE_THREAD)
+    add_compile_options(-fsanitize=thread -g -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=thread)
+endif()
+
+# Common utilities — common.h, file_header.h/.c, checksum.h/.c. Genuinely
+# system-wide (every module depends on them), so this is the first
+# subdirectory built, ahead of storage_engine which used to own them.
+add_subdirectory(common_utils)
 # Storage engine — stateless I/O layer (v3): BufferPool, BTree, Page,
 # DiskManager, RelationDef only.  No session state.
 add_subdirectory(storage_engine)
+# WAL — wal record/page/segment format (normal_wal) and, later, LARGE_WAL
+# overflow storage (large_wal). Depends only on common_utils (not
+# storage_engine) — WAL manages its own files and doesn't need BufferPool/
+# BTree/DiskManager/RelationDef. Built as an independent skeleton per
+# subsystem; not yet wired into partition_manager's TransactionManager
+# (see MYDB_WAL_IMPLEMENTATION.md §11, cross-subsystem dispatcher, deferred).
+add_subdirectory(wal)
 # crypto — SHA-256 + salt helpers, shared by engine (login/bootstrap) and the
 # network client (challenge-response). Lifted out of engine/ when the client
 # became a second consumer. Built before engine + client.

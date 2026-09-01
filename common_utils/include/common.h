@@ -15,6 +15,20 @@
 #define RECORD_HEADER_SIZE      5       /* 5-byte header preceding every record */
 
 /* ------------------------------------------------------------------ */
+/*  WAL format constants (MYDB_WAL_IMPLEMENTATION.md §8.3). System-    */
+/*  wide because every WAL consumer (record segments, and later the   */
+/*  ring buffer / Flusher / recovery) needs the same page/record size */
+/*  budget — unlike WalRecordHeader/WalPageHeader/WalSegmentHeader     */
+/*  themselves, which are wal/'s own structs, not declared here.      */
+/* ------------------------------------------------------------------ */
+#define WAL_PAGE_SIZE           4096
+#define WAL_PAGE_HEADER_SIZE      32   /* was 36 -- WalPageHeader unified/shrunk */
+#define WAL_RECORD_HEADER_SIZE    44
+#define WAL_PAGE_USABLE         4064   /* was 4060 -- WAL_PAGE_SIZE - WAL_PAGE_HEADER_SIZE */
+#define WAL_MAX_RECORD_SIZE     4064   /* was 4060 -- records above this redirect to LARGE_WAL */
+#define WAL_MAX_ROW_BODY        4020   /* was 4016 -- WAL_MAX_RECORD_SIZE - WAL_RECORD_HEADER_SIZE */
+
+/* ------------------------------------------------------------------ */
 /*  Size limits                                                       */
 /* ------------------------------------------------------------------ */
 #define MAX_TABLE_NAME      64
@@ -43,19 +57,29 @@
 /*  File type constants (all files share MYDB_MAGIC; file_type field  */
 /*  at byte offset 6 of every file header distinguishes them)         */
 /* ------------------------------------------------------------------ */
-#define FILETYPE_DATABASE    1   /* __database.mydb        — engine registry */
-#define FILETYPE_CATALOG     2   /* __catalog.mydb         — partition catalog */
-#define FILETYPE_SCHEMA      3   /* __schema.mydb          — schema definition */
-#define FILETYPE_RELATION    4   /* <relation>.mydb        — B+ tree data file */
-#define FILETYPE_USERS       5   /* system_schema/users.mydb */
-#define FILETYPE_PRIVILEGES  6   /* system_schema/privileges.mydb */
-#define FILETYPE_STATS       7   /* __stats.mydb           — CBO optimizer stats */
+#define FILETYPE_DATABASE            1   /* __database.mydb        — engine registry */
+#define FILETYPE_CATALOG             2   /* __catalog.mydb         — partition catalog */
+#define FILETYPE_SCHEMA              3   /* __schema.mydb          — schema definition */
+#define FILETYPE_RELATION            4   /* <relation>.mydb        — B+ tree data file */
+#define FILETYPE_USERS               5   /* system_schema/users.mydb */
+#define FILETYPE_PRIVILEGES          6   /* system_schema/privileges.mydb */
+#define FILETYPE_STATS               7   /* __stats.mydb           — CBO optimizer stats */
+#define FILETYPE_WAL_PAGE            8   /* wal/wal_<N>.mydb page format */
+#define FILETYPE_WAL_SEGMENT         9   /* wal/wal_<N>.mydb segment header */
+#define FILETYPE_LARGE_WAL_PAGE     10   /* large_wal/lw_<N>.mydb page format */
+#define FILETYPE_LARGE_WAL_SEGMENT  11   /* large_wal/lw_<N>.mydb segment header */
+#define FILETYPE_LARGE_WAL_INDEX    12   /* wal/large_wal_index.mydb */
+#define FILETYPE_LARGE_WAL_STATE    13   /* wal/large_wal_state.mydb */
 
 /* ------------------------------------------------------------------ */
 /*  On-disk format version. Bumped when any file layout changes in    */
 /*  a way that older binaries can't read.                             */
+/*  v3: bumped 2 -> 3 when every metadata-file checksum moved from    */
+/*  FNV-1a to CRC32 (WAL Phase 1) — old files fail MYDB_ERR_BAD_      */
+/*  CHECKSUM under the new algorithm, not a version mismatch, but the */
+/*  on-disk format genuinely changed.                                 */
 /* ------------------------------------------------------------------ */
-#define MYDB_FORMAT_VERSION  2
+#define MYDB_FORMAT_VERSION  3
 
 /* ------------------------------------------------------------------ */
 /*  v2 four-level hierarchy capacities                                */
@@ -135,6 +159,36 @@ typedef enum {
     REC_INFIMUM   = 2,  /* lower boundary pseudo-record on every page */
     REC_SUPREMUM  = 3   /* upper boundary pseudo-record on every page */
 } RecordType;
+
+/* ------------------------------------------------------------------ */
+/*  WAL record types (MYDB_WAL_DESIGN.md §8.4 / MYDB_WAL_             */
+/*  IMPLEMENTATION.md §8.5). System-wide, not wal/-owned: a change to  */
+/*  what kinds of records exist is a change every WAL consumer (data   */
+/*  pages, schema/catalog metadata, recovery) needs to agree on — same */
+/*  reasoning as PageType/RecordType above, unlike WalRecordHeader     */
+/*  itself, which is wal/'s own on-disk struct.                        */
+/*  UPDATE = DELETE + INSERT: MyDB does delete-then-reinsert, never     */
+/*  in-place row modification, so there is no WAL_REC_UPDATE.          */
+/* ------------------------------------------------------------------ */
+typedef enum {
+    WAL_REC_BEGIN              = 1,  /* body: none */
+    WAL_REC_COMMIT             = 2,  /* body: uint64_t commit_timestamp */
+    WAL_REC_ABORT              = 3,  /* body: none */
+    WAL_REC_INSERT             = 4,
+    WAL_REC_DELETE             = 5,  /* carries full before-image */
+    WAL_REC_PAGE_INIT          = 6,
+    WAL_REC_PAGE_SPLIT         = 7,
+    WAL_REC_PAGE_MERGE         = 8,  /* reserved, future */
+    WAL_REC_PAGE_COMPACT       = 9,
+    WAL_REC_FILE_HEADER_UPDATE = 10,
+    WAL_REC_SCHEMA_UPDATE      = 11,
+    WAL_REC_CATALOG_UPDATE     = 12,
+    WAL_REC_FILE_CREATE        = 13,
+    WAL_REC_FILE_DROP          = 14,
+    WAL_REC_CHECKPOINT         = 15,
+    WAL_REC_CLR                = 16,
+    WAL_REC_LARGE_REF          = 17  /* pointer to LARGE_WAL segment */
+} WalRecType;
 
 /* ------------------------------------------------------------------ */
 /*  Record ID — uniquely identifies a record on disk                  */
